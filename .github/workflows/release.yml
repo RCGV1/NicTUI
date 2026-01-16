@@ -104,6 +104,14 @@ jobs:
     needs: [build-linux-x86_64, build-macos-x86_64, build-macos-aarch64, build-windows]
     runs-on: ubuntu-latest
     steps:
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | awk -F'"' '{print $2}')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Tagging release as v$VERSION"
+          git tag v$VERSION || true
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:

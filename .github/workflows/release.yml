@@ -30,11 +30,12 @@ jobs:
       - name: Check if version tag already exists
         id: check_tag
         run: |
-          if gh api repos/{owner}/{repo}/git/refs/tags/v$VERSION --silent 2>/dev/null; then
-            echo "Tag v$VERSION already exists"
+          REPO="${{ github.repository }}"
+          if gh api "repos/${REPO}/git/refs/tags/v${VERSION}" --silent 2>/dev/null; then
+            echo "Tag v${VERSION} already exists"
             echo "exists=true" >> $GITHUB_OUTPUT
           else
-            echo "Tag v$VERSION does not exist - will create release"
+            echo "Tag v${VERSION} does not exist - will create release"
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
         env:
@@ -43,7 +44,7 @@ jobs:
       - name: Output version check result
         run: |
           echo "Version: ${{ steps.version.outputs.VERSION }}"
-          echo "Should release: ${{ steps.check-tag.outputs.exists != 'true' }}"
+          echo "Should release: ${{ steps.check_tag.outputs.exists != 'true' }}"
 
   build-macos-x86_64:
     needs: check-version

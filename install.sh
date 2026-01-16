@@ -50,17 +50,37 @@ detect_platform() {
 }
 
 get_latest_version() {
-    VERSION=$(gh api repos/${REPO}/releases/latest --jq '.tag_name' 2>/dev/null | sed 's/^v//')
-    if [ -z "$VERSION" ] || echo "$VERSION" | grep -q "Not Found"; then
-        echo "Error: Could not fetch latest version. No releases found." >&2
+    local VERSION=""
+
+    VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | sed 's/.*"v\([0-9.]*\)".*/\1/')
+
+    if [ -z "$VERSION" ]; then
+        echo "Error: Could not fetch latest version. Check your internet connection." >&2
+        echo "If GitHub is blocked, try downloading manually from:" >&2
+        echo "  https://github.com/${REPO}/releases/latest" >&2
         exit 1
     fi
     echo "$VERSION"
 }
 
-get_download_url() {
+download_with_fallback() {
     local VERSION="$1"
-    echo "https://github.com/${REPO}/releases/download/v${VERSION}/nictui-${VERSION}-${PLATFORM}"
+    local OUTPUT_FILE="$2"
+    local DOWNLOAD_URLS=(
+        "https://github.com/${REPO}/releases/download/v${VERSION}/nictui-${VERSION}-${PLATFORM}"
+        "https://objects.githubusercontent.com/github-production-release-asset-2e65be/${REPO}/${VERSION}/${PLATFORM}"
+    )
+
+    for url in "${DOWNLOAD_URLS[@]}"; do
+        echo "Trying: ${url}"
+        if curl -fsSL -o "$OUTPUT_FILE" "$url" 2>/dev/null; then
+            echo "Download successful!"
+            return 0
+        fi
+    done
+
+    echo "Error: Download failed from all sources" >&2
+    return 1
 }
 
 add_to_path() {
@@ -102,39 +122,41 @@ add_to_path() {
 
 is_installed() {
     if [ -f "$INSTALL_PATH" ]; then
-        INSTALLED_VERSION=$("$INSTALL_PATH" --version 2>/dev/null || echo "")
-        if [ -n "$INSTALLED_VERSION" ]; then
-            return 0
-        fi
+        return 0
     fi
     return 1
 }
 
 get_installed_version() {
     if [ -f "$INSTALL_PATH" ]; then
-        "$INSTALL_PATH" --version 2>/dev/null || echo ""
+        local ver=$("$INSTALL_PATH" --version 2>/dev/null || echo "")
+        if [ -n "$ver" ]; then
+            echo "$ver"
+        else
+            echo "unknown"
+        fi
     fi
 }
 
 install_nictui() {
     local VERSION="$1"
-    local DOWNLOAD_URL
     local TEMP_DIR
 
     echo "Detected platform: ${PLATFORM}"
     echo "Installing NicTUI v${VERSION}..."
-
-    DOWNLOAD_URL=$(get_download_url "$VERSION")
 
     TEMP_DIR=$(mktemp -d)
     trap "rm -rf $TEMP_DIR" EXIT
 
     local ARCHIVE="${TEMP_DIR}/nictui-${PLATFORM}"
 
-    echo "Downloading from ${DOWNLOAD_URL}..."
-
-    if ! curl -fsSL -o "$ARCHIVE" "$DOWNLOAD_URL"; then
-        echo "Error: Download failed. The binary for ${PLATFORM} may not be available yet." >&2
+    if ! download_with_fallback "$VERSION" "$ARCHIVE"; then
+        echo ""
+        echo "Manual download instructions:"
+        echo "1. Go to https://github.com/${REPO}/releases/latest"
+        echo "2. Download: nictui-${VERSION}-${PLATFORM}"
+        echo "3. Save it to ${INSTALL_DIR}/nictui"
+        echo "4. Run: chmod +x ${INSTALL_DIR}/nictui"
         exit 1
     fi
 
@@ -190,8 +212,25 @@ main() {
         exit 0
     fi
 
+    if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+        echo "NicTUI Installer"
+        echo ""
+        echo "Usage: $0 [OPTIONS]"
+        echo ""
+        echo "Options:"
+        echo "  --version, -v  Show installed version"
+        echo "  --uninstall    Remove NicTUI"
+        echo "  --help, -h     Show this help"
+        echo ""
+        echo "For manual installation, visit:"
+        echo "  https://github.com/${REPO}/releases/latest"
+        exit 0
+    fi
+
     echo "NicTUI Installer"
     echo "================"
+    echo "Repository: ${REPO}"
+    echo "Platform: ${PLATFORM}"
 
     LATEST_VERSION=$(get_latest_version)
     echo "Latest version: ${LATEST_VERSION}"

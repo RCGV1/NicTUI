@@ -8,8 +8,46 @@ permissions:
   contents: write
   actions: read
 
+env:
+  RUST_BACKTRACE: 1
+
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      should_release: ${{ steps.check_tag.outputs.exists != 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | awk -F'"' '{print $2}')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+
+      - name: Check if version tag already exists
+        id: check_tag
+        run: |
+          if gh api repos/{owner}/{repo}/git/refs/tags/v$VERSION --silent 2>/dev/null; then
+            echo "Tag v$VERSION already exists"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Tag v$VERSION does not exist - will create release"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Output version check result
+        run: |
+          echo "Version: ${{ steps.version.outputs.VERSION }}"
+          echo "Should release: ${{ steps.check-tag.outputs.exists != 'true' }}"
+
   build-macos-x86_64:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +71,8 @@ jobs:
           path: nictui-${{ steps.version.outputs.VERSION }}-macos-x86_64
 
   build-macos-aarch64:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +96,8 @@ jobs:
           path: nictui-${{ steps.version.outputs.VERSION }}-macos-aarch64
 
   build-windows:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,6 +122,8 @@ jobs:
           path: nictui-${{ steps.version.outputs.VERSION }}-windows-x86_64.exe
 
   build-linux-x86_64:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,32 +149,9 @@ jobs:
           name: nictui-linux-x86_64
           path: nictui-${{ steps.version.outputs.VERSION }}-linux-x86_64
 
-  # ARM build disabled - requires cross-rs/cross for proper GTK3/wayland support
-  # To re-enable:
-  # 1. Use cross-rs/cross for cross-compilation with pre-built Docker images
-  # 2. Configure Cross.toml with GTK3 dependencies for ARM target
-  # 3. Add back to create-release.needs array
-  #
-  # build-linux-arm:
-  #   runs-on: ubuntu-latest
-  #   name: Build ARM64
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: taiki-e/install-action@v2
-  #       with:
-  #         tool: cross
-  #     - name: Build Release
-  #       run: cross build --release --target aarch64-unknown-linux-gnu --bin nictui
-  #     - name: Rename binary
-  #       run: mv target/aarch64-unknown-linux-gnu/release/nictui nictui-${{ github.ref_name }}-linux-aarch64
-  #     - name: Upload artifact
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: nictui-linux-aarch64
-  #         path: nictui-${{ github.ref_name }}-linux-aarch64
-
   create-release:
-    needs: [build-linux-x86_64, build-macos-x86_64, build-macos-aarch64, build-windows]
+    needs: [check-version, build-linux-x86_64, build-macos-x86_64, build-macos-aarch64, build-windows]
+    if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

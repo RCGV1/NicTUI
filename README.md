@@ -13,28 +13,80 @@ A terminal-based user interface for programming the TIDRADIO TD-H3 HAM radio.
 - **Firmware Flashing** - Flash firmware updates
 - **Remote Control** - Control the radio remotely via USB serial
 
-## Supported Platforms
-
-| Platform | Architecture | Download |
-|----------|--------------|----------|
-| Linux | x86_64 | `nictui-v{version}-linux-x86_64` |
-| Linux | ARM (Raspberry Pi) | `nictui-v{version}-linux-aarch64` |
-| macOS | Intel (x86_64) | `nictui-v{version}-macos-x86_64` |
-| macOS | Apple Silicon (aarch64) | `nictui-v{version}-macos-aarch64` |
-| Windows | x86_64 | `nictui-v{version}-windows-x86_64.exe` |
-
 ## Installation
 
-### Linux/macOS
+### Quick Install (All Platforms)
+
+One-command installation that automatically detects your platform and installs NicTUI:
+
 ```bash
-# Download and extract
-tar -xzf nictui-v{version}-{platform}
-chmod +x nictui-{version}-{platform}
-./nictui-{version}-{platform}
+curl -fsSL https://raw.githubusercontent.com/RCGV1/NicTUI/master/install.sh | bash
 ```
 
-### Windows
-Download the `.exe` file and run it from Command Prompt or PowerShell.
+This will:
+- Detect your operating system and architecture
+- Download the latest release binary
+- Install to `~/.local/bin/nictui`
+- Add `~/.local/bin` to your PATH
+
+**After installation, restart your terminal or run:**
+```bash
+source ~/.bashrc  # or ~/.zshrc, ~/.profile, etc.
+```
+
+Then start NicTUI with:
+```bash
+nictui
+```
+
+### Manual Installation
+
+#### Linux/macOS
+
+```bash
+# Download the binary
+curl -LO https://github.com/RCGV1/NicTUI/releases/latest/download/nictui-{version}-{platform}
+
+# Example for Linux x86_64:
+# curl -LO https://github.com/RCGV1/NicTUI/releases/latest/download/nictui-1.0.0-linux-x86_64
+
+# Make executable
+chmod +x nictui-{version}-{platform}
+
+# Move to a directory in your PATH
+mkdir -p ~/.local/bin
+mv nictui-{version}-{platform} ~/.local/bin/nictui
+
+# Add to PATH (add to ~/.bashrc or ~/.zshrc)
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+#### Windows
+
+Download the `.exe` file from [Releases](https://github.com/RCGV1/NicTUI/releases) and run it from Command Prompt or PowerShell.
+
+### Update NicTUI
+
+To update to the latest version:
+
+```bash
+# Re-run the install script
+curl -fsSL https://raw.githubusercontent.com/RCGV1/NicTUI/master/install.sh | bash
+
+# Or manually download the new version and replace the binary
+```
+
+### Check Version
+
+```bash
+nictui --version
+```
+
+### Uninstall
+
+```bash
+~/.local/bin/nictui --uninstall
+```
 
 ## Usage
 
@@ -95,17 +147,15 @@ Download the `.exe` file and run it from Command Prompt or PowerShell.
 ## Building from Source
 
 ```bash
-git clone https://github.com/nicradio/NicTUI.git
+git clone https://github.com/RCGV1/NicTUI.git
 cd NicTUI
 cargo build --release
 ```
 
 ### Dependencies (Linux)
 
-- libwayland-dev
-- libwayland-client0
-- wayland-protocols
-- libasound2-dev
+- libgtk-3-dev
+- libudev-dev
 
 ## License
 

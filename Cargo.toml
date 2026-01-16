@@ -22,3 +22,6 @@ rfd = "0.15.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.142"
 serialport = "4.8.1"
+
+[patch.crates-io]
+ashpd = "=0.12.0"

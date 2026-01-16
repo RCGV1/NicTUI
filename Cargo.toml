@@ -1,0 +1,24 @@
+[package]
+name = "nictui"
+version = "1.0.0"
+edition = "2024"
+description = "NicTUI - Professional TDH3 Radio Programmer"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "nictui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+byteorder = "1.5.0"
+chrono = "0.4.42"
+crossterm = "0.29.0"
+csv = "1.4.0"
+ratatui = "0.30.0"
+rfd = "0.15.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.142"
+serialport = "4.8.1"

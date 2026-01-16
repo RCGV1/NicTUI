@@ -1,0 +1,8 @@
+[package]
+name = "simple-bin-flasher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serialport = "4"
+anyhow = "1"

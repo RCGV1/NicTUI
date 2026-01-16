@@ -1,0 +1,1 @@
+/Users/benjaminfaershtein/Desktop/TerminalNicSure/radio-flasher-rs/diagnostic_tool/target/release/radio-diagnostic: /Users/benjaminfaershtein/Desktop/TerminalNicSure/radio-flasher-rs/diagnostic_tool/src/main.rs

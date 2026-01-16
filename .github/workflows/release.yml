@@ -19,6 +19,8 @@ jobs:
       should_release: ${{ steps.check_tag.outputs.exists != 'true' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Get version from Cargo.toml
         id: version

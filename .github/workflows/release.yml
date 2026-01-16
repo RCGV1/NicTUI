@@ -90,8 +90,10 @@ jobs:
           githubToken: ${{ github.token }}
           install: |
             apt-get update -q -y
-            apt-get install -q -y libgtk-3-dev libudev-dev pkg-config
+            apt-get install -q -y libgtk-3-dev libudev-dev pkg-config curl
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           run: |
+            source "$HOME/.cargo/env"
             cargo build --release --bin nictui
 
       - name: Rename binary

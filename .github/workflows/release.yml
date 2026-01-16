@@ -43,7 +43,7 @@ jobs:
           docker run --rm --platform linux/arm64/v8 \
             -v ${{ github.workspace }}:/workspace \
             -w /workspace \
-            rust:1.75-slim \
+            rust:latest-slim \
             cargo build --release --bin nictui
 
       - name: Rename binary

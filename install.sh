@@ -51,8 +51,8 @@ detect_platform() {
 
 get_latest_version() {
     VERSION=$(gh api repos/${REPO}/releases/latest --jq '.tag_name' 2>/dev/null | sed 's/^v//')
-    if [ -z "$VERSION" ]; then
-        echo "Error: Could not fetch latest version" >&2
+    if [ -z "$VERSION" ] || echo "$VERSION" | grep -q "Not Found"; then
+        echo "Error: Could not fetch latest version. No releases found." >&2
         exit 1
     fi
     echo "$VERSION"

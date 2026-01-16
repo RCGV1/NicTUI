@@ -133,7 +133,6 @@ jobs:
             artifacts/nictui-macos-aarch64/*
             artifacts/nictui-windows-x86_64/*
             artifacts/checksums.txt
-          generate_release_notes: true
           body: |
             ## Download Binaries
 

@@ -78,22 +78,21 @@ jobs:
 
   build-linux-arm:
     runs-on: ubuntu-latest
+    name: Build ARM64 (QEMU)
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust target
-        run: rustup target add aarch64-unknown-linux-gnu
-
-      - name: Install cross
-        uses: taiki-e/install-action@v2
+      - uses: uraimo/run-on-arch-action@v3
+        name: Build on ARM64
         with:
-          tool: cross
-
-      - name: Install ARM dependencies
-        run: sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu
-
-      - name: Build Release
-        run: cross build --release --target aarch64-unknown-linux-gnu --bin nictui
+          arch: aarch64
+          distro: ubuntu24.04
+          githubToken: ${{ github.token }}
+          install: |
+            apt-get update -q -y
+            apt-get install -q -y libgtk-3-dev libudev-dev pkg-config
+          run: |
+            cargo build --release --bin nictui
 
       - name: Rename binary
         run: mv target/aarch64-unknown-linux-gnu/release/nictui nictui-${{ github.ref_name }}-linux-aarch64

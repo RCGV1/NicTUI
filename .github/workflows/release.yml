@@ -43,7 +43,9 @@ jobs:
           docker run --rm --platform linux/arm64/v8 \
             -v ${{ github.workspace }}:/workspace \
             -w /workspace \
-            arm64v8/rust:latest \
+            -e PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig \
+            -e PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu \
+            ghcr.io/cross-rs/aarch64-unknown-linux-gnu:latest \
             cargo build --release --bin nictui
 
       - name: Rename binary

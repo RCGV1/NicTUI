@@ -1,5 +1,4 @@
 use crate::app::App;
-use crate::ui::editors::centered_rect;
 use crate::ui::render_shortcut;
 use crate::ui::theme::*;
 use ratatui::{
@@ -9,6 +8,15 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Gauge, Paragraph},
 };
+
+const BIN_FLASH_OVERLAY_WIDTH: u16 = 55;
+const BIN_FLASH_OVERLAY_HEIGHT: u16 = 12;
+
+fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    Rect::new(area.x + x, area.y + y, width, height)
+}
 
 pub fn render_bin_flash_view(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
@@ -156,7 +164,7 @@ pub fn render_bin_flash_view(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 pub fn render_bin_flash_overlay(f: &mut Frame, app: &App, area: Rect) {
-    let popup_area = centered_rect(60, 20, area);
+    let popup_area = centered_fixed(BIN_FLASH_OVERLAY_WIDTH, BIN_FLASH_OVERLAY_HEIGHT, area);
     f.render_widget(Clear, popup_area);
 
     let block = Block::default()
@@ -172,16 +180,14 @@ pub fn render_bin_flash_overlay(f: &mut Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Length(4),
+            Constraint::Length(3),
             Constraint::Length(1),
         ])
         .split(inner_area);
 
-    let instruction = Paragraph::new(
-        "1. Turn OFF your radio\n2. Hold PTT\n3. Turn ON radio while holding button",
-    )
-    .alignment(Alignment::Center)
-    .style(Style::default().fg(Color::Yellow));
+    let instruction = Paragraph::new("1. Turn OFF radio\n2. Hold PTT, turn ON radio")
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::Yellow));
     f.render_widget(instruction, chunks[0]);
 
     let status = Paragraph::new(app.status_message.clone())

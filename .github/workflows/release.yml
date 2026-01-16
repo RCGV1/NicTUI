@@ -30,6 +30,7 @@ jobs:
       - name: Check if version tag already exists
         id: check_tag
         run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
           REPO="${{ github.repository }}"
           if gh api "repos/${REPO}/git/refs/tags/v${VERSION}" --silent 2>/dev/null; then
             echo "Tag v${VERSION} already exists"

@@ -76,37 +76,32 @@ jobs:
           name: nictui-linux-x86_64
           path: nictui-${{ github.ref_name }}-linux-x86_64
 
-  build-linux-arm:
-    runs-on: ubuntu-latest
-    name: Build ARM64 (QEMU)
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: uraimo/run-on-arch-action@v3
-        name: Build on ARM64
-        with:
-          arch: aarch64
-          distro: ubuntu24.04
-          githubToken: ${{ github.token }}
-          install: |
-            apt-get update -q -y
-            apt-get install -q -y libgtk-3-dev libudev-dev pkg-config curl
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-          run: |
-            source "$HOME/.cargo/env"
-            cargo build --release --bin nictui
-
-      - name: Rename binary
-        run: mv target/aarch64-unknown-linux-gnu/release/nictui nictui-${{ github.ref_name }}-linux-aarch64
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: nictui-linux-aarch64
-          path: nictui-${{ github.ref_name }}-linux-aarch64
+  # ARM build disabled - requires cross-rs/cross for proper GTK3/wayland support
+  # To re-enable:
+  # 1. Use cross-rs/cross for cross-compilation with pre-built Docker images
+  # 2. Configure Cross.toml with GTK3 dependencies for ARM target
+  # 3. Add back to create-release.needs array
+  #
+  # build-linux-arm:
+  #   runs-on: ubuntu-latest
+  #   name: Build ARM64
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: taiki-e/install-action@v2
+  #       with:
+  #         tool: cross
+  #     - name: Build Release
+  #       run: cross build --release --target aarch64-unknown-linux-gnu --bin nictui
+  #     - name: Rename binary
+  #       run: mv target/aarch64-unknown-linux-gnu/release/nictui nictui-${{ github.ref_name }}-linux-aarch64
+  #     - name: Upload artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: nictui-linux-aarch64
+  #         path: nictui-${{ github.ref_name }}-linux-aarch64
 
   create-release:
-    needs: [build-linux-x86_64, build-linux-arm, build-macos-x86_64, build-macos-aarch64, build-windows]
+    needs: [build-linux-x86_64, build-macos-x86_64, build-macos-aarch64, build-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -124,7 +119,6 @@ jobs:
         with:
           files: |
             artifacts/nictui-linux-x86_64/*
-            artifacts/nictui-linux-aarch64/*
             artifacts/nictui-macos-x86_64/*
             artifacts/nictui-macos-aarch64/*
             artifacts/nictui-windows-x86_64/*
@@ -137,10 +131,13 @@ jobs:
             | Platform | File |
             |----------|------|
             | Linux x86_64 | `nictui-${{ github.ref_name }}-linux-x86_64` |
-            | Linux ARM (Raspberry Pi) | `nictui-${{ github.ref_name }}-linux-aarch64` |
             | macOS x86_64 (Intel) | `nictui-${{ github.ref_name }}-macos-x86_64` |
             | macOS aarch64 (Apple Silicon) | `nictui-${{ github.ref_name }}-macos-aarch64` |
             | Windows x86_64 | `nictui-${{ github.ref_name }}-windows-x86_64.exe` |
+
+            ## Note
+
+            Linux ARM builds are temporarily disabled. See GitHub Actions workflow for status.
 
             ## Verification
 

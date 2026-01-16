@@ -18,7 +18,11 @@ chrono = "0.4.42"
 crossterm = "0.29.0"
 csv = "1.4.0"
 ratatui = "0.30.0"
-rfd = { version = "0.15.2", default-features = false, features = ["gtk3"] }
+rfd = "0.15.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.142"
 serialport = "4.8.1"
+
+[profile.release]
+lto = true
+opt-level = "z"

@@ -104,13 +104,14 @@ jobs:
     needs: [build-linux-x86_64, build-macos-x86_64, build-macos-aarch64, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - name: Get version from Cargo.toml
+      - name: Get version from Cargo.toml and create tag
         id: version
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | awk -F'"' '{print $2}')
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "Tagging release as v$VERSION"
-          git tag v$VERSION || true
+          git tag v$VERSION
+          git push origin v$VERSION || true
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -125,6 +126,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          name: Release v${{ steps.version.outputs.VERSION }}
           files: |
             artifacts/nictui-linux-x86_64/*
             artifacts/nictui-macos-x86_64/*
@@ -132,16 +135,15 @@ jobs:
             artifacts/nictui-windows-x86_64/*
             artifacts/checksums.txt
           generate_release_notes: true
-          name: Release ${{ github.ref_name }}
           body: |
             ## Download Binaries
 
             | Platform | File |
             |----------|------|
-            | Linux x86_64 | `nictui-${{ github.ref_name }}-linux-x86_64` |
-            | macOS x86_64 (Intel) | `nictui-${{ github.ref_name }}-macos-x86_64` |
-            | macOS aarch64 (Apple Silicon) | `nictui-${{ github.ref_name }}-macos-aarch64` |
-            | Windows x86_64 | `nictui-${{ github.ref_name }}-windows-x86_64.exe` |
+            | Linux x86_64 | `nictui-${{ steps.version.outputs.VERSION }}-linux-x86_64` |
+            | macOS x86_64 (Intel) | `nictui-${{ steps.version.outputs.VERSION }}-macos-x86_64` |
+            | macOS aarch64 (Apple Silicon) | `nictui-${{ steps.version.outputs.VERSION }}-macos-aarch64` |
+            | Windows x86_64 | `nictui-${{ steps.version.outputs.VERSION }}-windows-x86_64.exe` |
 
             ## Note
 

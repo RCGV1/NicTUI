@@ -9,7 +9,8 @@ use ratatui::{
 };
 
 pub fn render_channel_editor(f: &mut Frame, app: &App) {
-    let area = centered_rect(30, 20, f.area());
+    let (min_width, min_height) = get_minimal_popup_size(11, true);
+    let area = responsive_popup_area(min_width, min_height, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -67,24 +68,45 @@ pub fn render_channel_editor(f: &mut Frame, app: &App) {
             .constraints([Constraint::Min(0), Constraint::Length(1)])
             .split(inner_area);
 
-        let rows = fields.iter().enumerate().map(|(i, (label, value, _))| {
-            let style = if i == current_field_idx {
-                Style::default()
-                    .fg(COLOR_ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            let display_value = if i == current_field_idx {
-                format!("> {} <", app.edit_buffer)
-            } else {
-                value.clone()
-            };
-            Row::new(vec![
-                Cell::from(*label).style(style),
-                Cell::from(display_value).style(style),
-            ])
-        });
+        let available_height = chunks[0].height as usize;
+        let num_fields = fields.len();
+        let row_height = 1;
+
+        let visible_rows = if num_fields * row_height > available_height {
+            available_height / row_height
+        } else {
+            num_fields
+        };
+
+        let start_row = if current_field_idx >= visible_rows {
+            current_field_idx.saturating_sub(visible_rows - 1)
+        } else {
+            0
+        };
+
+        let rows = fields[start_row..]
+            .iter()
+            .take(visible_rows)
+            .enumerate()
+            .map(|(i, (label, value, _))| {
+                let actual_idx = start_row + i;
+                let style = if actual_idx == current_field_idx {
+                    Style::default()
+                        .fg(COLOR_ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                let display_value = if actual_idx == current_field_idx {
+                    format!("> {} <", app.edit_buffer)
+                } else {
+                    value.clone()
+                };
+                Row::new(vec![
+                    Cell::from(*label).style(style),
+                    Cell::from(display_value).style(style),
+                ])
+            });
 
         let table = Table::new(
             rows,
@@ -141,19 +163,24 @@ pub fn render_channel_editor(f: &mut Frame, app: &App) {
             f.render_widget(list, popup_area);
         }
 
-        f.render_widget(
-            Paragraph::new("↑/↓/Tab: Navigate | ←/→: Select | Enter: Save | Esc: Cancel")
+        if chunks[1].height > 0 {
+            f.render_widget(
+                Paragraph::new(
+                    "Up/Down/Tab: Navigate | Left/Right: Select | Enter: Save | Esc: Cancel",
+                )
                 .style(Style::default().fg(Color::DarkGray))
                 .alignment(ratatui::layout::Alignment::Center),
-            chunks[1],
-        );
+                chunks[1],
+            );
+        }
     }
 }
 
 pub fn render_settings_editor(f: &mut Frame, app: &App) {
     if let AppMode::EditSetting(idx) = app.mode {
         let meta = &SETTINGS_METADATA[idx];
-        let area = centered_rect(20, 20, f.area());
+        let (min_width, min_height) = get_minimal_popup_size(3, true);
+        let area = responsive_popup_area(min_width, min_height, f.area());
         f.render_widget(Clear, area);
 
         let block = Block::default()
@@ -176,17 +203,21 @@ pub fn render_settings_editor(f: &mut Frame, app: &App) {
         match meta.setting_type {
             SettingType::Numeric { min, max, unit } => {
                 let help_text = format!("Enter numeric value ({}-{} {})", min, max, unit);
-                f.render_widget(
-                    Paragraph::new(help_text).style(Style::default().fg(Color::Gray)),
-                    chunks[0],
-                );
+                if chunks[0].height > 0 {
+                    f.render_widget(
+                        Paragraph::new(help_text).style(Style::default().fg(Color::Gray)),
+                        chunks[0],
+                    );
+                }
 
-                f.render_widget(
-                    Paragraph::new(app.edit_buffer.as_str())
-                        .block(Block::default().borders(Borders::ALL).title(" Value "))
-                        .style(Style::default().fg(Color::White)),
-                    chunks[1],
-                );
+                if chunks[1].height > 0 {
+                    f.render_widget(
+                        Paragraph::new(app.edit_buffer.as_str())
+                            .block(Block::default().borders(Borders::ALL).title(" Value "))
+                            .style(Style::default().fg(Color::White)),
+                        chunks[1],
+                    );
+                }
             }
             SettingType::Boolean | SettingType::Enum(_) => {
                 let options = match meta.setting_type {
@@ -195,50 +226,57 @@ pub fn render_settings_editor(f: &mut Frame, app: &App) {
                     _ => unreachable!(),
                 };
 
-                let help_text = "Use ↑/↓ to select, Enter to confirm";
-                f.render_widget(
-                    Paragraph::new(help_text).style(Style::default().fg(Color::Gray)),
-                    chunks[0],
-                );
+                let help_text = "Use Up/Down to select, Enter to confirm";
+                if chunks[0].height > 0 {
+                    f.render_widget(
+                        Paragraph::new(help_text).style(Style::default().fg(Color::Gray)),
+                        chunks[0],
+                    );
+                }
 
-                let items: Vec<ListItem> = options
-                    .iter()
-                    .enumerate()
-                    .map(|(i, opt)| {
-                        let style = if i == app.selection_index {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(COLOR_ACCENT)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::Gray)
-                        };
-                        ListItem::new(format!("  {}  ", opt)).style(style)
-                    })
-                    .collect();
+                if chunks[1].height > 0 {
+                    let items: Vec<ListItem> = options
+                        .iter()
+                        .enumerate()
+                        .map(|(i, opt)| {
+                            let style = if i == app.selection_index {
+                                Style::default()
+                                    .fg(Color::Black)
+                                    .bg(COLOR_ACCENT)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::Gray)
+                            };
+                            ListItem::new(format!("  {}  ", opt)).style(style)
+                        })
+                        .collect();
 
-                let list = List::new(items).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Select Option "),
-                );
-                f.render_widget(list, chunks[1]);
+                    let list = List::new(items).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Select Option "),
+                    );
+                    f.render_widget(list, chunks[1]);
+                }
             }
         }
 
-        if let Some(s) = &app.settings {
-            let current_val = s.get_display_value(idx);
-            f.render_widget(
-                Paragraph::new(format!("Current Value: {}", current_val))
-                    .style(Style::default().fg(Color::DarkGray)),
-                chunks[2],
-            );
+        if chunks[2].height > 0 {
+            if let Some(s) = &app.settings {
+                let current_val = s.get_display_value(idx);
+                f.render_widget(
+                    Paragraph::new(format!("Current Value: {}", current_val))
+                        .style(Style::default().fg(Color::DarkGray)),
+                    chunks[2],
+                );
+            }
         }
     }
 }
 
 pub fn render_dtmf_editor(f: &mut Frame, app: &App) {
-    let area = centered_rect(60, 40, f.area());
+    let (min_width, min_height) = get_minimal_popup_size(7, true);
+    let area = responsive_popup_area(min_width, min_height, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -254,16 +292,32 @@ pub fn render_dtmf_editor(f: &mut Frame, app: &App) {
             if let Some(dtmf) = app.dtmf_presets.get(idx) {
                 let digits_str: String = dtmf.digits.iter().map(|d| format!("{:X}", d)).collect();
 
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
+                let available_height = inner_area.height.saturating_sub(4) as usize;
+                let num_chunks = 6;
+                let chunk_height = if available_height >= num_chunks {
+                    vec![
                         Constraint::Length(1),
                         Constraint::Length(3),
                         Constraint::Length(1),
                         Constraint::Length(3),
                         Constraint::Length(1),
                         Constraint::Length(2),
-                    ])
+                    ]
+                } else {
+                    let h = (available_height / num_chunks).max(1) as u16;
+                    vec![
+                        Constraint::Length(1),
+                        Constraint::Length(h),
+                        Constraint::Length(1),
+                        Constraint::Length(h),
+                        Constraint::Length(1),
+                        Constraint::Length(h),
+                    ]
+                };
+
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(chunk_height)
                     .split(inner_area);
 
                 let fields = vec![("Label", dtmf.label.clone()), ("Digits", digits_str)];
@@ -275,83 +329,104 @@ pub fn render_dtmf_editor(f: &mut Frame, app: &App) {
                     fields[0].clone()
                 };
 
-                f.render_widget(
-                    Paragraph::new("Label:").style(Style::default().fg(Color::Gray)),
-                    chunks[0],
-                );
+                if chunks[0].height > 0 {
+                    f.render_widget(
+                        Paragraph::new("Label:").style(Style::default().fg(Color::Gray)),
+                        chunks[0],
+                    );
+                }
 
-                let label_style = if current_field_idx == 0 {
-                    Style::default()
-                        .fg(COLOR_ACCENT)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                let label_display = if current_field_idx == 0 {
-                    format!("> {} <", app.edit_buffer)
-                } else {
-                    current.0.to_string()
-                };
-                f.render_widget(
-                    Paragraph::new(label_display)
-                        .block(Block::default().borders(Borders::ALL).title(" Value "))
-                        .style(label_style),
-                    chunks[1],
-                );
+                if chunks[1].height > 0 {
+                    let label_style = if current_field_idx == 0 {
+                        Style::default()
+                            .fg(COLOR_ACCENT)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    let label_display = if current_field_idx == 0 {
+                        format!("> {} <", app.edit_buffer)
+                    } else {
+                        current.0.to_string()
+                    };
+                    f.render_widget(
+                        Paragraph::new(label_display)
+                            .block(Block::default().borders(Borders::ALL).title(" Value "))
+                            .style(label_style),
+                        chunks[1],
+                    );
+                }
 
-                f.render_widget(
-                    Paragraph::new("Digits (DTMF sequence to send):")
-                        .style(Style::default().fg(Color::Gray)),
-                    chunks[2],
-                );
+                if chunks[2].height > 0 {
+                    f.render_widget(
+                        Paragraph::new("Digits (DTMF sequence to send):")
+                            .style(Style::default().fg(Color::Gray)),
+                        chunks[2],
+                    );
+                }
 
-                let digits_style = if current_field_idx == 1 {
-                    Style::default()
-                        .fg(COLOR_ACCENT)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                let digits_display = if current_field_idx == 1 {
-                    format!("> {} <", app.edit_buffer)
-                } else {
-                    current.1.clone()
-                };
-                f.render_widget(
-                    Paragraph::new(digits_display)
-                        .block(Block::default().borders(Borders::ALL).title(" Value "))
-                        .style(digits_style),
-                    chunks[3],
-                );
+                if chunks[3].height > 0 {
+                    let digits_style = if current_field_idx == 1 {
+                        Style::default()
+                            .fg(COLOR_ACCENT)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    let digits_display = if current_field_idx == 1 {
+                        format!("> {} <", app.edit_buffer)
+                    } else {
+                        current.1.clone()
+                    };
+                    f.render_widget(
+                        Paragraph::new(digits_display)
+                            .block(Block::default().borders(Borders::ALL).title(" Value "))
+                            .style(digits_style),
+                        chunks[3],
+                    );
+                }
 
-                f.render_widget(
-                    Paragraph::new("DTMF Keys: 0-9, A-F, *, #")
-                        .style(Style::default().fg(Color::DarkGray)),
-                    chunks[4],
-                );
+                if chunks[4].height > 0 {
+                    f.render_widget(
+                        Paragraph::new("DTMF Keys: 0-9, A-F, *, #")
+                            .style(Style::default().fg(Color::DarkGray)),
+                        chunks[4],
+                    );
+                }
 
-                f.render_widget(
-                    Paragraph::new("↑/↓/Tab: Navigate | Enter: Save | Esc: Cancel")
-                        .style(Style::default().fg(Color::DarkGray))
-                        .alignment(ratatui::layout::Alignment::Center),
-                    chunks[5],
-                );
+                if chunks[5].height > 0 {
+                    f.render_widget(
+                        Paragraph::new("Up/Down/Tab: Navigate | Enter: Save | Esc: Cancel")
+                            .style(Style::default().fg(Color::DarkGray))
+                            .alignment(ratatui::layout::Alignment::Center),
+                        chunks[5],
+                    );
+                }
             }
         }
     }
 }
 
 pub fn render_progress_overlay(f: &mut Frame, app: &App, area: Rect) {
-    let popup_area = centered_rect(60, 10, area);
-    f.render_widget(Clear, popup_area);
+    let (min_width, min_height) = get_minimal_popup_size(3, false);
+    let popup_area = responsive_popup_area(min_width, min_height, area);
+
+    let popup_width = popup_area.width.max(40).min(area.width.saturating_sub(2));
+    let popup_height = popup_area.height.max(5).min(area.height.saturating_sub(2));
+
+    let x = (area.width.saturating_sub(popup_width) / 2).max(1);
+    let y = (area.height.saturating_sub(popup_height) / 2).max(1);
+
+    let centered_area = Rect::new(x, y, popup_width, popup_height);
+    f.render_widget(Clear, centered_area);
 
     let block = Block::default()
         .title(" OPERATION IN PROGRESS ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLOR_PRIMARY));
 
-    let inner_area = block.inner(popup_area);
-    f.render_widget(block, popup_area);
+    let inner_area = block.inner(centered_area);
+    f.render_widget(block, centered_area);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -366,22 +441,25 @@ pub fn render_progress_overlay(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(app.status_message.as_str()).alignment(ratatui::layout::Alignment::Center);
     f.render_widget(status, chunks[0]);
 
-    let gauge = Gauge::default()
-        .gauge_style(
-            Style::default()
-                .fg(COLOR_PRIMARY)
-                .bg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )
-        .percent((app.progress * 100.0) as u16)
-        .label(format!("{:.1}%", app.progress * 100.0));
-    f.render_widget(gauge, chunks[1]);
+    if chunks[1].height > 0 {
+        let gauge = Gauge::default()
+            .gauge_style(
+                Style::default()
+                    .fg(COLOR_PRIMARY)
+                    .bg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .percent((app.progress * 100.0) as u16)
+            .label(format!("{:.1}%", app.progress * 100.0));
+        f.render_widget(gauge, chunks[1]);
+    }
 }
 
 pub fn render_error(f: &mut Frame, msg: &str, area: Rect) {
-    let area = centered_rect(50, 25, area);
+    let (min_width, min_height) = get_minimal_popup_size(7, false);
+    let area = responsive_popup_area(min_width, min_height, area);
     f.render_widget(Clear, area);
-    let p = Paragraph::new(format!("\n ⚠️ ERROR\n\n{}\n\nPress Esc to return", msg))
+    let p = Paragraph::new(format!("\n ERROR\n\n{}\n\nPress Esc to return", msg))
         .alignment(ratatui::layout::Alignment::Center)
         .style(Style::default().fg(COLOR_ERROR))
         .block(
@@ -394,7 +472,8 @@ pub fn render_error(f: &mut Frame, msg: &str, area: Rect) {
 
 pub fn render_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
     if let AppMode::DeleteChannelConfirm(channel_idx) = app.mode {
-        let popup_area = centered_rect(17, 15, area);
+        let (min_width, min_height) = get_minimal_popup_size(7, false);
+        let popup_area = responsive_popup_area(min_width, min_height, area);
         f.render_widget(Clear, popup_area);
 
         let channel_name = app
@@ -404,7 +483,7 @@ pub fn render_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
             .unwrap_or_else(|| format!("Channel {}", channel_idx + 1));
 
         let p = Paragraph::new(format!(
-            "\n 🗑️ DELETE CHANNEL?\n\n{}\n\n{} to confirm, {} to cancel",
+            "\n DELETE CHANNEL?\n\n{}\n\n{} to confirm, {} to cancel",
             channel_name,
             crate::ui::render_shortcut("Enter"),
             crate::ui::render_shortcut("Esc")
@@ -421,7 +500,8 @@ pub fn render_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
 }
 
 pub fn render_scan_preset_editor(f: &mut Frame, app: &App) {
-    let area = centered_rect(30, 20, f.area());
+    let (min_width, min_height) = get_minimal_popup_size(9, true);
+    let area = responsive_popup_area(min_width, min_height, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -465,24 +545,45 @@ pub fn render_scan_preset_editor(f: &mut Frame, app: &App) {
             .constraints([Constraint::Min(0), Constraint::Length(1)])
             .split(inner_area);
 
-        let rows = fields.iter().enumerate().map(|(i, (label, value, _))| {
-            let style = if i == current_field_idx {
-                Style::default()
-                    .fg(COLOR_ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            let display_value = if i == current_field_idx {
-                format!("> {} <", app.edit_buffer)
-            } else {
-                value.clone()
-            };
-            Row::new(vec![
-                Cell::from(*label).style(style),
-                Cell::from(display_value).style(style),
-            ])
-        });
+        let available_height = chunks[0].height as usize;
+        let num_fields = fields.len();
+        let row_height = 1;
+
+        let visible_rows = if num_fields * row_height > available_height {
+            available_height / row_height
+        } else {
+            num_fields
+        };
+
+        let start_row = if current_field_idx >= visible_rows {
+            current_field_idx.saturating_sub(visible_rows - 1)
+        } else {
+            0
+        };
+
+        let rows = fields[start_row..]
+            .iter()
+            .take(visible_rows)
+            .enumerate()
+            .map(|(i, (label, value, _))| {
+                let actual_idx = start_row + i;
+                let style = if actual_idx == current_field_idx {
+                    Style::default()
+                        .fg(COLOR_ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                let display_value = if actual_idx == current_field_idx {
+                    format!("> {} <", app.edit_buffer)
+                } else {
+                    value.clone()
+                };
+                Row::new(vec![
+                    Cell::from(*label).style(style),
+                    Cell::from(display_value).style(style),
+                ])
+            });
 
         let table = Table::new(
             rows,
@@ -541,37 +642,72 @@ pub fn render_scan_preset_editor(f: &mut Frame, app: &App) {
             f.render_widget(list, popup_area);
         }
 
-        f.render_widget(
-            Paragraph::new("↑/↓/Tab: Navigate | ←/→: Select | Enter: Save | Esc: Cancel")
+        if chunks[1].height > 0 {
+            f.render_widget(
+                Paragraph::new(
+                    "Up/Down/Tab: Navigate | Left/Right: Select | Enter: Save | Esc: Cancel",
+                )
                 .style(Style::default().fg(Color::DarkGray))
                 .alignment(ratatui::layout::Alignment::Center),
-            chunks[1],
-        );
+                chunks[1],
+            );
+        }
     }
 }
 
 pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
+    let terminal_width = r.width;
+    let terminal_height = r.height;
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+    let min_width: u16 = 40;
+    let min_height: u16 = 10;
+
+    let width = if percent_x < 100 {
+        ((terminal_width as u32 * percent_x as u32) / 100) as u16
+    } else {
+        terminal_width
+    };
+
+    let height = if percent_y < 100 {
+        ((terminal_height as u32 * percent_y as u32) / 100) as u16
+    } else {
+        terminal_height
+    };
+
+    let width = width.max(min_width).min(terminal_width.saturating_sub(2));
+    let height = height
+        .max(min_height)
+        .min(terminal_height.saturating_sub(2));
+
+    let x = (terminal_width.saturating_sub(width) / 2).max(1);
+    let y = (terminal_height.saturating_sub(height) / 2).max(1);
+
+    Rect::new(x, y, width, height)
+}
+
+pub fn get_minimal_popup_size(num_fields: usize, has_footer: bool) -> (u16, u16) {
+    let min_content_height = num_fields as u16 + 2;
+    let footer_height = if has_footer { 1 } else { 0 };
+    let total_height = min_content_height + footer_height + 2;
+
+    let min_width: u16 = 35;
+
+    (min_width, total_height)
+}
+
+pub fn responsive_popup_area(content_width: u16, content_height: u16, terminal: Rect) -> Rect {
+    let popup_width = content_width.max(30).min(terminal.width.saturating_sub(2));
+    let popup_height = content_height.max(5).min(terminal.height.saturating_sub(2));
+
+    let x = (terminal.width.saturating_sub(popup_width) / 2).max(1);
+    let y = (terminal.height.saturating_sub(popup_height) / 2).max(1);
+
+    Rect::new(x, y, popup_width, popup_height)
 }
 
 pub fn render_bandplan_editor(f: &mut Frame, app: &App) {
-    let area = centered_rect(35, 25, f.area());
+    let (min_width, min_height) = get_minimal_popup_size(9, true);
+    let area = responsive_popup_area(min_width, min_height, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -640,24 +776,45 @@ pub fn render_bandplan_editor(f: &mut Frame, app: &App) {
             .constraints([Constraint::Min(0), Constraint::Length(1)])
             .split(inner_area);
 
-        let rows = fields.iter().enumerate().map(|(i, (label, value, _))| {
-            let style = if i == current_field_idx {
-                Style::default()
-                    .fg(COLOR_ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            let display_value = if i == current_field_idx {
-                format!("> {} <", app.edit_buffer)
-            } else {
-                value.clone()
-            };
-            Row::new(vec![
-                Cell::from(*label).style(style),
-                Cell::from(display_value).style(style),
-            ])
-        });
+        let available_height = chunks[0].height as usize;
+        let num_fields = fields.len();
+        let row_height = 1;
+
+        let visible_rows = if num_fields * row_height > available_height {
+            available_height / row_height
+        } else {
+            num_fields
+        };
+
+        let start_row = if current_field_idx >= visible_rows {
+            current_field_idx.saturating_sub(visible_rows - 1)
+        } else {
+            0
+        };
+
+        let rows = fields[start_row..]
+            .iter()
+            .take(visible_rows)
+            .enumerate()
+            .map(|(i, (label, value, _))| {
+                let actual_idx = start_row + i;
+                let style = if actual_idx == current_field_idx {
+                    Style::default()
+                        .fg(COLOR_ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                let display_value = if actual_idx == current_field_idx {
+                    format!("> {} <", app.edit_buffer)
+                } else {
+                    value.clone()
+                };
+                Row::new(vec![
+                    Cell::from(*label).style(style),
+                    Cell::from(display_value).style(style),
+                ])
+            });
 
         let table = Table::new(
             rows,
@@ -715,11 +872,15 @@ pub fn render_bandplan_editor(f: &mut Frame, app: &App) {
             f.render_widget(list, popup_area);
         }
 
-        f.render_widget(
-            Paragraph::new("↑/↓/Tab: Navigate | ←/→: Select | Enter: Save | Esc: Cancel")
+        if chunks[1].height > 0 {
+            f.render_widget(
+                Paragraph::new(
+                    "Up/Down/Tab: Navigate | Left/Right: Select | Enter: Save | Esc: Cancel",
+                )
                 .style(Style::default().fg(Color::DarkGray))
                 .alignment(ratatui::layout::Alignment::Center),
-            chunks[1],
-        );
+                chunks[1],
+            );
+        }
     }
 }

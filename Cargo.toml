@@ -2,7 +2,8 @@
 name = "nictui"
 version = "1.0.0"
 edition = "2024"
-description = "NicTUI - Professional TDH3 Radio Programmer"
+description = "Professional TDH3 Radio Programmer"
+license = "GPL-3.0-only"
 
 [lib]
 path = "src/lib.rs"

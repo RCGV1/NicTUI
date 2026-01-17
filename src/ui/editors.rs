@@ -28,7 +28,7 @@ const CHANNEL_EDITOR_WIDTH: u16 = 42;
 const CHANNEL_EDITOR_HEIGHT: u16 = 15;
 
 const SETTINGS_EDITOR_WIDTH: u16 = 42;
-const SETTINGS_EDITOR_HEIGHT: u16 = 12;
+const SETTINGS_EDITOR_HEIGHT: u16 = 15;
 
 const DTMF_EDITOR_WIDTH: u16 = 50;
 const DTMF_EDITOR_HEIGHT: u16 = 11;
@@ -39,7 +39,7 @@ const BANDPLAN_EDITOR_HEIGHT: u16 = 17;
 const SCAN_PRESET_EDITOR_WIDTH: u16 = 42;
 const SCAN_PRESET_EDITOR_HEIGHT: u16 = 15;
 
-const PROGRESS_OVERLAY_WIDTH: u16 = 52;
+const PROGRESS_OVERLAY_WIDTH: u16 = 60;
 const PROGRESS_OVERLAY_HEIGHT: u16 = 6;
 
 const ERROR_DIALOG_WIDTH: u16 = 50;
@@ -204,12 +204,7 @@ pub fn render_settings_editor(f: &mut Frame, app: &App) {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
+            .constraints([Constraint::Length(11), Constraint::Length(1)])
             .split(inner_area);
 
         match meta.setting_type {
@@ -224,58 +219,43 @@ pub fn render_settings_editor(f: &mut Frame, app: &App) {
                     Paragraph::new(app.edit_buffer.as_str())
                         .block(Block::default().borders(Borders::ALL).title(" Value "))
                         .style(Style::default().fg(Color::White)),
-                    chunks[1],
+                    chunks[0],
                 );
             }
             SettingType::Boolean | SettingType::Enum(_) => {
-                let help_text = "Use ↑/↓ to select, Enter to confirm";
-                f.render_widget(
-                    Paragraph::new(help_text).style(Style::default().fg(Color::Gray)),
-                    chunks[0],
-                );
-
                 let options = match meta.setting_type {
                     SettingType::Boolean => vec!["Off", "On"],
                     SettingType::Enum(opts) => opts.to_vec(),
                     _ => unreachable!(),
                 };
 
-                let items: Vec<ListItem> = options
-                    .iter()
-                    .enumerate()
-                    .map(|(i, opt)| {
-                        let style = if i == app.selection_index {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(COLOR_ACCENT)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::Gray)
-                        };
-                        ListItem::new(format!(" {} ", opt)).style(style)
-                    })
-                    .collect();
+                let rows = options.iter().enumerate().map(|(i, opt)| {
+                    let style = if i == app.selection_index {
+                        Style::default()
+                            .fg(COLOR_ACCENT)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    let display_value = if i == app.selection_index {
+                        format!("> {} <", opt)
+                    } else {
+                        opt.to_string()
+                    };
+                    Row::new(vec![Cell::from(display_value).style(style)])
+                });
 
-                let list = List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(" Select "));
-                f.render_widget(list, chunks[1]);
+                let table = Table::new(rows, [Constraint::Length(39)])
+                    .block(Block::default().borders(Borders::NONE));
+                f.render_widget(table, chunks[0]);
             }
-        }
-
-        if let Some(s) = &app.settings {
-            let current_val = s.get_display_value(idx);
-            f.render_widget(
-                Paragraph::new(format!("Current: {}", current_val))
-                    .style(Style::default().fg(Color::DarkGray)),
-                chunks[2],
-            );
         }
 
         f.render_widget(
             Paragraph::new("↑/↓: Select | Enter: Save | Esc: Cancel")
                 .style(Style::default().fg(Color::DarkGray))
                 .alignment(ratatui::layout::Alignment::Center),
-            chunks[3],
+            chunks[1],
         );
     }
 }

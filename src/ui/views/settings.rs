@@ -48,10 +48,10 @@ pub fn render_settings_table(f: &mut Frame, app: &mut App, area: Rect) {
     let (title, border_style) = if app.settings_dirty {
         (
             " RADIO SETTINGS (UNSAVED) ",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(Color::Cyan),
         )
     } else {
-        (" RADIO SETTINGS ", Style::default().fg(Color::Green))
+        (" RADIO SETTINGS ", Style::default().fg(Color::Cyan))
     };
 
     let table = Table::new(
@@ -79,7 +79,7 @@ pub fn render_settings_table(f: &mut Frame, app: &mut App, area: Rect) {
     )
     .row_highlight_style(
         Style::default()
-            .bg(Color::Rgb(40, 80, 40))
+            .bg(Color::Rgb(40, 40, 80))
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol(">> ");

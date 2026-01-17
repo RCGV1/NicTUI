@@ -31,7 +31,7 @@ pub fn render_dtmf(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = app.dtmf_presets.iter().enumerate().map(|(i, dp)| {
         let style = if Some(i) == app.dtmf_state.selected() {
             Style::default()
-                .bg(Color::Rgb(80, 60, 40))
+                .bg(Color::Rgb(40, 40, 80))
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD)
         } else {
@@ -54,11 +54,11 @@ pub fn render_dtmf(f: &mut Frame, app: &mut App, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .title(" DTMF PRESETS ")
-            .border_style(Style::default().fg(Color::Rgb(255, 165, 0))),
+            .border_style(Style::default().fg(Color::Cyan)),
     )
     .row_highlight_style(
         Style::default()
-            .bg(Color::Rgb(80, 60, 40))
+            .bg(Color::Rgb(40, 40, 80))
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol(">> ");

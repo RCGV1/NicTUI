@@ -44,11 +44,9 @@ pub fn render_scanning_page(f: &mut Frame, app: &mut App, area: Rect) {
 
             let style = if is_selected {
                 Style::default()
-                    .bg(Color::Rgb(50, 50, 80))
+                    .bg(Color::Rgb(40, 40, 80))
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
-            } else if i % 2 == 0 {
-                Style::default().bg(Color::Rgb(30, 30, 35))
             } else {
                 Style::default()
             };
@@ -92,6 +90,11 @@ pub fn render_scanning_page(f: &mut Frame, app: &mut App, area: Rect) {
                 .title(" SCAN PRESETS (Press Enter to edit) ")
                 .border_style(border_style),
         )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(40, 40, 80))
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol(">> ");
 
         f.render_stateful_widget(table, chunks[0], &mut app.preset_state);
@@ -100,7 +103,7 @@ pub fn render_scanning_page(f: &mut Frame, app: &mut App, area: Rect) {
     render_group_list(f, app, chunks[1]);
 }
 
-fn render_group_list(f: &mut Frame, app: &App, area: Rect) {
+fn render_group_list(f: &mut Frame, app: &mut App, area: Rect) {
     let border_style = Style::default().fg(Color::Cyan);
 
     let group_chunks = Layout::default()
@@ -181,7 +184,13 @@ fn render_group_list(f: &mut Frame, app: &App, area: Rect) {
             .borders(Borders::ALL)
             .title(" MEMORY GROUPS (A-O) ")
             .border_style(border_style),
-    );
+    )
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Rgb(40, 40, 80))
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol(">> ");
 
-    f.render_widget(table, group_chunks[0]);
+    f.render_stateful_widget(table, group_chunks[0], &mut app.scanning_group_state);
 }

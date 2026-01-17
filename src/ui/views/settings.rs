@@ -1,7 +1,6 @@
 use crate::app::App;
 use crate::protocol::SETTINGS_METADATA;
 use crate::ui::render_shortcut;
-use crate::ui::theme::COLOR_ACCENT;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -30,8 +29,8 @@ pub fn render_settings_table(f: &mut Frame, app: &mut App, area: Rect) {
         let display_val = settings.get_display_value(i);
         let style = if Some(i) == app.settings_state.selected() {
             Style::default()
-                .fg(Color::Black)
-                .bg(COLOR_ACCENT)
+                .fg(Color::White)
+                .bg(Color::Rgb(40, 40, 80))
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)

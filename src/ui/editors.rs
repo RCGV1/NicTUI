@@ -36,11 +36,11 @@ const DTMF_EDITOR_HEIGHT: u16 = 11;
 const BANDPLAN_EDITOR_WIDTH: u16 = 46;
 const BANDPLAN_EDITOR_HEIGHT: u16 = 17;
 
-const SCAN_PRESET_EDITOR_WIDTH: u16 = 42;
+const SCAN_PRESET_EDITOR_WIDTH: u16 = 50;
 const SCAN_PRESET_EDITOR_HEIGHT: u16 = 15;
 
-const PROGRESS_OVERLAY_WIDTH: u16 = 70;
-const PROGRESS_OVERLAY_HEIGHT: u16 = 10;
+const PROGRESS_OVERLAY_WIDTH: u16 = 80;
+const PROGRESS_OVERLAY_HEIGHT: u16 = 8;
 
 const ERROR_DIALOG_WIDTH: u16 = 50;
 const ERROR_DIALOG_HEIGHT: u16 = 9;
@@ -525,7 +525,7 @@ pub fn render_scan_preset_editor(f: &mut Frame, app: &App) {
             ("Persist (s)", sp.persist.to_string(), false),
             ("Resume (s)", sp.resume.to_string(), false),
             ("Modulation", mod_str, true),
-            ("Ultrascan", sp.ultrascan.to_string(), true),
+            ("Ultrascan", sp.ultrascan.to_string(), false),
         ];
 
         let chunks = Layout::default()
@@ -552,7 +552,7 @@ pub fn render_scan_preset_editor(f: &mut Frame, app: &App) {
             ])
         });
 
-        let table = Table::new(rows, [Constraint::Length(16), Constraint::Length(25)])
+        let table = Table::new(rows, [Constraint::Length(16), Constraint::Length(33)])
             .block(Block::default().borders(Borders::NONE));
         f.render_widget(table, chunks[0]);
 
@@ -560,10 +560,6 @@ pub fn render_scan_preset_editor(f: &mut Frame, app: &App) {
         if is_enum {
             let options = match current_field_idx {
                 6 => vec!["FM", "AM", "USB"],
-                7 => vec![
-                    "Off", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13",
-                    "14", "15", "16", "17", "18", "19", "20",
-                ],
                 _ => vec![],
             };
 

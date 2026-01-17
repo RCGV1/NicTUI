@@ -298,7 +298,8 @@ pub fn render_dtmf_editor(f: &mut Frame, app: &App) {
 
                 let label_style = if field_idx == 0 {
                     Style::default()
-                        .fg(COLOR_ACCENT)
+                        .fg(Color::White)
+                        .bg(Color::Rgb(40, 40, 80))
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::Gray)
@@ -321,7 +322,8 @@ pub fn render_dtmf_editor(f: &mut Frame, app: &App) {
 
                 let digits_style = if field_idx == 1 {
                     Style::default()
-                        .fg(COLOR_ACCENT)
+                        .fg(Color::White)
+                        .bg(Color::Rgb(40, 40, 80))
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::Gray)

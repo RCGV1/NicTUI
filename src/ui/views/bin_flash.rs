@@ -9,7 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Gauge, Paragraph},
 };
 
-const BIN_FLASH_OVERLAY_WIDTH: u16 = 55;
+const BIN_FLASH_OVERLAY_WIDTH: u16 = 70;
 const BIN_FLASH_OVERLAY_HEIGHT: u16 = 12;
 
 fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {

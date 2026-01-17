@@ -12,7 +12,7 @@ mod widgets;
 use self::editors::*;
 use self::theme::*;
 use crate::app::{App, AppMode, MainTab};
-use views::bin_flash::render_bin_flash_overlay as render_bin_flash_overlay_view;
+use views::bin_flash::render_bin_flash_overlay;
 pub use views::*;
 
 pub fn ui(f: &mut Frame, app: &mut App) {
@@ -20,8 +20,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     match &app.mode {
         AppMode::PortSelection => render_port_selection(f, app, area),
         AppMode::Main(tab) => render_main_layout(f, app, area, *tab),
-        AppMode::Reading | AppMode::Writing => render_progress_overlay(f, app, area),
-        AppMode::BinFlashing => render_bin_flash_overlay_view(f, app, area),
+        AppMode::Reading | AppMode::Writing => {
+            render_progress_overlay(f, app, area, "OPERATION IN PROGRESS", None)
+        }
+        AppMode::BinFlashing => render_bin_flash_overlay(f, app, area),
         AppMode::EditChannel(_) => {
             render_main_layout(f, app, area, MainTab::Channels);
             render_channel_editor(f, app);

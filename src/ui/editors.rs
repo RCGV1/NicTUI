@@ -40,7 +40,7 @@ const SCAN_PRESET_EDITOR_WIDTH: u16 = 42;
 const SCAN_PRESET_EDITOR_HEIGHT: u16 = 15;
 
 const PROGRESS_OVERLAY_WIDTH: u16 = 70;
-const PROGRESS_OVERLAY_HEIGHT: u16 = 6;
+const PROGRESS_OVERLAY_HEIGHT: u16 = 10;
 
 const ERROR_DIALOG_WIDTH: u16 = 50;
 const ERROR_DIALOG_HEIGHT: u16 = 9;
@@ -359,37 +359,89 @@ pub fn render_dtmf_editor(f: &mut Frame, app: &App) {
     }
 }
 
-pub fn render_progress_overlay(f: &mut Frame, app: &App, area: Rect) {
+pub fn render_progress_overlay(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    title: &str,
+    instruction: Option<&str>,
+) {
     let popup_area = centered_fixed(PROGRESS_OVERLAY_WIDTH, PROGRESS_OVERLAY_HEIGHT, area);
     f.render_widget(Clear, popup_area);
 
     let block = Block::default()
-        .title(" OPERATION IN PROGRESS ")
+        .title(format!(" {} ", title))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLOR_PRIMARY));
 
     let inner_area = block.inner(popup_area);
     f.render_widget(block, popup_area);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(3)])
-        .split(inner_area);
+    if let Some(instr) = instruction {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(inner_area);
 
-    let status =
-        Paragraph::new(app.status_message.as_str()).alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(status, chunks[0]);
+        let instruction_text = Paragraph::new(instr)
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(Color::Yellow));
+        f.render_widget(instruction_text, chunks[0]);
 
-    let gauge = Gauge::default()
-        .gauge_style(
-            Style::default()
-                .fg(COLOR_PRIMARY)
-                .bg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )
-        .percent((app.progress * 100.0) as u16)
-        .label(format!("{:.1}%", app.progress * 100.0));
-    f.render_widget(gauge, chunks[1]);
+        let status = Paragraph::new(app.status_message.as_str())
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(status, chunks[1]);
+
+        let gauge = Gauge::default()
+            .gauge_style(
+                Style::default()
+                    .fg(COLOR_PRIMARY)
+                    .bg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .percent((app.progress * 100.0) as u16)
+            .label(format!("{:.1}%", app.progress * 100.0));
+        f.render_widget(gauge, chunks[2]);
+
+        let help = Paragraph::new("Press Esc to abort")
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(help, chunks[3]);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(inner_area);
+
+        let status = Paragraph::new(app.status_message.as_str())
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(status, chunks[0]);
+
+        let gauge = Gauge::default()
+            .gauge_style(
+                Style::default()
+                    .fg(COLOR_PRIMARY)
+                    .bg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .percent((app.progress * 100.0) as u16)
+            .label(format!("{:.1}%", app.progress * 100.0));
+        f.render_widget(gauge, chunks[1]);
+
+        let help = Paragraph::new("Press Esc to cancel")
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(help, chunks[2]);
+    }
 }
 
 pub fn render_error(f: &mut Frame, msg: &str, area: Rect) {

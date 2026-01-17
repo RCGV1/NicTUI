@@ -1,22 +1,14 @@
 use crate::app::App;
+use crate::ui::editors::render_progress_overlay;
 use crate::ui::render_shortcut;
 use crate::ui::theme::*;
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, Paragraph},
+    widgets::{Block, Borders, Paragraph},
 };
-
-const BIN_FLASH_OVERLAY_WIDTH: u16 = 70;
-const BIN_FLASH_OVERLAY_HEIGHT: u16 = 12;
-
-fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
-    let x = (area.width.saturating_sub(width)) / 2;
-    let y = (area.height.saturating_sub(height)) / 2;
-    Rect::new(area.x + x, area.y + y, width, height)
-}
 
 pub fn render_bin_flash_view(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
@@ -164,50 +156,11 @@ pub fn render_bin_flash_view(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 pub fn render_bin_flash_overlay(f: &mut Frame, app: &App, area: Rect) {
-    let popup_area = centered_fixed(BIN_FLASH_OVERLAY_WIDTH, BIN_FLASH_OVERLAY_HEIGHT, area);
-    f.render_widget(Clear, popup_area);
-
-    let block = Block::default()
-        .title(" FLASHING IN PROGRESS ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_PRIMARY));
-
-    let inner_area = block.inner(popup_area);
-    f.render_widget(block, popup_area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(inner_area);
-
-    let instruction = Paragraph::new("1. Turn OFF radio\n2. Hold PTT, turn ON radio")
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::Yellow));
-    f.render_widget(instruction, chunks[0]);
-
-    let status = Paragraph::new(app.status_message.clone())
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::White));
-    f.render_widget(status, chunks[1]);
-
-    let gauge = Gauge::default()
-        .gauge_style(
-            Style::default()
-                .fg(COLOR_PRIMARY)
-                .bg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )
-        .percent((app.progress * 100.0) as u16)
-        .label(format!("{:.1}%", app.progress * 100.0));
-    f.render_widget(gauge, chunks[2]);
-
-    let help = Paragraph::new("Press Esc to abort")
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(help, chunks[3]);
+    render_progress_overlay(
+        f,
+        app,
+        area,
+        "FLASHING IN PROGRESS",
+        Some("1. Turn OFF radio\n2. Hold PTT, turn ON radio"),
+    )
 }

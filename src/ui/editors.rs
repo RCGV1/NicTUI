@@ -335,14 +335,14 @@ pub fn render_dtmf_editor(f: &mut Frame, app: &App) {
                 f.render_widget(
                     Paragraph::new("Keys: 0-9, A-F, *, #")
                         .style(Style::default().fg(Color::DarkGray)),
-                    chunks[4],
+                    chunks[2],
                 );
 
                 f.render_widget(
                     Paragraph::new("↑/↓/Tab: Navigate | Enter: Save | Esc: Cancel")
                         .style(Style::default().fg(Color::DarkGray))
                         .alignment(ratatui::layout::Alignment::Center),
-                    chunks[5],
+                    chunks[3],
                 );
             }
         }

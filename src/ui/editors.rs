@@ -31,7 +31,7 @@ const SETTINGS_EDITOR_WIDTH: u16 = 42;
 const SETTINGS_EDITOR_HEIGHT: u16 = 15;
 
 const DTMF_EDITOR_WIDTH: u16 = 50;
-const DTMF_EDITOR_HEIGHT: u16 = 11;
+const DTMF_EDITOR_HEIGHT: u16 = 10;
 
 const BANDPLAN_EDITOR_WIDTH: u16 = 46;
 const BANDPLAN_EDITOR_HEIGHT: u16 = 17;
@@ -287,9 +287,7 @@ pub fn render_dtmf_editor(f: &mut Frame, app: &App) {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(1),
                         Constraint::Length(3),
-                        Constraint::Length(1),
                         Constraint::Length(3),
                         Constraint::Length(1),
                         Constraint::Length(1),
@@ -298,8 +296,7 @@ pub fn render_dtmf_editor(f: &mut Frame, app: &App) {
 
                 let label_style = if field_idx == 0 {
                     Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Rgb(40, 40, 80))
+                        .fg(COLOR_ACCENT)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::Gray)
@@ -310,20 +307,15 @@ pub fn render_dtmf_editor(f: &mut Frame, app: &App) {
                     dtmf.label.clone()
                 };
                 f.render_widget(
-                    Paragraph::new("Label:").style(Style::default().fg(Color::Gray)),
-                    chunks[0],
-                );
-                f.render_widget(
                     Paragraph::new(label_display)
-                        .block(Block::default().borders(Borders::ALL))
+                        .block(Block::default().borders(Borders::ALL).title(" Label "))
                         .style(label_style),
-                    chunks[1],
+                    chunks[0],
                 );
 
                 let digits_style = if field_idx == 1 {
                     Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Rgb(40, 40, 80))
+                        .fg(COLOR_ACCENT)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::Gray)
@@ -334,14 +326,10 @@ pub fn render_dtmf_editor(f: &mut Frame, app: &App) {
                     digits_str
                 };
                 f.render_widget(
-                    Paragraph::new("Digits:").style(Style::default().fg(Color::Gray)),
-                    chunks[2],
-                );
-                f.render_widget(
                     Paragraph::new(digits_display)
-                        .block(Block::default().borders(Borders::ALL))
+                        .block(Block::default().borders(Borders::ALL).title(" Digits "))
                         .style(digits_style),
-                    chunks[3],
+                    chunks[1],
                 );
 
                 f.render_widget(

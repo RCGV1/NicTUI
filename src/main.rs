@@ -195,7 +195,7 @@ where
                                 KeyCode::Enter => {
                                     if let Some(i) = app.dtmf_state.selected() {
                                         app.dtmf_edit_preset_idx = Some(i);
-                                        app.mode = AppMode::EditDTMF(i);
+                                        app.mode = AppMode::EditDTMF(0);
                                         app.update_dtmf_edit_buffer();
                                     }
                                 }

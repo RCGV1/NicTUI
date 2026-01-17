@@ -232,7 +232,8 @@ pub fn render_settings_editor(f: &mut Frame, app: &App) {
                 let rows = options.iter().enumerate().map(|(i, opt)| {
                     let style = if i == app.selection_index {
                         Style::default()
-                            .fg(COLOR_ACCENT)
+                            .fg(Color::White)
+                            .bg(Color::Rgb(40, 40, 80))
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::Gray)
@@ -246,7 +247,13 @@ pub fn render_settings_editor(f: &mut Frame, app: &App) {
                 });
 
                 let table = Table::new(rows, [Constraint::Length(39)])
-                    .block(Block::default().borders(Borders::NONE));
+                    .block(Block::default().borders(Borders::NONE))
+                    .row_highlight_style(
+                        Style::default()
+                            .bg(Color::Rgb(40, 40, 80))
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol(">> ");
                 f.render_widget(table, chunks[0]);
             }
         }

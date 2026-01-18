@@ -24,7 +24,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Gauge, List, ListItem, Paragraph, Row, Table},
 };
 
-const CHANNEL_EDITOR_WIDTH: u16 = 42;
+const CHANNEL_EDITOR_WIDTH: u16 = 48;
 const CHANNEL_EDITOR_HEIGHT: u16 = 15;
 
 const SETTINGS_EDITOR_WIDTH: u16 = 42;

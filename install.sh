@@ -52,7 +52,7 @@ detect_platform() {
 get_latest_version() {
     echo "Fetching latest version from GitHub..." >&2
     local VERSION
-    VERSION=$(curl -sSL --connect-timeout 5 --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | sed 's/.*"v\([0-9.]*\)".*/\1/')
+    VERSION=$(curl -sSL --connect-timeout 5 --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | sed 's/.*"v\([0-9.]*\)".*/\1/')
 
     if [ -z "$VERSION" ]; then
         echo "Error: Could not fetch latest version." >&2
@@ -73,7 +73,7 @@ download_binary() {
     echo "Downloading NicTUI v${VERSION}..." >&2
     local URL="https://github.com/${REPO}/releases/download/v${VERSION}/nictui-${VERSION}-${PLATFORM}"
 
-    if ! curl -sSL --connect-timeout 10 --max-time 120 -L -o "$OUTPUT_FILE" "$URL" 2>/dev/null; then
+    if ! curl -sSL --connect-timeout 10 --max-time 120 -L -o "$OUTPUT_FILE" "$URL"; then
         echo "Error: Download failed" >&2
         return 1
     fi
@@ -155,7 +155,7 @@ install_binary() {
 
     mkdir -p "$INSTALL_DIR"
 
-    if ! cp -f "$ARCHIVE" "$INSTALL_PATH" 2>/dev/null; then
+    if ! cp -f "$ARCHIVE" "$INSTALL_PATH"; then
         echo "Error: Failed to install to ${INSTALL_PATH}" >&2
         echo "Check permissions: ls -la ${INSTALL_DIR}" >&2
         exit 1
@@ -166,7 +166,7 @@ install_binary() {
     local NEW_VER
     NEW_VER=$("$INSTALL_PATH" --version 2>/dev/null || echo "unknown")
     echo "Installed to ${INSTALL_PATH}"
-    echo "Version: ${NEW_VER}"
+    echo "Binary version: ${NEW_VER}"
 }
 
 main() {
@@ -240,8 +240,11 @@ main() {
     echo "========================================"
     echo "Installation complete!"
     echo ""
-    echo "To use immediately:"
-    echo "  hash -r && ${INSTALL_PATH}"
+    echo "IMPORTANT: Clear shell cache with:"
+    echo "  hash -r"
+    echo ""
+    echo "Then run:"
+    echo "  ${INSTALL_PATH}"
     echo ""
     echo "Or in new terminals:"
     echo "  nictui"

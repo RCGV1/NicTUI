@@ -1,6 +1,6 @@
 use ratatui::style::Color;
 
-pub const VERSION: &str = "v1.0.0";
+pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 pub const COLOR_PRIMARY: Color = Color::Rgb(0, 200, 180);
 pub const COLOR_SECONDARY: Color = Color::Rgb(180, 100, 255);

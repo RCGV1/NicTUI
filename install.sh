@@ -108,7 +108,16 @@ add_to_path() {
 
     local path_line="export PATH=\"${INSTALL_DIR}:\$PATH\""
 
+    # Remove any existing NicTUI PATH lines first to avoid duplicates
     if [ -f "$shell_config" ]; then
+        local tmp_file
+        tmp_file=$(mktemp)
+        grep -v "NicTUI installation" "$shell_config" > "$tmp_file" 2>/dev/null || true
+        grep -v "export PATH.*\.local/bin.*PATH" "$tmp_file" > "$tmp_file.tmp" 2>/dev/null || true
+        mv "$tmp_file.tmp" "$shell_config" 2>/dev/null || cp "$tmp_file" "$shell_config"
+        rm -f "$tmp_file"
+
+        # Add the PATH line
         if ! grep -qF "${INSTALL_DIR}" "$shell_config" 2>/dev/null; then
             echo "" >> "$shell_config"
             echo "# NicTUI installation" >> "$shell_config"

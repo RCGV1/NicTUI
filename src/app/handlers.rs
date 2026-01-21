@@ -523,6 +523,16 @@ impl App {
     pub fn start_edit_setting(&mut self) {
         if let Some(i) = self.settings_state.selected() {
             self.mode = AppMode::EditSetting(i);
+            if let Some(s) = &self.settings {
+                let meta = &crate::protocol::SETTINGS_METADATA[i];
+                match meta.setting_type {
+                    crate::protocol::SettingType::Enum(_)
+                    | crate::protocol::SettingType::Boolean => {
+                        self.selection_index = s.get_value(i) as usize;
+                    }
+                    _ => {}
+                }
+            }
             self.update_setting_edit_buffer();
         }
     }

@@ -153,15 +153,23 @@ impl App {
                 }
             };
 
+            let _ = tx.send(AppEvent::Status("Detecting channel format...".to_string()));
+            let channel_endian = match proto.detect_channel_endianness() {
+                Ok(e) => e,
+                Err(_) => endian,
+            };
+
             let mut channels = Vec::new();
             for i in 0..198 {
                 let blk = i + 2;
                 let start = blk * BLOCK_SIZE;
                 let end = start + BLOCK_SIZE;
                 if end <= eeprom.len() {
-                    if let Some(ch) =
-                        RadioProtocol::parse_channel(&eeprom[start..end], (i + 1) as u16, endian)
-                    {
+                    if let Some(ch) = RadioProtocol::parse_channel(
+                        &eeprom[start..end],
+                        (i + 1) as u16,
+                        channel_endian,
+                    ) {
                         channels.push(ch);
                     }
                 }
@@ -647,6 +655,12 @@ impl App {
                 return;
             }
 
+            let _ = tx.send(AppEvent::Status("Detecting channel format...".to_string()));
+            let channel_endian = match proto.detect_channel_endianness() {
+                Ok(e) => e,
+                Err(_) => endian,
+            };
+
             let active_channels: Vec<(u16, Channel)> = channels
                 .into_iter()
                 .filter(|ch| !deleted_channels.contains(&ch.channel_num))
@@ -662,7 +676,7 @@ impl App {
                     ch.channel_num
                 )));
                 let blk = (ch.channel_num + 1) as u8;
-                let data = RadioProtocol::pack_channel(ch, endian);
+                let data = RadioProtocol::pack_channel(ch, channel_endian);
                 if !proto.write_block(blk, &data).unwrap_or(false) {
                     let _ = tx.send(AppEvent::Error(format!(
                         "Failed to write channel {}",
@@ -847,6 +861,12 @@ impl App {
                 return;
             }
 
+            let _ = tx.send(AppEvent::Status("Detecting channel format...".to_string()));
+            let channel_endian = match proto.detect_channel_endianness() {
+                Ok(e) => e,
+                Err(_) => endian,
+            };
+
             let total = channels.len();
             for (i, ch) in channels.iter().enumerate() {
                 let _ = tx.send(AppEvent::Status(format!(
@@ -854,7 +874,7 @@ impl App {
                     ch.channel_num
                 )));
                 let blk = (ch.channel_num - 1 + 2) as u8;
-                let data = RadioProtocol::pack_channel(ch, endian);
+                let data = RadioProtocol::pack_channel(ch, channel_endian);
 
                 if let Err(e) = proto.write_block(blk, &data) {
                     let _ = tx.send(AppEvent::Error(format!(

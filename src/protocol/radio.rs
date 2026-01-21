@@ -180,6 +180,28 @@ impl RadioProtocol {
         }
     }
 
+    pub fn detect_channel_endianness(&mut self) -> Result<Endianness> {
+        for blk_num in 2..10 {
+            let blk = self.read_block(blk_num)?;
+            let rx_freq_le = u32::from_le_bytes(blk[0..4].try_into().unwrap());
+            let rx_freq_be = u32::from_be_bytes(blk[0..4].try_into().unwrap());
+
+            let le_valid = rx_freq_le >= 100000 && rx_freq_le <= 100000000;
+            let be_valid = rx_freq_be >= 100000 && rx_freq_be <= 100000000;
+
+            if le_valid && !be_valid {
+                return Ok(Endianness::Little);
+            }
+            if be_valid && !le_valid {
+                return Ok(Endianness::Big);
+            }
+            if le_valid && be_valid {
+                return Ok(Endianness::Little);
+            }
+        }
+        Ok(Endianness::Big)
+    }
+
     pub fn read_block(&mut self, block_num: u8) -> Result<Vec<u8>> {
         for _ in 0..5 {
             self.send(&[PKT_READ_EEPROM, block_num])?;
@@ -234,10 +256,26 @@ impl RadioProtocol {
         if rx_freq_raw == 0 || rx_freq_raw == 0xFFFFFFFF {
             return None;
         }
+
+        // Validate frequency is in reasonable range (1 MHz to 1000 MHz for amateur radio)
+        // Stored as integer: value * 100000 = Hz
+        if rx_freq_raw < 100000 || rx_freq_raw > 100000000 {
+            return None;
+        }
+
         let tx_freq_raw = match endian {
             Endianness::Little => LittleEndian::read_u32(&raw[4..8]),
             Endianness::Big => BigEndian::read_u32(&raw[4..8]),
         };
+
+        // Validate TX frequency is in reasonable range
+        if tx_freq_raw != 0
+            && tx_freq_raw != 0xFFFFFFFF
+            && (tx_freq_raw < 100000 || tx_freq_raw > 100000000)
+        {
+            return None;
+        }
+
         let rx_tone_raw = match endian {
             Endianness::Little => LittleEndian::read_u16(&raw[8..10]),
             Endianness::Big => BigEndian::read_u16(&raw[8..10]),

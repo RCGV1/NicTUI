@@ -191,12 +191,32 @@ mod tests {
         for (i, slot) in ["Slot1", "Slot2", "Slot3", "Slot4"].iter().enumerate() {
             if let Some(val_str) = get_val(slot) {
                 groups[i] = match val_str.as_str() {
-                    "A" => 10,
-                    "B" => 11,
-                    "C" => 12,
-                    "D" => 13,
-                    "E" => 14,
-                    "F" => 15,
+                    "A" => 1,
+                    "B" => 2,
+                    "C" => 3,
+                    "D" => 4,
+                    "E" => 5,
+                    "F" => 6,
+                    "G" => 7,
+                    "H" => 8,
+                    "I" => 9,
+                    "J" => 10,
+                    "K" => 11,
+                    "L" => 12,
+                    "M" => 13,
+                    "N" => 14,
+                    "O" => 15,
+                    "P" => 16,
+                    "Q" => 17,
+                    "R" => 18,
+                    "S" => 19,
+                    "T" => 20,
+                    "U" => 21,
+                    "V" => 22,
+                    "W" => 23,
+                    "X" => 24,
+                    "Y" => 25,
+                    "Z" => 26,
                     s => s.parse::<u8>().unwrap_or(0),
                 };
             }
@@ -270,6 +290,20 @@ mod tests {
         assert_eq!(result.tx_tone, "94.8");
         assert_eq!(result.power, 255);
         assert_eq!(result.position, 1); // Active=True -> position=1
+    }
+
+    #[test]
+    fn test_channel_csv_inactive() {
+        let data = "Channel_Num,Active,Name,RX,TX,RX_Tone,TX_Tone,TX_Power,Slot1,Slot2,Slot3,Slot4,Bandwidth,Modulation,BusyLock,Reversed,PTTID\n\
+                    1,False,TEST,145.31000,144.71000,Off,Off,255,,,,,Wide,FM,False,False,Off";
+        let mut rdr = Reader::from_reader(data.as_bytes());
+        let mut iter = rdr.deserialize::<HashMap<String, String>>();
+        let row = iter.next().unwrap().unwrap();
+        let result = parse_row(row);
+
+        assert_eq!(result.channel_num, 1);
+        assert_eq!(result.name, "TEST");
+        assert_eq!(result.position, 0); // Active=False -> position=0
     }
 
     #[test]

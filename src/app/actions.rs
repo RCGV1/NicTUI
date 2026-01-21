@@ -750,12 +750,32 @@ impl App {
                 for (i, slot) in ["Slot1", "Slot2", "Slot3", "Slot4"].iter().enumerate() {
                     if let Some(val_str) = get_val(slot) {
                         groups[i] = match val_str.as_str() {
-                            "A" => 10,
-                            "B" => 11,
-                            "C" => 12,
-                            "D" => 13,
-                            "E" => 14,
-                            "F" => 15,
+                            "A" => 1,
+                            "B" => 2,
+                            "C" => 3,
+                            "D" => 4,
+                            "E" => 5,
+                            "F" => 6,
+                            "G" => 7,
+                            "H" => 8,
+                            "I" => 9,
+                            "J" => 10,
+                            "K" => 11,
+                            "L" => 12,
+                            "M" => 13,
+                            "N" => 14,
+                            "O" => 15,
+                            "P" => 16,
+                            "Q" => 17,
+                            "R" => 18,
+                            "S" => 19,
+                            "T" => 20,
+                            "U" => 21,
+                            "V" => 22,
+                            "W" => 23,
+                            "X" => 24,
+                            "Y" => 25,
+                            "Z" => 26,
                             s => s.parse::<u8>().unwrap_or(0),
                         };
                     }
@@ -805,9 +825,9 @@ impl App {
                         .map(|s| s.to_lowercase() == "true")
                         .unwrap_or(true)
                     {
-                        0
-                    } else {
                         1
+                    } else {
+                        0
                     },
                 };
                 channels.push(ch);
@@ -900,6 +920,17 @@ impl App {
                         "M" => 13,
                         "N" => 14,
                         "O" => 15,
+                        "P" => 16,
+                        "Q" => 17,
+                        "R" => 18,
+                        "S" => 19,
+                        "T" => 20,
+                        "U" => 21,
+                        "V" => 22,
+                        "W" => 23,
+                        "X" => 24,
+                        "Y" => 25,
+                        "Z" => 26,
                         s => s.parse::<u8>().unwrap_or(0),
                     };
                 }
@@ -949,9 +980,9 @@ impl App {
                     .map(|s| s.to_lowercase() == "true")
                     .unwrap_or(true)
                 {
-                    0
-                } else {
                     1
+                } else {
+                    0
                 },
             };
             channels.push(ch);

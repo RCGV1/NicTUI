@@ -286,7 +286,7 @@ impl RadioProtocol {
                 3 => "LSB".to_string(),
                 _ => "FM".to_string(),
             },
-            position: 1 - ((bits >> 3) & 0x01),
+            position: (bits >> 3) & 0x01,
             ptt_id: (bits >> 4) & 0x03,
             reverse: bits & 0x40 != 0,
             busy_lock: bits & 0x80 != 0,
@@ -339,7 +339,7 @@ impl RadioProtocol {
             _ => 0,
         };
         bits |= (mod_val << 1) & 0x06;
-        bits |= ((1 - (ch.position & 0x01)) & 0x01) << 3;
+        bits |= (ch.position & 0x01) << 3;
         bits |= (ch.ptt_id & 0x03) << 4;
         if ch.reverse {
             bits |= 0x40;

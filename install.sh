@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -eo pipefail
 
 REPO="RCGV1/NicTUI"
 INSTALL_DIR="${HOME}/.local/bin"

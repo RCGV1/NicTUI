@@ -52,7 +52,7 @@ detect_platform() {
 get_latest_version() {
     local VERSION=""
 
-    VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | sed 's/.*"v\([0-9.]*\)".*/\1/')
+    VERSION=$(curl -fsSL --connect-timeout 10 --max-time 30 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | sed 's/.*"v\([0-9.]*\)".*/\1/')
 
     if [ -z "$VERSION" ]; then
         echo "Error: Could not fetch latest version. Check your internet connection." >&2
@@ -68,15 +68,18 @@ download_with_fallback() {
     local OUTPUT_FILE="$2"
     local DOWNLOAD_URLS=(
         "https://github.com/${REPO}/releases/download/v${VERSION}/nictui-${VERSION}-${PLATFORM}"
-        "https://objects.githubusercontent.com/github-production-release-asset-2e65be/${REPO}/${VERSION}/${PLATFORM}"
+        "https://objects.githubusercontent.com/github-production-release-asset-2e65be/325060/$(echo $VERSION | sed 's/\.//g')?${PLATFORM}"
     )
 
     for url in "${DOWNLOAD_URLS[@]}"; do
-        echo "Trying: ${url}"
-        if curl -fsSL -o "$OUTPUT_FILE" "$url" 2>/dev/null; then
-            echo "Download successful!"
-            return 0
+        echo "Downloading from GitHub..."
+        if curl -fsSL --connect-timeout 10 --max-time 120 -L -o "$OUTPUT_FILE" "$url" 2>/dev/null; then
+            if [ -s "$OUTPUT_FILE" ]; then
+                echo "Download successful!"
+                return 0
+            fi
         fi
+        echo "Retry..."
     done
 
     echo "Error: Download failed from all sources" >&2
@@ -170,14 +173,14 @@ install_nictui() {
 
     mkdir -p "$INSTALL_DIR"
 
-    if [ -f "$INSTALL_PATH" ]; then
-        echo "Backing up existing installation..."
-        cp "$INSTALL_PATH" "${INSTALL_PATH}.backup"
+    rm -f "${INSTALL_PATH}.backup"
+
+    if mv "$ARCHIVE" "$INSTALL_PATH"; then
+        echo "Installed NicTUI to ${INSTALL_PATH}"
+    else
+        echo "Error: Failed to install NicTUI" >&2
+        exit 1
     fi
-
-    mv "$ARCHIVE" "$INSTALL_PATH"
-
-    echo "Installed NicTUI to ${INSTALL_PATH}"
 
     add_to_path
 

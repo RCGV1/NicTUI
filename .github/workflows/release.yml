@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.VERSION }}
-      should_release: ${{ steps.check_tag.outputs.exists != 'true' }}
+      should_release: ${{ steps.check_release.outputs.result != 'true' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,17 +29,18 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
 
-      - name: Check if version tag already exists
-        id: check_tag
+      - name: Check if release already exists
+        id: check_release
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
           REPO="${{ github.repository }}"
-          if gh api "repos/${REPO}/git/refs/tags/v${VERSION}" --silent 2>/dev/null; then
-            echo "Tag v${VERSION} already exists"
-            echo "exists=true" >> $GITHUB_OUTPUT
+          # Check for both tag and release
+          if gh api "repos/${REPO}/releases/tags/v${VERSION}" --silent 2>/dev/null; then
+            echo "Release v${VERSION} already exists"
+            echo "result=true" >> $GITHUB_OUTPUT
           else
-            echo "Tag v${VERSION} does not exist - will create release"
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Release v${VERSION} does not exist - will create release"
+            echo "result=false" >> $GITHUB_OUTPUT
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -47,7 +48,7 @@ jobs:
       - name: Output version check result
         run: |
           echo "Version: ${{ steps.version.outputs.VERSION }}"
-          echo "Should release: ${{ steps.check_tag.outputs.exists != 'true' }}"
+          echo "Should release: ${{ steps.check_release.outputs.result != 'true' }}"
 
   build-macos-x86_64:
     needs: check-version

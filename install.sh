@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 REPO="RCGV1/NicTUI"
 INSTALL_DIR="${HOME}/.local/bin"
@@ -52,37 +52,35 @@ detect_platform() {
 get_latest_version() {
     local VERSION=""
 
-    VERSION=$(curl -fsSL --connect-timeout 10 --max-time 30 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | sed 's/.*"v\([0-9.]*\)".*/\1/')
+    echo "Fetching latest version from GitHub..."
+    VERSION=$(curl -sSL --connect-timeout 5 --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" 2>&1 | grep '"tag_name"' | sed 's/.*"v\([0-9.]*\)".*/\1/')
 
     if [ -z "$VERSION" ]; then
-        echo "Error: Could not fetch latest version. Check your internet connection." >&2
-        echo "If GitHub is blocked, try downloading manually from:" >&2
+        echo "Error: Could not fetch latest version." >&2
+        echo "Check your internet connection." >&2
+        echo "" >&2
+        echo "Manual download:" >&2
         echo "  https://github.com/${REPO}/releases/latest" >&2
         exit 1
     fi
+    echo "Latest version: v${VERSION}"
     echo "$VERSION"
 }
 
 download_with_fallback() {
     local VERSION="$1"
     local OUTPUT_FILE="$2"
-    local DOWNLOAD_URLS=(
-        "https://github.com/${REPO}/releases/download/v${VERSION}/nictui-${VERSION}-${PLATFORM}"
-        "https://objects.githubusercontent.com/github-production-release-asset-2e65be/325060/$(echo $VERSION | sed 's/\.//g')?${PLATFORM}"
-    )
+    local DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/nictui-${VERSION}-${PLATFORM}"
 
-    for url in "${DOWNLOAD_URLS[@]}"; do
-        echo "Downloading from GitHub..."
-        if curl -fsSL --connect-timeout 10 --max-time 120 -L -o "$OUTPUT_FILE" "$url" 2>/dev/null; then
-            if [ -s "$OUTPUT_FILE" ]; then
-                echo "Download successful!"
-                return 0
-            fi
-        fi
-        echo "Retry..."
-    done
+    echo "Downloading NicTUI v${VERSION}..."
+    curl -sSL --connect-timeout 10 --max-time 120 -L -o "$OUTPUT_FILE" "$DOWNLOAD_URL"
 
-    echo "Error: Download failed from all sources" >&2
+    if [ -s "$OUTPUT_FILE" ]; then
+        echo "Download complete!"
+        return 0
+    fi
+
+    echo "Error: Download failed" >&2
     return 1
 }
 
@@ -112,14 +110,8 @@ add_to_path() {
             echo "" >> "$shell_config"
             echo "# NicTUI installation" >> "$shell_config"
             echo "$path_line" >> "$shell_config"
-            echo "Added ${INSTALL_DIR} to PATH in ${shell_config}"
-        else
-            echo "${INSTALL_DIR} is already in your PATH"
+            echo "Added ${INSTALL_DIR} to PATH"
         fi
-    else
-        echo "# NicTUI installation" > "$shell_config"
-        echo "$path_line" >> "$shell_config"
-        echo "Added ${INSTALL_DIR} to PATH (created ${shell_config})"
     fi
 }
 
@@ -131,7 +123,7 @@ is_installed() {
 }
 
 get_installed_version() {
-    if [ -f "$INSTALL_PATH" ]; then
+    if [ -f "$INSTALL_PATH" ] && [ -x "$INSTALL_PATH" ]; then
         local ver=$("$INSTALL_PATH" --version 2>/dev/null || echo "")
         if [ -n "$ver" ]; then
             echo "$ver"
@@ -147,10 +139,8 @@ install_nictui() {
     local TEMP_DIR
 
     if [ "$IS_UPDATE" = "true" ]; then
-        echo "Detected platform: ${PLATFORM}"
         echo "Updating NicTUI to v${VERSION}..."
     else
-        echo "Detected platform: ${PLATFORM}"
         echo "Installing NicTUI v${VERSION}..."
     fi
 
@@ -160,12 +150,6 @@ install_nictui() {
     local ARCHIVE="${TEMP_DIR}/nictui-${PLATFORM}"
 
     if ! download_with_fallback "$VERSION" "$ARCHIVE"; then
-        echo ""
-        echo "Manual download instructions:"
-        echo "1. Go to https://github.com/${REPO}/releases/latest"
-        echo "2. Download: nictui-${VERSION}-${PLATFORM}"
-        echo "3. Save it to ${INSTALL_DIR}/nictui"
-        echo "4. Run: chmod +x ${INSTALL_DIR}/nictui"
         exit 1
     fi
 
@@ -173,20 +157,17 @@ install_nictui() {
 
     mkdir -p "$INSTALL_DIR"
 
-    rm -f "${INSTALL_PATH}.backup"
-
-    if ! cp "$ARCHIVE" "$INSTALL_PATH"; then
-        echo "Error: Failed to copy NicTUI to ${INSTALL_PATH}" >&2
-        echo "Check permissions: ls -la ${INSTALL_DIR}" >&2
+    if ! cp -f "$ARCHIVE" "$INSTALL_PATH"; then
+        echo "Error: Failed to copy to ${INSTALL_PATH}" >&2
+        echo "Try: chmod u+w ${INSTALL_DIR}" >&2
         exit 1
     fi
 
-    if [ ! -x "$INSTALL_PATH" ]; then
-        chmod +x "$INSTALL_PATH"
-    fi
+    chmod +x "$INSTALL_PATH"
+
+    echo "Installed to ${INSTALL_PATH}"
 
     local NEW_VERSION=$("$INSTALL_PATH" --version 2>/dev/null || echo "unknown")
-    echo "Installed NicTUI to ${INSTALL_PATH}"
     echo "Binary version: ${NEW_VERSION}"
 
     add_to_path
@@ -195,15 +176,10 @@ install_nictui() {
     echo "========================================"
     echo "Installation complete!"
     echo ""
-    echo "NicTUI v${VERSION} has been installed."
+    echo "To use immediately, run:"
+    echo "  hash -r && ${INSTALL_PATH}"
     echo ""
-    echo "IMPORTANT: Run this command to clear cached paths:"
-    echo "  hash -r"
-    echo ""
-    echo "Then start NicTUI with:"
-    echo "  ${INSTALL_PATH}"
-    echo ""
-    echo "Or from any new terminal:"
+    echo "Or in new terminals:"
     echo "  nictui"
     echo "========================================"
 }
@@ -247,11 +223,8 @@ main() {
 
     echo "NicTUI Installer"
     echo "================"
-    echo "Repository: ${REPO}"
-    echo "Platform: ${PLATFORM}"
 
     LATEST_VERSION=$(get_latest_version)
-    echo "Latest version: ${LATEST_VERSION}"
 
     if is_installed; then
         INSTALLED_VERSION=$(get_installed_version)
@@ -259,14 +232,13 @@ main() {
 
         if [ "$INSTALLED_VERSION" = "$LATEST_VERSION" ]; then
             echo ""
-            echo "NicTUI v${LATEST_VERSION} is already installed and up to date."
-            exit 0
-        else
-            echo ""
-            echo "Updating from v${INSTALLED_VERSION} to v${LATEST_VERSION}..."
-            install_nictui "$LATEST_VERSION" "true"
+            echo "NicTUI v${LATEST_VERSION} is already installed."
             exit 0
         fi
+
+        echo ""
+        echo "Updating to v${LATEST_VERSION}..."
+        install_nictui "$LATEST_VERSION" "true"
     else
         echo "NicTUI is not installed."
         echo ""

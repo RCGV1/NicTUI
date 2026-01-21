@@ -175,12 +175,19 @@ install_nictui() {
 
     rm -f "${INSTALL_PATH}.backup"
 
-    if mv "$ARCHIVE" "$INSTALL_PATH"; then
-        echo "Installed NicTUI to ${INSTALL_PATH}"
-    else
-        echo "Error: Failed to install NicTUI" >&2
+    if ! cp "$ARCHIVE" "$INSTALL_PATH"; then
+        echo "Error: Failed to copy NicTUI to ${INSTALL_PATH}" >&2
+        echo "Check permissions: ls -la ${INSTALL_DIR}" >&2
         exit 1
     fi
+
+    if [ ! -x "$INSTALL_PATH" ]; then
+        chmod +x "$INSTALL_PATH"
+    fi
+
+    local NEW_VERSION=$("$INSTALL_PATH" --version 2>/dev/null || echo "unknown")
+    echo "Installed NicTUI to ${INSTALL_PATH}"
+    echo "Binary version: ${NEW_VERSION}"
 
     add_to_path
 
@@ -188,16 +195,16 @@ install_nictui() {
     echo "========================================"
     echo "Installation complete!"
     echo ""
-    echo "NicTUI has been successfully added to your PATH."
+    echo "NicTUI v${VERSION} has been installed."
     echo ""
-    echo "To start NicTUI, run:"
+    echo "IMPORTANT: Run this command to clear cached paths:"
+    echo "  hash -r"
+    echo ""
+    echo "Then start NicTUI with:"
     echo "  ${INSTALL_PATH}"
     echo ""
-    echo "Or simply run from any terminal:"
+    echo "Or from any new terminal:"
     echo "  nictui"
-    echo ""
-    echo "Note: If the command isn't found, restart your terminal or run:"
-    echo "  source ~/.bashrc  # or ~/.zshrc, ~/.profile, etc."
     echo "========================================"
 }
 

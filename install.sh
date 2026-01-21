@@ -111,12 +111,12 @@ add_to_path() {
             echo "$path_line" >> "$shell_config"
             echo "Added ${INSTALL_DIR} to PATH in ${shell_config}"
         else
-            echo "${INSTALL_DIR} is already in PATH"
+            echo "${INSTALL_DIR} is already in your PATH"
         fi
     else
         echo "# NicTUI installation" > "$shell_config"
         echo "$path_line" >> "$shell_config"
-        echo "Created ${shell_config} with PATH configuration"
+        echo "Added ${INSTALL_DIR} to PATH (created ${shell_config})"
     fi
 }
 
@@ -140,10 +140,16 @@ get_installed_version() {
 
 install_nictui() {
     local VERSION="$1"
+    local IS_UPDATE="$2"
     local TEMP_DIR
 
-    echo "Detected platform: ${PLATFORM}"
-    echo "Installing NicTUI v${VERSION}..."
+    if [ "$IS_UPDATE" = "true" ]; then
+        echo "Detected platform: ${PLATFORM}"
+        echo "Updating NicTUI to v${VERSION}..."
+    else
+        echo "Detected platform: ${PLATFORM}"
+        echo "Installing NicTUI v${VERSION}..."
+    fi
 
     TEMP_DIR=$(mktemp -d)
     trap "rm -rf $TEMP_DIR" EXIT
@@ -179,13 +185,15 @@ install_nictui() {
     echo "========================================"
     echo "Installation complete!"
     echo ""
+    echo "NicTUI has been successfully added to your PATH."
+    echo ""
     echo "To start NicTUI, run:"
     echo "  ${INSTALL_PATH}"
     echo ""
-    echo "Or add ${INSTALL_DIR} to your PATH and run:"
+    echo "Or simply run from any terminal:"
     echo "  nictui"
     echo ""
-    echo "Note: You may need to restart your terminal or run:"
+    echo "Note: If the command isn't found, restart your terminal or run:"
     echo "  source ~/.bashrc  # or ~/.zshrc, ~/.profile, etc."
     echo "========================================"
 }
@@ -246,12 +254,14 @@ main() {
         else
             echo ""
             echo "Updating from v${INSTALLED_VERSION} to v${LATEST_VERSION}..."
+            install_nictui "$LATEST_VERSION" "true"
+            exit 0
         fi
     else
         echo "NicTUI is not installed."
+        echo ""
+        install_nictui "$LATEST_VERSION" "false"
     fi
-
-    install_nictui "$LATEST_VERSION"
 }
 
 main "$@"

@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::state::{App, AppEvent, AppMode, MainTab};
-use crate::protocol::{BIN_FLASH_BAUD_RATE, BLOCK_SIZE, Channel, EEPROM_SIZE, RadioProtocol};
+use crate::protocol::{Channel, RadioProtocol, BIN_FLASH_BAUD_RATE, BLOCK_SIZE, EEPROM_SIZE};
 
 impl App {
     pub fn select_port(&mut self) {
@@ -503,7 +503,6 @@ impl App {
             ));
             let _ = tx.send(AppEvent::WriteComplete);
         });
-        self.settings_dirty = false;
     }
 
     pub fn remote_on(&mut self) {
@@ -677,12 +676,22 @@ impl App {
                 )));
                 let blk = (ch.channel_num + 1) as u8;
                 let data = RadioProtocol::pack_channel(ch, channel_endian);
-                if !proto.write_block(blk, &data).unwrap_or(false) {
-                    let _ = tx.send(AppEvent::Error(format!(
-                        "Failed to write channel {}",
-                        ch.channel_num
-                    )));
-                    return;
+                match proto.write_block(blk, &data) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = tx.send(AppEvent::Error(format!(
+                            "Failed to write channel {}",
+                            ch.channel_num
+                        )));
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::Error(format!(
+                            "Error writing channel {}: {}",
+                            ch.channel_num, e
+                        )));
+                        return;
+                    }
                 }
                 progress += 1.0;
                 let _ = tx.send(AppEvent::Progress(progress / total_operations as f64));
@@ -692,12 +701,22 @@ impl App {
                 let _ = tx.send(AppEvent::Status(format!("Clearing Channel {}...", ch_num)));
                 let blk = (ch_num + 1) as u8;
                 let empty_data = vec![0xFFu8; 32];
-                if !proto.write_block(blk, &empty_data).unwrap_or(false) {
-                    let _ = tx.send(AppEvent::Error(format!(
-                        "Failed to clear channel {}",
-                        ch_num
-                    )));
-                    return;
+                match proto.write_block(blk, &empty_data) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = tx.send(AppEvent::Error(format!(
+                            "Failed to clear channel {}",
+                            ch_num
+                        )));
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::Error(format!(
+                            "Error clearing channel {}: {}",
+                            ch_num, e
+                        )));
+                        return;
+                    }
                 }
                 progress += 1.0;
                 let _ = tx.send(AppEvent::Progress(progress / total_operations as f64));
@@ -1151,18 +1170,28 @@ impl App {
                     let _ = tx.send(AppEvent::Status("Parsing codeplug data...".to_string()));
                     let _ = tx.send(AppEvent::Progress(0.4));
                     let channels = codeplug::extract_channels_from_codeplug(&data, endian);
+                    let channel_count = channels.len();
                     let _ = tx.send(AppEvent::Status("Extracting channels...".to_string()));
                     let _ = tx.send(AppEvent::Progress(0.6));
                     let settings = codeplug::extract_settings_from_codeplug(&data, endian);
+                    let settings_present = settings.is_some();
                     let _ = tx.send(AppEvent::Status("Extracting settings...".to_string()));
                     let _ = tx.send(AppEvent::Progress(0.8));
-                    let _scan_presets = codeplug::extract_scan_presets_from_codeplug(&data, endian);
+                    let scan_presets = codeplug::extract_scan_presets_from_codeplug(&data, endian);
+                    let scan_preset_count = scan_presets.len();
                     let _ = tx.send(AppEvent::Progress(1.0));
-                    let _ = tx.send(AppEvent::CodeplugLoaded(path, data));
+                    let _ = tx.send(AppEvent::CodeplugDataLoaded {
+                        path,
+                        data,
+                        channels,
+                        settings,
+                        scan_presets,
+                    });
                     let _ = tx.send(AppEvent::Status(format!(
-                        "Codeplug loaded: {} channels, settings {}",
-                        channels.len(),
-                        if settings.is_some() {
+                        "Codeplug loaded: {} channels, {} scan presets, settings {}",
+                        channel_count,
+                        scan_preset_count,
+                        if settings_present {
                             "present"
                         } else {
                             "missing"

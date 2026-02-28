@@ -3,17 +3,17 @@ use crate::ui::render_shortcut;
 use crate::ui::theme::VERSION;
 use crate::ui::theme::{COLOR_BORDER, COLOR_PRIMARY, COLOR_WARNING};
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
+    Frame,
 };
 
 pub fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(45)])
+        .constraints([Constraint::Percentage(10), Constraint::Fill(1)])
         .split(area);
 
     let status = Paragraph::new(format!(" {}  |  {} ", app.status_message, VERSION))
@@ -28,7 +28,12 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.mode {
         AppMode::Main(MainTab::Channels) => {
             let has_changes = app.channels_dirty || !app.deleted_channels.is_empty();
-            let mut hints = vec![render_shortcut("r"), Span::raw(" rd | ")];
+            let mut hints = vec![
+                render_shortcut("i"),
+                Span::raw(" import | "),
+                render_shortcut("r"),
+                Span::raw(" read | "),
+            ];
             if has_changes {
                 hints.push(render_shortcut("w"));
                 hints.push(Span::styled(
@@ -39,7 +44,7 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                 ));
             } else {
                 hints.push(render_shortcut("w"));
-                hints.push(Span::raw(" wr "));
+                hints.push(Span::raw(" write "));
             }
             hints.push(Span::raw(" | "));
             hints.push(render_shortcut("n"));
@@ -133,12 +138,13 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let hints_p = Paragraph::new(hints)
-        .alignment(ratatui::layout::Alignment::Right)
+        .alignment(ratatui::layout::Alignment::Center)
         .style(
             Style::default()
                 .fg(COLOR_PRIMARY)
                 .bg(Color::Rgb(20, 20, 25)),
         )
+        .wrap(ratatui::widgets::Wrap { trim: true })
         .block(
             Block::default()
                 .borders(Borders::TOP)

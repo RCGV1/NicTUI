@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -259,7 +259,7 @@ impl RadioProtocol {
 
         // Validate frequency is in reasonable range (1 MHz to 1000 MHz for amateur radio)
         // Stored as integer: value * 100000 = Hz
-        if rx_freq_raw < 100000 || rx_freq_raw > 100000000 {
+        if rx_freq_raw < 100000 || rx_freq_raw > 1000000000 {
             return None;
         }
 
@@ -271,7 +271,7 @@ impl RadioProtocol {
         // Validate TX frequency is in reasonable range
         if tx_freq_raw != 0
             && tx_freq_raw != 0xFFFFFFFF
-            && (tx_freq_raw < 100000 || tx_freq_raw > 100000000)
+            && (tx_freq_raw < 100000 || tx_freq_raw > 1000000000)
         {
             return None;
         }

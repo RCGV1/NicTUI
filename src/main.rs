@@ -19,11 +19,11 @@ use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use nictui::app::{App, AppMode, MainTab};
 use nictui::ui;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use std::time::Duration;
 
@@ -82,9 +82,7 @@ where
 
         let is_dialog_open = app.dialog_open;
 
-        if !is_dialog_open {
-            terminal.draw(|f| ui::ui(f, app))?;
-        } else if was_dialog_open && !is_dialog_open {
+        if !is_dialog_open || (was_dialog_open && !is_dialog_open) {
             terminal.draw(|f| ui::ui(f, app))?;
         }
 

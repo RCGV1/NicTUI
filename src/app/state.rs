@@ -1,8 +1,8 @@
 use ratatui::widgets::TableState;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 
 use crate::protocol::{
     BandPlan, Channel, DTMFPreset, Endianness, RemotePacket, ScanPreset, SettingsBlock,
@@ -67,6 +67,13 @@ pub enum AppEvent {
     LoadCodeplug(PathBuf),
     ExportCodeplug(PathBuf),
     CodeplugLoaded(PathBuf, Vec<u8>),
+    CodeplugDataLoaded {
+        path: PathBuf,
+        data: Vec<u8>,
+        channels: Vec<Channel>,
+        settings: Option<SettingsBlock>,
+        scan_presets: Vec<ScanPreset>,
+    },
     LoadBinFirmware(PathBuf),
     BinFirmwareLoaded(PathBuf, Vec<u8>),
     BinFlashComplete,

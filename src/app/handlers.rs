@@ -73,6 +73,7 @@ impl App {
                     self.channels_dirty = false;
                     self.deleted_channels.clear();
                     self.dtmf_dirty = false;
+                    self.settings_dirty = false;
                 }
                 AppEvent::LoadCSV(path) => self.start_import_and_write(path),
                 AppEvent::WriteCSV(path) => self.start_write_csv_channels(path),
@@ -92,6 +93,25 @@ impl App {
                     self.codeplug_data = Some(data);
                     self.codeplug_path = Some(path);
                     self.status_message = "Codeplug loaded successfully".to_string();
+                    self.mode = AppMode::Main(MainTab::Codeplug);
+                }
+                AppEvent::CodeplugDataLoaded {
+                    path,
+                    data,
+                    channels,
+                    settings,
+                    scan_presets,
+                } => {
+                    self.codeplug_data = Some(data);
+                    self.codeplug_path = Some(path);
+                    self.channels = channels;
+                    self.settings = settings;
+                    self.scan_presets = scan_presets;
+                    self.status_message = format!(
+                        "Codeplug loaded: {} channels, {} scan presets",
+                        self.channels.len(),
+                        self.scan_presets.len()
+                    );
                     self.mode = AppMode::Main(MainTab::Codeplug);
                 }
                 AppEvent::ShowBinFirmwareDialog => self.show_bin_firmware_dialog(),
@@ -483,35 +503,47 @@ impl App {
 
         if let Some(pending_ch) = self.pending_channel_edit.take() {
             let new_channel_num = pending_ch.channel_num;
-            let old_channel_num = (self.channel_state.selected().unwrap_or(0) + 1) as u16;
 
             if let Some(i) = self.channel_state.selected() {
                 if i < self.channels.len() {
-                    self.channels[i] = pending_ch;
+                    // Check if another channel already has this number
+                    let duplicate = self
+                        .channels
+                        .iter()
+                        .enumerate()
+                        .any(|(idx, c)| idx != i && c.channel_num == new_channel_num);
 
-                    if new_channel_num != old_channel_num {
-                        self.renumber_channels();
-                        index_changed = true;
-                        if let Some(new_pos) = self
-                            .channels
+                    if duplicate {
+                        self.status_message =
+                            format!("Channel {} already exists!", new_channel_num);
+                        self.channels_dirty = false;
+                    } else {
+                        self.channels[i] = pending_ch;
+
+                        // Find the new position based on channel number
+                        let mut sorted_channels: Vec<_> =
+                            self.channels.iter().enumerate().collect();
+                        sorted_channels.sort_by_key(|(_, c)| c.channel_num);
+
+                        if let Some((new_pos, _)) = sorted_channels
                             .iter()
-                            .position(|c| c.channel_num == new_channel_num)
+                            .find(|(_, c)| c.channel_num == new_channel_num)
                         {
-                            self.channel_state.select(Some(new_pos));
+                            self.channel_state.select(Some(*new_pos));
                         }
                     }
 
-                    if index_changed {
+                    if index_changed && !duplicate {
                         self.channels_dirty = true;
                         self.status_message =
                             format!("Channel {} saved (Unsaved)", new_channel_num);
-                    } else {
+                    } else if !duplicate {
                         self.status_message = format!("Channel {} saved", new_channel_num);
                     }
                 }
             }
+            self.mode = AppMode::Main(MainTab::Channels);
         }
-        self.mode = AppMode::Main(MainTab::Channels);
     }
 
     pub fn renumber_channels(&mut self) {
@@ -719,7 +751,6 @@ impl App {
             return;
         }
         self.start_write_dtmf();
-        self.dtmf_dirty = false;
     }
 
     pub fn start_edit_bandplan(&mut self) {

@@ -3,19 +3,14 @@ use crate::ui::editors::render_progress_overlay;
 use crate::ui::render_shortcut;
 use crate::ui::theme::*;
 use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
+    Frame,
 };
 
 pub fn render_bin_flash_view(f: &mut Frame, app: &mut App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
-
     let mut content_lines = vec![];
 
     content_lines.push(Line::from(vec![Span::styled(
@@ -131,28 +126,7 @@ pub fn render_bin_flash_view(f: &mut Frame, app: &mut App, area: Rect) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(COLOR_PRIMARY)),
     );
-    f.render_widget(content, chunks[0]);
-
-    let mut hints = vec![render_shortcut("i"), Span::raw(" import file")];
-
-    if app.bin_firmware_data.is_some() && app.protocol_port_name.is_some() {
-        hints.push(Span::raw(" | "));
-        hints.push(render_shortcut("f"));
-        hints.push(Span::raw(" flash"));
-    }
-
-    hints.push(Span::raw(" | "));
-    hints.push(render_shortcut("Esc"));
-    hints.push(Span::raw(" back"));
-
-    let hint_line = Paragraph::new(Line::from(hints))
-        .style(Style::default().bg(Color::Rgb(40, 40, 40)))
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(COLOR_PRIMARY)),
-        );
-    f.render_widget(hint_line, chunks[1]);
+    f.render_widget(content, area);
 }
 
 pub fn render_bin_flash_overlay(f: &mut Frame, app: &App, area: Rect) {

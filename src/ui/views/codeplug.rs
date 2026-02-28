@@ -1,12 +1,11 @@
 use crate::app::App;
-use crate::ui::render_shortcut;
 use crate::ui::theme::*;
 use ratatui::{
-    Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
+    Frame,
 };
 
 pub fn render_codeplug_view(f: &mut Frame, app: &mut App, area: Rect) {
@@ -19,11 +18,6 @@ pub fn render_codeplug_view(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(hint, area);
         return;
     }
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
 
     // Main content area
     let mut content_lines = vec![];
@@ -67,39 +61,32 @@ pub fn render_codeplug_view(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     content_lines.push(Line::from(""));
-    content_lines.push(Line::from(""));
-    content_lines.push(Line::from(vec![Span::styled(
-        "  Actions:",
-        Style::default()
-            .fg(COLOR_PRIMARY)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    content_lines.push(Line::from(""));
 
+    // Show channel count
+    let channel_count = app.channels.len();
+    let deleted_count = app.deleted_channels.len();
     content_lines.push(Line::from(vec![
-        Span::raw("    "),
-        render_shortcut("i"),
-        Span::raw("  Import codeplug from .nfw file"),
+        Span::styled("  Channels: ", Style::default().fg(COLOR_ACCENT)),
+        Span::styled(
+            format!("{} (+ {} deleted)", channel_count, deleted_count),
+            Style::default().fg(Color::White),
+        ),
     ]));
 
-    if !app.channels.is_empty() && app.settings.is_some() {
+    // Show settings info
+    if app.settings.is_some() {
         content_lines.push(Line::from(vec![
-            Span::raw("    "),
-            render_shortcut("e"),
-            Span::raw("  Export current config to .nfw file"),
+            Span::styled("  Radio Settings: ", Style::default().fg(COLOR_ACCENT)),
+            Span::styled("Loaded", Style::default().fg(COLOR_SUCCESS)),
         ]));
     }
 
-    if app.codeplug_data.is_some() {
-        content_lines.push(Line::from(vec![
-            Span::raw("    "),
-            render_shortcut("w"),
-            Span::styled(
-                "  Write codeplug to radio",
-                Style::default().fg(COLOR_SUCCESS),
-            ),
-        ]));
-    }
+    // Show import/export hints
+    content_lines.push(Line::from(""));
+    content_lines.push(Line::from(vec![
+        Span::styled("  Hint: ", Style::default().fg(COLOR_DIM)),
+        Span::raw("Press 'i' to import, 'e' to export, 'w' to write to radio"),
+    ]));
 
     let content = Paragraph::new(content_lines).block(
         Block::default()
@@ -107,29 +94,5 @@ pub fn render_codeplug_view(f: &mut Frame, app: &mut App, area: Rect) {
             .border_style(Style::default().fg(COLOR_PRIMARY))
             .title(" CODEPLUG MANAGER "),
     );
-    f.render_widget(content, chunks[0]);
-
-    // Hints footer (matching other tabs' style)
-    let mut hints = vec![render_shortcut("i"), Span::raw(" import")];
-
-    if !app.channels.is_empty() && app.settings.is_some() {
-        hints.push(Span::raw(" | "));
-        hints.push(render_shortcut("e"));
-        hints.push(Span::raw(" export"));
-    }
-
-    if app.codeplug_data.is_some() {
-        hints.push(Span::raw(" | "));
-        hints.push(render_shortcut("w"));
-        hints.push(Span::raw(" write"));
-    }
-
-    let hint_line = Paragraph::new(Line::from(hints))
-        .style(Style::default().bg(Color::Rgb(40, 40, 40)))
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(COLOR_PRIMARY)),
-        );
-    f.render_widget(hint_line, chunks[1]);
+    f.render_widget(content, area);
 }

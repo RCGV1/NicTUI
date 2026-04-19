@@ -1,10 +1,18 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use super::metadata::SETTINGS_METADATA;
 use super::types::*;
+
+pub const SETTINGS_MAGIC: u16 = 0xD82F;
+pub const BAND_PLAN_RECORD_COUNT: usize = 20;
+pub const BAND_PLAN_RECORD_SIZE: usize = 10;
+pub const SCAN_PRESET_RECORD_COUNT: usize = 8;
+pub const SCAN_PRESET_RECORD_SIZE: usize = 20;
+pub const GROUP_LABEL_RECORD_COUNT: usize = GROUP_LABEL_COUNT;
+pub const GROUP_LABEL_RECORD_SIZE: usize = GROUP_LABEL_SIZE;
 
 #[derive(Debug, Clone)]
 pub enum RemotePacket {
@@ -41,10 +49,62 @@ pub enum RemotePacket {
     },
     SignalBarPos {
         y: u8,
+        aux: u8,
     },
-    LedStatus {
-        status: u8,
+    SmallStatus {
+        id: u8,
+        value1: u8,
+        value2: u8,
     },
+}
+
+impl RemotePacket {
+    pub fn summary(&self) -> String {
+        match self {
+            RemotePacket::DisplayText { x, y, text, .. } => {
+                format!("TXT ({x:>3},{y:>3}) {}", truncate_remote_text(text, 20))
+            }
+            RemotePacket::DrawRectangle {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => format!("BOX ({x:>3},{y:>3}) {width:>3}x{height:<3}"),
+            RemotePacket::DrawSymbol {
+                symbol_id, x, y, ..
+            } => {
+                format!("SYM {symbol_id:02X} @ ({x:>3},{y:>3})")
+            }
+            RemotePacket::SignalStrength {
+                strength,
+                mode,
+                battery,
+            } => format!("RSSI {strength:>3} mode {mode:>2} batt {battery:>3}"),
+            RemotePacket::NoiseLevel { level, mode } => {
+                format!("NOISE {level:>3} mode {mode:>2}")
+            }
+            RemotePacket::SignalBarPos { y, aux } => {
+                format!("SBAR y {y:>3} aux {aux:>3}")
+            }
+            RemotePacket::SmallStatus { id, value1, value2 } => {
+                format!("STS {id:02X}  {value1:02X} {value2:02X}")
+            }
+        }
+    }
+}
+
+fn truncate_remote_text(text: &str, max_len: usize) -> String {
+    if text.chars().count() <= max_len {
+        text.to_string()
+    } else {
+        let mut shortened = text
+            .chars()
+            .take(max_len.saturating_sub(3))
+            .collect::<String>();
+        shortened.push_str("...");
+        shortened
+    }
 }
 
 pub struct RadioProtocol {
@@ -58,9 +118,19 @@ impl RadioProtocol {
     }
 
     pub fn new_with_baud(port_name: &str, baud_rate: u32) -> Result<Self> {
-        let port = serialport::new(port_name, baud_rate)
-            .timeout(Duration::from_millis(50))
-            .open()?;
+        let builder = serialport::new(port_name, baud_rate).timeout(Duration::from_millis(50));
+        #[cfg(unix)]
+        let port: Box<dyn serialport::SerialPort> = {
+            let mut port = builder.open_native()?;
+            #[cfg(target_os = "macos")]
+            {
+                let _ = port.set_exclusive(false);
+            }
+            Box::new(port)
+        };
+        #[cfg(not(unix))]
+        let mut port = builder.open()?;
+        let _ = port.clear(serialport::ClearBuffer::All);
         Ok(Self {
             port,
             log_callback: None,
@@ -75,7 +145,6 @@ impl RadioProtocol {
 
     fn send(&mut self, data: &[u8]) -> Result<()> {
         self.log(format!("TX: {:02X?}", data));
-        self.port.clear(serialport::ClearBuffer::Input)?;
         self.port.write_all(data)?;
         self.port.flush()?;
         Ok(())
@@ -88,7 +157,10 @@ impl RadioProtocol {
     pub fn read_byte(&mut self) -> Result<Option<u8>> {
         let mut buf = [0u8; 1];
         match self.port.read(&mut buf) {
-            Ok(1) => Ok(Some(buf[0])),
+            Ok(1) => {
+                self.log(format!("RX: [{:02X}]", buf[0]));
+                Ok(Some(buf[0]))
+            }
             Ok(_) => Ok(None),
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(None),
             Err(e) => Err(e.into()),
@@ -165,6 +237,15 @@ impl RadioProtocol {
         Ok(())
     }
 
+    pub fn press_remote_key(&mut self, key_code: u8) -> Result<()> {
+        std::thread::sleep(Duration::from_millis(50));
+        self.send_key(key_code)?;
+        std::thread::sleep(Duration::from_millis(60));
+        self.send_bytes(&[0xFF])?;
+        std::thread::sleep(Duration::from_millis(20));
+        Ok(())
+    }
+
     pub fn reboot(&mut self) -> Result<()> {
         self.send(&[PKT_REBOOT])?;
         std::thread::sleep(Duration::from_millis(500));
@@ -186,8 +267,8 @@ impl RadioProtocol {
             let rx_freq_le = u32::from_le_bytes(blk[0..4].try_into().unwrap());
             let rx_freq_be = u32::from_be_bytes(blk[0..4].try_into().unwrap());
 
-            let le_valid = rx_freq_le >= 100000 && rx_freq_le <= 100000000;
-            let be_valid = rx_freq_be >= 100000 && rx_freq_be <= 100000000;
+            let le_valid = (100000..=100000000).contains(&rx_freq_le);
+            let be_valid = (100000..=100000000).contains(&rx_freq_be);
 
             if le_valid && !be_valid {
                 return Ok(Endianness::Little);
@@ -202,24 +283,147 @@ impl RadioProtocol {
         Ok(Endianness::Big)
     }
 
-    pub fn read_block(&mut self, block_num: u8) -> Result<Vec<u8>> {
-        for _ in 0..5 {
-            self.send(&[PKT_READ_EEPROM, block_num])?;
-            match self.recv(1 + BLOCK_SIZE + 1, Duration::from_millis(1000)) {
-                Ok(resp) => {
-                    if resp[0] == PKT_READ_EEPROM {
-                        let data = &resp[1..1 + BLOCK_SIZE];
-                        let checksum = resp[1 + BLOCK_SIZE];
-                        let calculated_sum: u8 =
-                            data.iter().fold(0u8, |acc, &x| acc.wrapping_add(x));
-                        if calculated_sum == checksum {
-                            return Ok(data.to_vec());
-                        }
-                    }
+    pub fn infer_settings_endianness(raw: &[u8]) -> Endianness {
+        if raw.len() < 2 {
+            return Endianness::Big;
+        }
+
+        let big = BigEndian::read_u16(&raw[0..2]);
+        if big == SETTINGS_MAGIC {
+            return Endianness::Big;
+        }
+
+        let little = LittleEndian::read_u16(&raw[0..2]);
+        if little == SETTINGS_MAGIC {
+            return Endianness::Little;
+        }
+
+        Endianness::Big
+    }
+
+    pub fn infer_bandplan_endianness(raw: &[u8]) -> Endianness {
+        let score = |endian| {
+            let mut valid = 0usize;
+            for chunk in raw
+                .chunks_exact(BAND_PLAN_RECORD_SIZE)
+                .take(BAND_PLAN_RECORD_COUNT)
+            {
+                let start = match endian {
+                    Endianness::Little => LittleEndian::read_u32(&chunk[0..4]),
+                    Endianness::Big => BigEndian::read_u32(&chunk[0..4]),
+                };
+                let end = match endian {
+                    Endianness::Little => LittleEndian::read_u32(&chunk[4..8]),
+                    Endianness::Big => BigEndian::read_u32(&chunk[4..8]),
+                };
+                if start == 0 && end == 0 {
+                    continue;
                 }
-                Err(_) => {}
+                if (1_000_000..=130_000_000).contains(&start)
+                    && (1_000_000..=130_000_000).contains(&end)
+                    && start < end
+                {
+                    valid += 1;
+                }
             }
-            std::thread::sleep(Duration::from_millis(200));
+            valid
+        };
+
+        if score(Endianness::Big) >= score(Endianness::Little) {
+            Endianness::Big
+        } else {
+            Endianness::Little
+        }
+    }
+
+    pub fn infer_scan_preset_endianness(raw: &[u8]) -> Endianness {
+        let score = |endian| {
+            let mut valid = 0usize;
+            for chunk in raw
+                .chunks_exact(SCAN_PRESET_RECORD_SIZE)
+                .take(SCAN_PRESET_RECORD_COUNT)
+            {
+                let start = match endian {
+                    Endianness::Little => LittleEndian::read_u32(&chunk[0..4]),
+                    Endianness::Big => BigEndian::read_u32(&chunk[0..4]),
+                };
+                let range = match endian {
+                    Endianness::Little => LittleEndian::read_u16(&chunk[4..6]),
+                    Endianness::Big => BigEndian::read_u16(&chunk[4..6]),
+                };
+                let step = match endian {
+                    Endianness::Little => LittleEndian::read_u16(&chunk[6..8]),
+                    Endianness::Big => BigEndian::read_u16(&chunk[6..8]),
+                };
+                let label = chunk[11..19].iter().all(|byte| {
+                    *byte == 0 || *byte == b' ' || byte.is_ascii_alphanumeric() || *byte == b'.'
+                });
+
+                if start == 0 {
+                    continue;
+                }
+                if (1_000_000..=130_000_000).contains(&start)
+                    && range <= 10_000
+                    && (100..=10_000).contains(&step)
+                    && label
+                {
+                    valid += 1;
+                }
+            }
+            valid
+        };
+
+        if score(Endianness::Big) >= score(Endianness::Little) {
+            Endianness::Big
+        } else {
+            Endianness::Little
+        }
+    }
+
+    pub fn read_block(&mut self, block_num: u8) -> Result<Vec<u8>> {
+        for attempt in 0..6 {
+            let _ = self.port.clear(serialport::ClearBuffer::Input);
+            std::thread::sleep(Duration::from_millis(15));
+            self.send(&[PKT_READ_EEPROM, block_num])?;
+
+            match self.recv(1 + BLOCK_SIZE + 1, Duration::from_millis(1000)) {
+                Ok(resp) if resp[0] == PKT_READ_EEPROM => {
+                    let data = &resp[1..1 + BLOCK_SIZE];
+                    let checksum = resp[1 + BLOCK_SIZE];
+                    let calculated_sum: u8 = data.iter().fold(0u8, |acc, &x| acc.wrapping_add(x));
+                    if calculated_sum == checksum {
+                        std::thread::sleep(Duration::from_millis(8));
+                        return Ok(data.to_vec());
+                    }
+
+                    self.log(format!(
+                        "Read block {} attempt {} checksum mismatch: got {:02X}, expected {:02X}",
+                        block_num,
+                        attempt + 1,
+                        checksum,
+                        calculated_sum
+                    ));
+                }
+                Ok(resp) => {
+                    self.log(format!(
+                        "Read block {} attempt {} returned unexpected header {:02X}",
+                        block_num,
+                        attempt + 1,
+                        resp[0]
+                    ));
+                }
+                Err(error) => {
+                    self.log(format!(
+                        "Read block {} attempt {} failed: {}",
+                        block_num,
+                        attempt + 1,
+                        error
+                    ));
+                }
+            }
+
+            let _ = self.port.clear(serialport::ClearBuffer::All);
+            std::thread::sleep(Duration::from_millis(120 + attempt as u64 * 30));
         }
         Err(anyhow!("Failed to read block {} after retries", block_num))
     }
@@ -233,17 +437,36 @@ impl RadioProtocol {
         pkt.extend_from_slice(data);
         pkt.push(checksum);
 
-        for _ in 0..3 {
+        for attempt in 0..5 {
+            let _ = self.port.clear(serialport::ClearBuffer::Input);
+            std::thread::sleep(Duration::from_millis(15));
             self.send(&pkt)?;
+
             match self.recv(1, Duration::from_millis(1000)) {
-                Ok(resp) => {
-                    if resp[0] == PKT_WRITE_EEPROM {
-                        return Ok(true);
-                    }
+                Ok(resp) if resp[0] == PKT_WRITE_EEPROM => {
+                    std::thread::sleep(Duration::from_millis(12));
+                    return Ok(true);
                 }
-                Err(_) => {}
+                Ok(resp) => {
+                    self.log(format!(
+                        "Write block {} attempt {} returned unexpected ack {:02X}",
+                        block_num,
+                        attempt + 1,
+                        resp[0]
+                    ));
+                }
+                Err(error) => {
+                    self.log(format!(
+                        "Write block {} attempt {} failed: {}",
+                        block_num,
+                        attempt + 1,
+                        error
+                    ));
+                }
             }
-            std::thread::sleep(Duration::from_millis(100));
+
+            let _ = self.port.clear(serialport::ClearBuffer::All);
+            std::thread::sleep(Duration::from_millis(120 + attempt as u64 * 30));
         }
         Ok(false)
     }
@@ -259,7 +482,7 @@ impl RadioProtocol {
 
         // Validate frequency is in reasonable range (1 MHz to 1000 MHz for amateur radio)
         // Stored as integer: value * 100000 = Hz
-        if rx_freq_raw < 100000 || rx_freq_raw > 1000000000 {
+        if !(100000..=1000000000).contains(&rx_freq_raw) {
             return None;
         }
 
@@ -271,7 +494,7 @@ impl RadioProtocol {
         // Validate TX frequency is in reasonable range
         if tx_freq_raw != 0
             && tx_freq_raw != 0xFFFFFFFF
-            && (tx_freq_raw < 100000 || tx_freq_raw > 1000000000)
+            && !(100000..=1000000000).contains(&tx_freq_raw)
         {
             return None;
         }
@@ -289,7 +512,20 @@ impl RadioProtocol {
             Endianness::Little => LittleEndian::read_u16(&raw[13..15]),
             Endianness::Big => BigEndian::read_u16(&raw[13..15]),
         };
-        let bits = raw[17];
+        let bits = raw[15];
+
+        // Some radios synthesize a placeholder record when a memory slot is cleared instead of
+        // leaving the bytes erased. Treat that template as empty so readback matches user intent.
+        if rx_freq_raw == 14_400_000
+            && tx_freq_raw == 14_400_000
+            && rx_tone_raw == 0xFFFF
+            && tx_tone_raw == 0xFFFF
+            && power == 0xFF
+            && groups_raw == 0xFFFF
+            && bits == 0xFF
+        {
+            return None;
+        }
 
         let groups = [
             (groups_raw & 0x000F) as u8,
@@ -318,10 +554,10 @@ impl RadioProtocol {
                 "Wide".to_string()
             },
             modulation: match (bits >> 1) & 0x03 {
-                0 => "FM".to_string(),
-                1 => "AM".to_string(),
-                2 => "USB".to_string(),
-                3 => "LSB".to_string(),
+                0 => "LSB".to_string(),
+                1 => "FM".to_string(),
+                2 => "AM".to_string(),
+                3 => "USB".to_string(),
                 _ => "FM".to_string(),
             },
             position: (bits >> 3) & 0x01,
@@ -333,7 +569,7 @@ impl RadioProtocol {
     }
 
     pub fn pack_channel(ch: &Channel, endian: Endianness) -> Vec<u8> {
-        let mut raw = vec![0u8; 32];
+        let mut raw = vec![0xFFu8; 32];
         let rx_freq_raw = (ch.rx_freq.parse::<f64>().unwrap_or(0.0) * 100000.0) as u32;
         let tx_freq_raw = (ch.tx_freq.parse::<f64>().unwrap_or(0.0) * 100000.0) as u32;
 
@@ -370,11 +606,11 @@ impl RadioProtocol {
             bits |= 0x01;
         }
         let mod_val = match ch.modulation.as_str() {
-            "FM" => 0,
-            "AM" => 1,
-            "USB" => 2,
-            "LSB" => 3,
-            _ => 0,
+            "LSB" => 0,
+            "FM" => 1,
+            "AM" => 2,
+            "USB" => 3,
+            _ => 1,
         };
         bits |= (mod_val << 1) & 0x06;
         bits |= (ch.position & 0x01) << 3;
@@ -385,10 +621,16 @@ impl RadioProtocol {
         if ch.busy_lock {
             bits |= 0x80;
         }
-        raw[17] = bits;
+        raw[15] = bits;
+        raw[16..20].fill(0xFF);
 
         let name_bytes = ch.name.as_bytes();
         let len = name_bytes.len().min(12);
+        raw[20..32].fill(0);
+        if len < 12 {
+            raw[20..31].fill(b' ');
+            raw[31] = 0;
+        }
         raw[20..20 + len].copy_from_slice(&name_bytes[..len]);
 
         raw
@@ -396,16 +638,16 @@ impl RadioProtocol {
 
     pub fn parse_settings_block(raw: &[u8], endian: Endianness) -> SettingsBlock {
         let mut vfo_state = [VfoState::default(), VfoState::default()];
-        for i in 0..2 {
+        for (i, state) in vfo_state.iter_mut().enumerate() {
             let offset = 0x20 + (i * 19);
             // Check bounds before accessing to prevent panic with 64-byte codeplugs
             if offset + 18 < raw.len() {
-                vfo_state[i].group = raw[offset];
-                vfo_state[i].last_group = raw[offset + 1];
-                vfo_state[i]
+                state.group = raw[offset];
+                state.last_group = raw[offset + 1];
+                state
                     .group_mode_channels
                     .copy_from_slice(&raw[offset + 2..offset + 18]);
-                vfo_state[i].mode = raw[offset + 18];
+                state.mode = raw[offset + 18];
             }
         }
 
@@ -630,19 +872,31 @@ impl RadioProtocol {
     }
 
     pub fn parse_remote_packet(&mut self) -> Result<Option<RemotePacket>> {
-        // Read ID
-        let id_buf = self.recv(1, Duration::from_millis(10))?;
-        let id = id_buf[0];
+        let Some(id) = self.read_byte()? else {
+            return Ok(None);
+        };
 
         // NOP packets are just ignored
         if id == 0x00 {
             return Ok(None);
         }
 
+        let packet =
+            Self::parse_remote_packet_inner(id, |length, timeout| self.recv(length, timeout))?;
+        if packet.is_none() {
+            self.log(format!("REMOTE: unhandled packet {:02X}", id));
+        }
+        Ok(packet)
+    }
+
+    fn parse_remote_packet_inner<F>(id: u8, mut recv: F) -> Result<Option<RemotePacket>>
+    where
+        F: FnMut(usize, Duration) -> Result<Vec<u8>>,
+    {
         match id {
             0x64 => {
                 // Display Text
-                let header = self.recv(7, Duration::from_millis(100))?;
+                let header = recv(7, Duration::from_millis(100))?;
                 let font_size = header[0];
                 let x = header[1];
                 let y = header[2];
@@ -652,14 +906,14 @@ impl RadioProtocol {
                 // Read null-terminated string
                 let mut text_bytes = Vec::new();
                 loop {
-                    let b = self.recv(1, Duration::from_millis(100))?[0];
+                    let b = recv(1, Duration::from_millis(100))?[0];
                     if b == 0 {
                         break;
                     }
                     text_bytes.push(b);
                 }
                 // Skip padding
-                let _ = self.recv(2, Duration::from_millis(10));
+                let _ = recv(2, Duration::from_millis(10));
 
                 Ok(Some(RemotePacket::DisplayText {
                     font_size,
@@ -672,13 +926,13 @@ impl RadioProtocol {
             }
             0x65 => {
                 // Draw Rectangle
-                let data = self.recv(6, Duration::from_millis(100))?;
+                let data = recv(6, Duration::from_millis(100))?;
                 let x = data[0];
                 let y = data[1];
                 let width = data[2];
                 let height = data[3];
                 let color = LittleEndian::read_u16(&data[4..6]);
-                let _ = self.recv(2, Duration::from_millis(10));
+                let _ = recv(2, Duration::from_millis(10));
                 Ok(Some(RemotePacket::DrawRectangle {
                     x,
                     y,
@@ -689,13 +943,13 @@ impl RadioProtocol {
             }
             0x66 => {
                 // Draw Symbol
-                let data = self.recv(7, Duration::from_millis(100))?;
+                let data = recv(7, Duration::from_millis(100))?;
                 let symbol_id = data[0];
                 let x = data[1];
                 let y = data[2];
                 let fg_color = LittleEndian::read_u16(&data[3..5]);
                 let bg_color = LittleEndian::read_u16(&data[5..7]);
-                let _ = self.recv(2, Duration::from_millis(10));
+                let _ = recv(2, Duration::from_millis(10));
                 Ok(Some(RemotePacket::DrawSymbol {
                     symbol_id,
                     x,
@@ -706,14 +960,8 @@ impl RadioProtocol {
             }
             0x67 => {
                 // Signal Strength (2 bytes data + 2 bytes padding)
-                let data = self.recv(2, Duration::from_millis(100))?;
-                let padding = self.recv(2, Duration::from_millis(10))?;
-
-                // Log for debugging battery parsing
-                self.log(format!(
-                    "Signal packet: strength={}, mode={}, padding={:02X?}",
-                    data[0], data[1], padding
-                ));
+                let data = recv(2, Duration::from_millis(100))?;
+                let padding = recv(2, Duration::from_millis(10))?;
 
                 // Based on empirical testing, battery might be in padding bytes
                 // Documentation doesn't mention battery, but hardware seems to send it
@@ -725,24 +973,29 @@ impl RadioProtocol {
                     battery,
                 }))
             }
-            0x68 => {
-                // Noise Level
-                let data = self.recv(2, Duration::from_millis(100))?;
-                let _ = self.recv(2, Duration::from_millis(10));
+            // The Nicsure helper used by these packets shifts out two data bytes after the opcode.
+            // Accept the high-bit form as well until the live wire value is captured directly.
+            0x68 | 0xE8 => {
+                let data = recv(2, Duration::from_millis(100))?;
                 Ok(Some(RemotePacket::NoiseLevel {
                     level: data[0],
                     mode: data[1],
                 }))
             }
-            0x69 => {
-                // Signal Bar Pos
-                let data = self.recv(1, Duration::from_millis(100))?;
-                let _ = self.recv(2, Duration::from_millis(10));
-                Ok(Some(RemotePacket::SignalBarPos { y: data[0] }))
+            0x69 | 0xE9 => {
+                let data = recv(2, Duration::from_millis(100))?;
+                Ok(Some(RemotePacket::SignalBarPos {
+                    y: data[0],
+                    aux: data[1],
+                }))
             }
             0x70..=0x7F => {
-                // LED Status
-                Ok(Some(RemotePacket::LedStatus { status: id & 0x0F }))
+                let data = recv(2, Duration::from_millis(100))?;
+                Ok(Some(RemotePacket::SmallStatus {
+                    id,
+                    value1: data[0],
+                    value2: data[1],
+                }))
             }
             _ => Ok(None),
         }
@@ -764,10 +1017,11 @@ impl RadioProtocol {
             start_freq,
             end_freq,
             max_power,
-            tx_allowed: bits & 0x01 != 0,
-            wrap: bits & 0x02 != 0,
-            bandwidth: (bits >> 3) & 0x07,
-            modulation: (bits >> 0) & 0x07,
+            tx_allowed: bits == 0x27,
+            wrap: bits == 0x27,
+            bandwidth: if bits == 0xA0 { 1 } else { 0 },
+            modulation: if bits == 0x4A { 1 } else { 0 },
+            raw_flags: bits,
         }
     }
 
@@ -784,31 +1038,19 @@ impl RadioProtocol {
             }
         }
         raw[8] = bp.max_power;
-        let mut bits = 0u8;
-        if bp.tx_allowed {
-            bits |= 0x01;
-        }
-        if bp.wrap {
-            bits |= 0x02;
-        }
-        bits |= (bp.modulation & 0x07) << 0;
-        bits |= (bp.bandwidth & 0x07) << 3;
-        raw[9] = bits;
+        raw[9] = if bp.raw_flags != 0 {
+            bp.raw_flags
+        } else if bp.modulation == 1 {
+            0x4A
+        } else if bp.tx_allowed || bp.wrap {
+            0x27
+        } else {
+            0x00
+        };
         raw
     }
 
     pub fn parse_scan_preset(raw: &[u8], index: u8, endian: Endianness) -> ScanPreset {
-        // Python structure (14 bytes total):
-        // ul32 startscanfreq      (0-3)
-        // ul16 numbersearches     (4-5)
-        // u8 squelchscan          (6)
-        // u8 squelchtailscan      (7)
-        // ul16 stepscan           (8-9)
-        // u8 scanhold             (10)
-        // u8 scantail             (11)
-        // u8 updatescan           (12)
-        // u8 modulationscan       (13)
-
         let start_freq = match endian {
             Endianness::Little => LittleEndian::read_u32(&raw[0..4]),
             Endianness::Big => BigEndian::read_u32(&raw[0..4]),
@@ -817,48 +1059,75 @@ impl RadioProtocol {
             Endianness::Little => LittleEndian::read_u16(&raw[4..6]),
             Endianness::Big => BigEndian::read_u16(&raw[4..6]),
         };
-        let _squelch_scan = raw[6];
-        let _squelch_tail_scan = raw[7];
         let step = match endian {
-            Endianness::Little => LittleEndian::read_u16(&raw[8..10]),
-            Endianness::Big => BigEndian::read_u16(&raw[8..10]),
+            Endianness::Little => LittleEndian::read_u16(&raw[6..8]),
+            Endianness::Big => BigEndian::read_u16(&raw[6..8]),
         };
-        let scan_hold = raw[10];
-        let scan_tail = raw[11];
-        let update_scan = raw[12];
-        let modulation_scan = raw[13];
+        let raw_mode = raw[10];
+        let label = String::from_utf8_lossy(&raw[11..19])
+            .trim_matches(char::from(0))
+            .trim()
+            .to_string();
 
         ScanPreset {
             index,
             start_freq,
             range,
             step,
-            resume: scan_hold,
-            persist: scan_tail,
-            modulation: modulation_scan,
-            ultrascan: update_scan,
-            label: format!("Preset {}", index + 1), // No label in firmware, generate one
+            resume: raw[8],
+            persist: raw[9],
+            modulation: match raw_mode & 0x0F {
+                1 => 1,
+                2 => 2,
+                _ => 0,
+            },
+            ultrascan: raw[19],
+            label: if label.is_empty() {
+                format!("Preset {}", index + 1)
+            } else {
+                label
+            },
+            raw_mode,
+            raw_tail: raw[19],
         }
     }
 
     pub fn pack_scan_preset(sp: &ScanPreset, endian: Endianness) -> Vec<u8> {
-        let mut raw = vec![0u8; 14];
+        let mut raw = vec![0u8; SCAN_PRESET_RECORD_SIZE];
         match endian {
             Endianness::Little => {
                 LittleEndian::write_u32(&mut raw[0..4], sp.start_freq);
                 LittleEndian::write_u16(&mut raw[4..6], sp.range);
-                LittleEndian::write_u16(&mut raw[8..10], sp.step);
+                LittleEndian::write_u16(&mut raw[6..8], sp.step);
             }
             Endianness::Big => {
                 BigEndian::write_u32(&mut raw[0..4], sp.start_freq);
                 BigEndian::write_u16(&mut raw[4..6], sp.range);
-                BigEndian::write_u16(&mut raw[8..10], sp.step);
+                BigEndian::write_u16(&mut raw[6..8], sp.step);
             }
         }
-        raw[10] = sp.resume;
-        raw[11] = sp.persist;
-        raw[12] = sp.modulation;
-        raw[13] = sp.ultrascan;
+        raw[8] = sp.resume;
+        raw[9] = sp.persist;
+        let mode_prefix = if sp.raw_mode & 0xF0 != 0 {
+            sp.raw_mode & 0xF0
+        } else {
+            0x10
+        };
+        raw[10] = mode_prefix
+            | match sp.modulation {
+                1 => 1,
+                2 => 2,
+                _ => 0,
+            };
+        raw[11..19].fill(b' ');
+        let label_bytes = sp.label.as_bytes();
+        let label_len = label_bytes.len().min(8);
+        raw[11..11 + label_len].copy_from_slice(&label_bytes[..label_len]);
+        raw[19] = if sp.ultrascan != 0 {
+            sp.ultrascan
+        } else {
+            sp.raw_tail
+        };
         raw
     }
 
@@ -942,6 +1211,41 @@ impl RadioProtocol {
         raw[5..5 + label_len].copy_from_slice(&label_bytes[..label_len]);
         raw
     }
+
+    pub fn parse_group_labels(raw: &[u8]) -> Vec<String> {
+        let mut labels = Vec::with_capacity(GROUP_LABEL_RECORD_COUNT);
+        for index in 0..GROUP_LABEL_RECORD_COUNT {
+            let start = index * GROUP_LABEL_RECORD_SIZE;
+            let end = start + GROUP_LABEL_RECORD_SIZE;
+            let label = raw
+                .get(start..end)
+                .map(|bytes| {
+                    String::from_utf8_lossy(bytes)
+                        .trim_matches(char::from(0))
+                        .trim()
+                        .to_string()
+                })
+                .unwrap_or_default();
+            labels.push(label);
+        }
+        labels
+    }
+
+    pub fn pack_group_labels(labels: &[String]) -> Vec<u8> {
+        let normalized = normalize_group_labels(labels);
+        let mut raw = vec![0u8; GROUP_LABEL_RECORD_COUNT * GROUP_LABEL_RECORD_SIZE];
+
+        for (index, label) in normalized.iter().enumerate() {
+            let start = index * GROUP_LABEL_RECORD_SIZE;
+            let end = start + GROUP_LABEL_RECORD_SIZE;
+            let bytes = label.as_bytes();
+            let len = bytes.len().min(GROUP_LABEL_RECORD_SIZE);
+            raw[start..end].fill(0);
+            raw[start..start + len].copy_from_slice(&bytes[..len]);
+        }
+
+        raw
+    }
 }
 
 impl SettingsBlock {
@@ -984,7 +1288,7 @@ impl SettingsBlock {
             34 => self.rf_gain as u32,
             35 => self.s_bar_style as u32,
             36 => self.sq_noise_lev as u32,
-            37 => self.last_fmt_freq as u32,
+            37 => self.last_fmt_freq,
             38 => self.vox as u32,
             39 => self.vox_tail as u32,
             40 => self.tx_timeout as u32,
@@ -1047,7 +1351,7 @@ impl SettingsBlock {
             34 => self.rf_gain = value as u8,
             35 => self.s_bar_style = value as u8,
             36 => self.sq_noise_lev = value as u8,
-            37 => self.last_fmt_freq = value as u32,
+            37 => self.last_fmt_freq = value,
             38 => self.vox = value as u8,
             39 => self.vox_tail = value as u16,
             40 => self.tx_timeout = value as u8,
@@ -1113,15 +1417,9 @@ fn pack_tone(tone: &str) -> u16 {
     if tone.to_lowercase() == "off" {
         return 0;
     }
-    if tone.starts_with('D') {
-        let inverted = tone.ends_with('i');
-        let dcs_str = if inverted {
-            &tone[1..tone.len() - 1]
-        } else if tone.ends_with('n') {
-            &tone[1..tone.len() - 1]
-        } else {
-            &tone[1..]
-        };
+    if let Some(rest) = tone.strip_prefix('D') {
+        let inverted = rest.ends_with('i');
+        let dcs_str = rest.trim_end_matches(['i', 'n']);
         let dcs = dcs_str.parse::<u16>().unwrap_or(0);
         let mut val = 0x8000 | (dcs & 0x3FFF);
         if inverted {
@@ -1130,4 +1428,234 @@ fn pack_tone(tone: &str) -> u16 {
         return val;
     }
     (tone.parse::<f64>().unwrap_or(0.0) * 10.0) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    fn recv_from_queue(
+        queue: &mut VecDeque<u8>,
+        length: usize,
+        _timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        if queue.len() < length {
+            return Err(anyhow!(
+                "Timeout waiting for response (got {}/{} bytes)",
+                queue.len(),
+                length
+            ));
+        }
+
+        Ok((0..length)
+            .map(|_| queue.pop_front().expect("queue length checked"))
+            .collect())
+    }
+
+    #[test]
+    fn parses_small_status_packets_with_two_payload_bytes() {
+        let mut queue = VecDeque::from([0x12, 0x34]);
+        let packet = RadioProtocol::parse_remote_packet_inner(0x72, |length, timeout| {
+            recv_from_queue(&mut queue, length, timeout)
+        })
+        .unwrap();
+
+        match packet {
+            Some(RemotePacket::SmallStatus { id, value1, value2 }) => {
+                assert_eq!(id, 0x72);
+                assert_eq!(value1, 0x12);
+                assert_eq!(value2, 0x34);
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn parses_signal_bar_packet_without_overreading() {
+        let mut queue = VecDeque::from([0x55, 0xAA]);
+        let packet = RadioProtocol::parse_remote_packet_inner(0x69, |length, timeout| {
+            recv_from_queue(&mut queue, length, timeout)
+        })
+        .unwrap();
+
+        match packet {
+            Some(RemotePacket::SignalBarPos { y, aux }) => {
+                assert_eq!(y, 0x55);
+                assert_eq!(aux, 0xAA);
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn parses_noise_packet_without_padding() {
+        let mut queue = VecDeque::from([0x09, 0x02]);
+        let packet = RadioProtocol::parse_remote_packet_inner(0xE8, |length, timeout| {
+            recv_from_queue(&mut queue, length, timeout)
+        })
+        .unwrap();
+
+        match packet {
+            Some(RemotePacket::NoiseLevel { level, mode }) => {
+                assert_eq!(level, 0x09);
+                assert_eq!(mode, 0x02);
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn infers_big_endian_settings_from_live_magic() {
+        let raw = [
+            0xD8, 0x2F, 0x04, 0x01, 0x00, 0x00, 0x13, 0x88, 0x0A, 0xF0, 0x0A, 0xF0,
+        ];
+        assert_eq!(
+            RadioProtocol::infer_settings_endianness(&raw),
+            Endianness::Big
+        );
+    }
+
+    #[test]
+    fn parses_live_like_channel_meta_from_byte_fifteen() {
+        let raw = [
+            0x00, 0xDD, 0xB9, 0xB8, 0x00, 0xDC, 0xCF, 0x58, 0x00, 0x00, 0x03, 0xB4, 0xFF, 0x10,
+            0x00, 0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0x57, 0x36, 0x53, 0x4C, 0x47, 0x20, 0x20, 0x20,
+            0x20, 0x20, 0x20, 0x00,
+        ];
+
+        let channel = RadioProtocol::parse_channel(&raw, 1, Endianness::Big)
+            .expect("live-like channel should parse");
+
+        assert_eq!(channel.rx_freq, "145.31000");
+        assert_eq!(channel.tx_freq, "144.71000");
+        assert_eq!(channel.bandwidth, "Wide");
+        assert_eq!(channel.modulation, "FM");
+        assert!(!channel.reverse);
+        assert!(!channel.busy_lock);
+        assert_eq!(channel.groups, [0, 0, 0, 1]);
+        assert_eq!(channel.position, 1);
+    }
+
+    #[test]
+    fn packs_live_like_ham_channel_exactly() {
+        let raw = [
+            0x00, 0xDD, 0xB9, 0xB8, 0x00, 0xDC, 0xCF, 0x58, 0x00, 0x00, 0x03, 0xB4, 0xFF, 0x10,
+            0x00, 0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0x57, 0x36, 0x53, 0x4C, 0x47, 0x20, 0x20, 0x20,
+            0x20, 0x20, 0x20, 0x00,
+        ];
+        let channel = RadioProtocol::parse_channel(&raw, 1, Endianness::Big)
+            .expect("live-like channel should parse");
+
+        assert_eq!(RadioProtocol::pack_channel(&channel, Endianness::Big), raw);
+    }
+
+    #[test]
+    fn packs_live_like_narrow_fm_channel_exactly() {
+        let raw = [
+            0x00, 0xED, 0x5F, 0x94, 0x00, 0xF2, 0xA9, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
+            0x00, 0x0B, 0xFF, 0xFF, 0xFF, 0xFF, 0x53, 0x43, 0x20, 0x53, 0x68, 0x65, 0x72, 0x69,
+            0x66, 0x66, 0x20, 0x42,
+        ];
+        let channel = RadioProtocol::parse_channel(&raw, 77, Endianness::Big)
+            .expect("live-like channel should parse");
+
+        assert_eq!(RadioProtocol::pack_channel(&channel, Endianness::Big), raw);
+    }
+
+    #[test]
+    fn packs_live_like_am_channel_exactly() {
+        let raw = [
+            0x00, 0xBB, 0xB8, 0xA4, 0x00, 0xBB, 0xB8, 0xA4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30,
+            0x00, 0x0C, 0xFF, 0xFF, 0xFF, 0xFF, 0x41, 0x69, 0x72, 0x2D, 0x41, 0x69, 0x72, 0x20,
+            0x48, 0x65, 0x6C, 0x69,
+        ];
+        let channel = RadioProtocol::parse_channel(&raw, 142, Endianness::Big)
+            .expect("live-like channel should parse");
+
+        assert_eq!(RadioProtocol::pack_channel(&channel, Endianness::Big), raw);
+    }
+
+    #[test]
+    fn ignores_cleared_placeholder_channel_template() {
+        let raw = [
+            0x00, 0xDB, 0xBA, 0x00, 0x00, 0xDB, 0xBA, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+
+        assert!(RadioProtocol::parse_channel(&raw, 8, Endianness::Big).is_none());
+    }
+
+    #[test]
+    fn parses_live_like_bandplan_record_big_endian() {
+        let raw = [0x00, 0xA4, 0xCB, 0x80, 0x00, 0xD1, 0x0B, 0xA0, 0x00, 0x4A];
+        let plan = RadioProtocol::parse_bandplan(&raw, 0, Endianness::Big);
+
+        assert_eq!(plan.start_freq, 10_800_000);
+        assert_eq!(plan.end_freq, 13_700_000);
+        assert_eq!(plan.modulation, 1);
+        assert_eq!(plan.raw_flags, 0x4A);
+    }
+
+    #[test]
+    fn parses_live_like_scan_preset_record() {
+        let raw = [
+            0x00, 0xB2, 0x87, 0x20, 0x07, 0x6C, 0x13, 0x88, 0x02, 0x00, 0x11, 0x61, 0x69, 0x72,
+            0x20, 0x20, 0x20, 0x20, 0x00, 0x00,
+        ];
+        let preset = RadioProtocol::parse_scan_preset(&raw, 0, Endianness::Big);
+
+        assert_eq!(preset.start_freq, 11_700_000);
+        assert_eq!(preset.range, 1900);
+        assert_eq!(preset.step, 5000);
+        assert_eq!(preset.modulation, 1);
+        assert_eq!(preset.label, "air");
+        assert_eq!(preset.raw_mode, 0x11);
+    }
+
+    #[test]
+    fn parses_group_label_table() {
+        let raw = [
+            0x48, 0x61, 0x6D, 0x00, 0x00, 0x00, 0x44, 0x69, 0x73, 0x70, 0x61, 0x00, 0x41, 0x69,
+            0x72, 0x00, 0x00, 0x00, 0x57, 0x65, 0x61, 0x74, 0x68, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let labels = RadioProtocol::parse_group_labels(&raw);
+
+        assert_eq!(labels.len(), GROUP_LABEL_COUNT);
+        assert_eq!(labels[0], "Ham");
+        assert_eq!(labels[1], "Dispa");
+        assert_eq!(labels[2], "Air");
+        assert_eq!(labels[3], "Weath");
+        assert!(labels[4].is_empty());
+    }
+
+    #[test]
+    fn packs_group_label_table_with_fixed_width_records() {
+        let labels = vec![
+            "Ham".to_string(),
+            "Dispatch".to_string(),
+            "Air".to_string(),
+            "Weather".to_string(),
+        ];
+
+        let packed = RadioProtocol::pack_group_labels(&labels);
+
+        assert_eq!(packed.len(), GROUP_LABEL_COUNT * GROUP_LABEL_RECORD_SIZE);
+        assert_eq!(&packed[0..6], b"Ham\0\0\0");
+        assert_eq!(&packed[6..12], b"Dispat");
+        assert_eq!(&packed[12..18], b"Air\0\0\0");
+        assert_eq!(&packed[18..24], b"Weathe");
+    }
 }

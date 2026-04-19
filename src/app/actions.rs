@@ -1,12 +1,21 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use super::state::{App, AppEvent, AppMode, MainTab};
-use crate::protocol::{Channel, RadioProtocol, BIN_FLASH_BAUD_RATE, BLOCK_SIZE, EEPROM_SIZE};
+use crate::channel_file::{load_channels_from_path, save_channels_to_path};
+use crate::device::{
+    ProgressEvent, read_band_plans as read_radio_band_plans, read_channels as read_radio_channels,
+    read_dtmf_presets as read_radio_dtmf_presets, read_group_labels as read_radio_group_labels,
+    read_scan_presets as read_radio_scan_presets, read_settings as read_radio_settings,
+    write_channels as write_radio_channels, write_codeplug as write_radio_codeplug,
+    write_dtmf_presets as write_radio_dtmf_presets, write_group_labels as write_radio_group_labels,
+    write_settings as write_radio_settings,
+};
+use crate::protocol::{BIN_FLASH_BAUD_RATE, RadioProtocol};
 
 impl App {
     pub fn select_port(&mut self) {
@@ -16,17 +25,21 @@ impl App {
         }
 
         let port_name = self.ports[self.selected_port_index].clone();
-        match RadioProtocol::new(&port_name) {
-            Ok(_) => {
-                self.protocol_port_name = Some(port_name.clone());
-                self.mode = AppMode::Main(MainTab::Channels);
-                self.status_message = format!("Connected to {}", port_name);
-                self.log(&format!("Opened port {}", port_name));
-            }
-            Err(e) => {
-                self.mode = AppMode::Error(format!("Failed to open port: {}", e));
-            }
-        }
+        let was_detected_radio = self
+            .selected_port_candidate()
+            .map(|candidate| candidate.is_radio())
+            .unwrap_or(false);
+        self.protocol_port_name = Some(port_name.clone());
+        self.mode = AppMode::Main(MainTab::Channels);
+        self.status_message = if was_detected_radio {
+            format!(
+                "Using detected radio port {}. Radio opens on first action.",
+                port_name
+            )
+        } else {
+            format!("Selected {}. Radio opens on first action.", port_name)
+        };
+        self.log(&format!("Selected port {}", port_name));
     }
 
     pub fn pick_import_file(&mut self) {
@@ -51,38 +64,28 @@ impl App {
         self.progress = 0.0;
 
         thread::spawn(move || {
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open port: {}", e)));
-                    return;
-                }
-            };
-
-            let _ = tx.send(AppEvent::Status("Handshaking...".to_string()));
-            if !proto.handshake().unwrap_or(false) {
-                let _ = tx.send(AppEvent::Error("Handshake failed".to_string()));
-                return;
-            }
-
-            let _ = tx.send(AppEvent::Status(format!(
-                "Clearing Channel {}...",
-                channel_num
-            )));
-            let blk = (channel_num + 1) as u8;
-            let empty_data = vec![0xFFu8; 32];
-
-            match proto.write_block(blk, &empty_data) {
-                Ok(true) => {
+            match write_radio_channels(
+                &port_name,
+                &[],
+                &[channel_num],
+                crate::protocol::Endianness::Big,
+                false,
+                |event| match event {
+                    ProgressEvent::Status(status) => {
+                        let _ = tx.send(AppEvent::Status(status));
+                    }
+                    ProgressEvent::Progress(progress) => {
+                        let _ = tx.send(AppEvent::Progress(progress));
+                    }
+                },
+            ) {
+                Ok(()) => {
                     let _ = tx.send(AppEvent::Progress(1.0));
                     let _ = tx.send(AppEvent::Status("Channel cleared successfully".to_string()));
                     let _ = tx.send(AppEvent::WriteComplete);
                 }
-                Ok(false) => {
-                    let _ = tx.send(AppEvent::Error("Radio rejected write".to_string()));
-                }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Write failed: {}", e)));
+                    let _ = tx.send(AppEvent::Error(format!("Failed to clear channel: {}", e)));
                 }
             }
         });
@@ -93,99 +96,53 @@ impl App {
             Some(p) => p.clone(),
             None => return,
         };
+        if let AppMode::Main(tab) = self.mode {
+            self.last_main_tab = tab;
+            if tab != MainTab::Remote {
+                self.last_non_remote_tab = tab;
+            }
+        }
         let tx = self.event_tx.clone();
         self.mode = AppMode::Reading;
         self.progress = 0.0;
 
         thread::spawn(move || {
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
+            match read_radio_channels(&port_name, |event| match event {
+                ProgressEvent::Status(status) => {
+                    let _ = tx.send(AppEvent::Status(status));
+                }
+                ProgressEvent::Progress(progress) => {
+                    let _ = tx.send(AppEvent::Progress(progress));
+                }
+            }) {
+                Ok((channels, endian)) => {
+                    let _ = tx.send(AppEvent::ReadChannelsComplete(channels, endian));
+                    match read_radio_group_labels(&port_name, |event| match event {
+                        ProgressEvent::Status(status) => {
+                            let _ = tx.send(AppEvent::Status(status));
+                        }
+                        ProgressEvent::Progress(progress) => {
+                            let _ = tx.send(AppEvent::Progress(progress));
+                        }
+                    }) {
+                        Ok(labels) => {
+                            let _ = tx.send(AppEvent::ReadGroupLabelsComplete(labels));
+                            let _ = tx.send(AppEvent::Status(
+                                "Channels and group names loaded".to_string(),
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::Status(format!(
+                                "Channels loaded, but group names could not be refreshed: {}",
+                                e
+                            )));
+                        }
+                    }
+                }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open port: {}", e)));
-                    return;
-                }
-            };
-
-            let _ = tx.send(AppEvent::Status("Handshaking...".to_string()));
-            if !proto.handshake().unwrap_or(false) {
-                let _ = tx.send(AppEvent::Error("Handshake failed".to_string()));
-                return;
-            }
-
-            let mut eeprom = vec![0u8; EEPROM_SIZE];
-
-            // Read settings and channels (blocks 0-199)
-            let blocks_to_read = 200;
-            for blk in 0..blocks_to_read {
-                match proto.read_block(blk as u8) {
-                    Ok(data) => {
-                        let start = blk * BLOCK_SIZE;
-                        eeprom[start..start + BLOCK_SIZE].copy_from_slice(&data);
-                        let _ = tx.send(AppEvent::Status(format!(
-                            "Reading EEPROM... {}/{}",
-                            blk + 1,
-                            blocks_to_read
-                        )));
-                        let _ = tx.send(AppEvent::Progress(
-                            (blk + 1) as f64 / (blocks_to_read + 1) as f64,
-                        ));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!(
-                            "Failed to read block {}: {}",
-                            blk, e
-                        )));
-                        return;
-                    }
+                    let _ = tx.send(AppEvent::Error(format!("Failed to read channels: {}", e)));
                 }
             }
-
-            // Detect Endianness
-            let _ = tx.send(AppEvent::Status("Detecting Endianness...".to_string()));
-            let endian = match proto.detect_endianness() {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!(
-                        "Failed to detect endianness: {}",
-                        e
-                    )));
-                    return;
-                }
-            };
-
-            let _ = tx.send(AppEvent::Status("Detecting channel format...".to_string()));
-            let channel_endian = match proto.detect_channel_endianness() {
-                Ok(e) => e,
-                Err(_) => endian,
-            };
-
-            let mut channels = Vec::new();
-            for i in 0..198 {
-                let blk = i + 2;
-                let start = blk * BLOCK_SIZE;
-                let end = start + BLOCK_SIZE;
-                if end <= eeprom.len() {
-                    if let Some(ch) = RadioProtocol::parse_channel(
-                        &eeprom[start..end],
-                        (i + 1) as u16,
-                        channel_endian,
-                    ) {
-                        channels.push(ch);
-                    }
-                }
-                let _ = tx.send(AppEvent::Status(format!(
-                    "Reading channels... {}",
-                    channels.len()
-                )));
-                let _ = tx.send(AppEvent::Progress(0.5 + (i as f64 / 198.0) * 0.5));
-            }
-
-            let _ = tx.send(AppEvent::Status(format!(
-                "Read {} channels",
-                channels.len()
-            )));
-            let _ = tx.send(AppEvent::Progress(1.0));
-            let _ = tx.send(AppEvent::ReadChannelsComplete(channels, endian));
         });
     }
 
@@ -195,50 +152,80 @@ impl App {
             None => return,
         };
         let tx = self.event_tx.clone();
-        let endian = self.endian;
         self.mode = AppMode::Reading;
         self.progress = 0.0;
 
         thread::spawn(move || {
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
+            match read_radio_scan_presets(&port_name, |event| match event {
+                ProgressEvent::Status(status) => {
+                    let _ = tx.send(AppEvent::Status(status));
+                }
+                ProgressEvent::Progress(progress) => {
+                    let _ = tx.send(AppEvent::Progress(progress));
+                }
+            }) {
+                Ok((presets, _)) => {
+                    let _ = tx.send(AppEvent::ReadPresetsComplete(presets));
+                    match read_radio_group_labels(&port_name, |event| match event {
+                        ProgressEvent::Status(status) => {
+                            let _ = tx.send(AppEvent::Status(status));
+                        }
+                        ProgressEvent::Progress(progress) => {
+                            let _ = tx.send(AppEvent::Progress(progress));
+                        }
+                    }) {
+                        Ok(labels) => {
+                            let _ = tx.send(AppEvent::ReadGroupLabelsComplete(labels));
+                            let _ = tx.send(AppEvent::Status(
+                                "Scan presets and group names loaded".to_string(),
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::Status(format!(
+                                "Scan presets loaded, but group names could not be refreshed: {}",
+                                e
+                            )));
+                        }
+                    }
+                }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open port: {}", e)));
-                    return;
-                }
-            };
-
-            let _ = tx.send(AppEvent::Status("Reading Presets...".to_string()));
-            let start_blk = 0x1AE0 / 32; // Block 215
-            let mut data = Vec::new();
-            // Read 5 blocks (160 bytes) for 10 presets × 14 bytes each = 140 bytes
-            for i in 0..5 {
-                match proto.read_block((start_blk + i) as u8) {
-                    Ok(blk) => {
-                        data.extend_from_slice(&blk);
-                        let _ = tx.send(AppEvent::Progress((i + 1) as f64 / 5.0));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!("Failed to read presets: {}", e)));
-                        return;
-                    }
+                    let _ = tx.send(AppEvent::Error(format!("Failed to read presets: {}", e)));
                 }
             }
+        });
+    }
 
-            let mut presets = Vec::new();
-            // Each preset is 14 bytes, parse 10 presets
-            for i in 0..10 {
-                let start = i * 14;
-                let end = start + 14;
-                if end <= data.len() {
-                    presets.push(RadioProtocol::parse_scan_preset(
-                        &data[start..end],
-                        i as u8,
-                        endian,
-                    ));
+    pub fn start_write_group_labels(&mut self) {
+        let port_name = match &self.protocol_port_name {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let tx = self.event_tx.clone();
+        let group_labels = self.group_labels.clone();
+        self.last_main_tab = MainTab::MemoryGroups;
+        self.mode = AppMode::Writing;
+        self.progress = 0.0;
+
+        thread::spawn(move || {
+            match write_radio_group_labels(&port_name, &group_labels, |event| match event {
+                ProgressEvent::Status(status) => {
+                    let _ = tx.send(AppEvent::Status(status));
+                }
+                ProgressEvent::Progress(progress) => {
+                    let _ = tx.send(AppEvent::Progress(progress));
+                }
+            }) {
+                Ok(()) => {
+                    let _ = tx.send(AppEvent::Status("Group names saved".to_string()));
+                    let _ = tx.send(AppEvent::WriteComplete);
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error(format!(
+                        "Failed to save group names: {}",
+                        e
+                    )));
                 }
             }
-            let _ = tx.send(AppEvent::ReadPresetsComplete(presets));
         });
     }
 
@@ -248,48 +235,25 @@ impl App {
             None => return,
         };
         let tx = self.event_tx.clone();
-        let endian = self.endian;
         self.mode = AppMode::Reading;
         self.progress = 0.0;
 
         thread::spawn(move || {
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
+            match read_radio_band_plans(&port_name, |event| match event {
+                ProgressEvent::Status(status) => {
+                    let _ = tx.send(AppEvent::Status(status));
+                }
+                ProgressEvent::Progress(progress) => {
+                    let _ = tx.send(AppEvent::Progress(progress));
+                }
+            }) {
+                Ok((plans, _)) => {
+                    let _ = tx.send(AppEvent::ReadBandPlanComplete(plans));
+                }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open port: {}", e)));
-                    return;
-                }
-            };
-
-            let _ = tx.send(AppEvent::Status("Reading BandPlan...".to_string()));
-            let start_blk = 0x1A00 / 32;
-            let mut data = Vec::new();
-            for i in 0..7 {
-                match proto.read_block((start_blk + i) as u8) {
-                    Ok(blk) => {
-                        data.extend_from_slice(&blk);
-                        let _ = tx.send(AppEvent::Progress((i + 1) as f64 / 7.0));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!("Failed to read bandplan: {}", e)));
-                        return;
-                    }
+                    let _ = tx.send(AppEvent::Error(format!("Failed to read bandplan: {}", e)));
                 }
             }
-
-            let mut plans = Vec::new();
-            for i in 0..20 {
-                let start = 2 + i * 10;
-                let end = start + 10;
-                if end <= data.len() {
-                    plans.push(RadioProtocol::parse_bandplan(
-                        &data[start..end],
-                        i as u8,
-                        endian,
-                    ));
-                }
-            }
-            let _ = tx.send(AppEvent::ReadBandPlanComplete(plans));
         });
     }
 
@@ -303,39 +267,21 @@ impl App {
         self.progress = 0.0;
 
         thread::spawn(move || {
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
+            match read_radio_dtmf_presets(&port_name, |event| match event {
+                ProgressEvent::Status(status) => {
+                    let _ = tx.send(AppEvent::Status(status));
+                }
+                ProgressEvent::Progress(progress) => {
+                    let _ = tx.send(AppEvent::Progress(progress));
+                }
+            }) {
+                Ok(presets) => {
+                    let _ = tx.send(AppEvent::ReadDTMFComplete(presets));
+                }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open port: {}", e)));
-                    return;
-                }
-            };
-
-            let _ = tx.send(AppEvent::Status("Reading DTMF...".to_string()));
-            let start_blk = 0x1CF0 / 32;
-            let mut data = Vec::new();
-            for i in 0..9 {
-                match proto.read_block((start_blk + i) as u8) {
-                    Ok(blk) => {
-                        data.extend_from_slice(&blk);
-                        let _ = tx.send(AppEvent::Progress((i + 1) as f64 / 9.0));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!("Failed to read DTMF: {}", e)));
-                        return;
-                    }
+                    let _ = tx.send(AppEvent::Error(format!("Failed to read DTMF: {}", e)));
                 }
             }
-
-            let mut presets = Vec::new();
-            for i in 0..20 {
-                let start = i * 13;
-                let end = start + 13;
-                if end <= data.len() {
-                    presets.push(RadioProtocol::parse_dtmf_preset(&data[start..end], i as u8));
-                }
-            }
-            let _ = tx.send(AppEvent::ReadDTMFComplete(presets));
         });
     }
 
@@ -350,49 +296,22 @@ impl App {
         self.progress = 0.0;
 
         thread::spawn(move || {
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
+            match write_radio_dtmf_presets(&port_name, &dtmf_presets, |event| match event {
+                ProgressEvent::Status(status) => {
+                    let _ = tx.send(AppEvent::Status(status));
+                }
+                ProgressEvent::Progress(progress) => {
+                    let _ = tx.send(AppEvent::Progress(progress));
+                }
+            }) {
+                Ok(()) => {
+                    let _ = tx.send(AppEvent::Status("DTMF written successfully".to_string()));
+                    let _ = tx.send(AppEvent::WriteComplete);
+                }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open port: {}", e)));
-                    return;
-                }
-            };
-
-            let _ = tx.send(AppEvent::Status("Handshaking...".to_string()));
-            if !proto.handshake().unwrap_or(false) {
-                let _ = tx.send(AppEvent::Error("Handshake failed".to_string()));
-                return;
-            }
-
-            let _ = tx.send(AppEvent::Status("Writing DTMF...".to_string()));
-            let start_blk = 0x1CF0 / 32;
-
-            let mut data = vec![0xFFu8; 9 * 32];
-            for (i, preset) in dtmf_presets.iter().enumerate() {
-                if i >= 20 {
-                    break;
-                }
-                let start = i * 13;
-                let packed = RadioProtocol::pack_dtmf_preset(preset);
-                data[start..start + packed.len()].copy_from_slice(&packed);
-            }
-
-            for i in 0..9 {
-                let blk_data = &data[i * 32..(i + 1) * 32];
-                match proto.write_block((start_blk + i) as u8, blk_data) {
-                    Ok(true) => {
-                        let _ = tx.send(AppEvent::Progress((i + 1) as f64 / 9.0));
-                    }
-                    _ => {
-                        let _ =
-                            tx.send(AppEvent::Error(format!("Failed to write DTMF block {}", i)));
-                        return;
-                    }
+                    let _ = tx.send(AppEvent::Error(format!("Failed to write DTMF: {}", e)));
                 }
             }
-
-            let _ = tx.send(AppEvent::Status("DTMF written successfully".to_string()));
-            let _ = tx.send(AppEvent::WriteComplete);
         });
     }
 
@@ -406,43 +325,21 @@ impl App {
         self.progress = 0.0;
 
         thread::spawn(move || {
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open port: {}", e)));
-                    return;
+            match read_radio_settings(&port_name, |event| match event {
+                ProgressEvent::Status(status) => {
+                    let _ = tx.send(AppEvent::Status(status));
                 }
-            };
-
-            let _ = tx.send(AppEvent::Status("Detecting Endianness...".to_string()));
-            let endian = match proto.detect_endianness() {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!(
-                        "Failed to detect endianness: {}",
-                        e
-                    )));
-                    return;
+                ProgressEvent::Progress(progress) => {
+                    let _ = tx.send(AppEvent::Progress(progress));
                 }
-            };
-
-            let _ = tx.send(AppEvent::Status("Reading Settings...".to_string()));
-            let start_blk = 0x1900 / 32;
-            let mut data = Vec::new();
-            for i in 0..4 {
-                match proto.read_block((start_blk + i) as u8) {
-                    Ok(blk) => {
-                        data.extend_from_slice(&blk);
-                        let _ = tx.send(AppEvent::Progress((i + 1) as f64 / 4.0));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!("Failed to read settings: {}", e)));
-                        return;
-                    }
+            }) {
+                Ok((settings, endian)) => {
+                    let _ = tx.send(AppEvent::ReadSettingsComplete(settings, endian));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error(format!("Failed to read settings: {}", e)));
                 }
             }
-            let settings = RadioProtocol::parse_settings_block(&data, endian);
-            let _ = tx.send(AppEvent::ReadSettingsComplete(settings, endian));
         });
     }
 
@@ -456,64 +353,53 @@ impl App {
             Some(s) => s.clone(),
             None => return,
         };
-        let endian = self.endian;
         self.mode = AppMode::Writing;
         self.progress = 0.0;
 
         thread::spawn(move || {
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
+            match write_radio_settings(
+                &port_name,
+                &settings,
+                crate::protocol::Endianness::Big,
+                true,
+                |event| match event {
+                    ProgressEvent::Status(status) => {
+                        let _ = tx.send(AppEvent::Status(status));
+                    }
+                    ProgressEvent::Progress(progress) => {
+                        let _ = tx.send(AppEvent::Progress(progress));
+                    }
+                },
+            ) {
+                Ok(()) => {
+                    let _ = tx.send(AppEvent::Status(
+                        "Settings written successfully".to_string(),
+                    ));
+                    let _ = tx.send(AppEvent::WriteComplete);
+                }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open port: {}", e)));
-                    return;
-                }
-            };
-
-            let _ = tx.send(AppEvent::Status("Handshaking...".to_string()));
-            if !proto.handshake().unwrap_or(false) {
-                let _ = tx.send(AppEvent::Error("Handshake failed".to_string()));
-                return;
-            }
-
-            let _ = tx.send(AppEvent::Status("Writing Settings...".to_string()));
-            let start_blk = 0x1900 / 32;
-            let data = RadioProtocol::pack_settings_block(&settings, endian);
-
-            for i in 0..4 {
-                let blk_data = &data[i * 32..(i + 1) * 32];
-                match proto.write_block((start_blk + i) as u8, blk_data) {
-                    Ok(true) => {
-                        let _ = tx.send(AppEvent::Progress((i + 1) as f64 / 4.0));
-                    }
-                    _ => {
-                        let _ = tx.send(AppEvent::Error(format!(
-                            "Failed to write settings block {}",
-                            i
-                        )));
-                        return;
-                    }
+                    let _ = tx.send(AppEvent::Error(format!("Failed to write settings: {}", e)));
                 }
             }
-
-            let _ = tx.send(AppEvent::Status("Rebooting radio...".to_string()));
-            let _ = proto.reboot();
-
-            let _ = tx.send(AppEvent::Status(
-                "Settings written successfully".to_string(),
-            ));
-            let _ = tx.send(AppEvent::WriteComplete);
         });
     }
 
     pub fn remote_on(&mut self) {
+        if self.remote_active {
+            self.status_message = "Remote mode already active".to_string();
+            return;
+        }
+
         let port_name = match &self.protocol_port_name {
             Some(p) => p.clone(),
             None => return,
         };
         let tx = self.event_tx.clone();
         let (key_tx, key_rx) = mpsc::channel();
+        self.remote_screen = Default::default();
         self.remote_tx = Some(key_tx);
         self.remote_active = true;
+        self.status_message = "Starting remote mode...".to_string();
         self.remote_stop_signal.store(false, Ordering::SeqCst);
         let stop_signal = self.remote_stop_signal.clone();
 
@@ -521,35 +407,67 @@ impl App {
             let mut proto = match RadioProtocol::new(&port_name) {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open port: {}", e)));
+                    let _ = tx.send(AppEvent::RemoteStopped(format!(
+                        "Failed to open remote port: {}",
+                        e
+                    )));
                     return;
                 }
             };
-            if proto.remote_on().unwrap_or(false) {
-                let _ = tx.send(AppEvent::Status("Remote Mode ON".to_string()));
 
-                // Start listening for packets
-                loop {
-                    if stop_signal.load(Ordering::SeqCst) {
-                        let _ = proto.remote_off();
+            let log_tx = tx.clone();
+            proto.log_callback = Some(Box::new(move |message| {
+                let _ = log_tx.send(AppEvent::Log(message));
+            }));
+
+            if !proto.handshake().unwrap_or(false) {
+                let _ = tx.send(AppEvent::RemoteStopped(
+                    "Remote handshake failed".to_string(),
+                ));
+                return;
+            }
+
+            if !proto.remote_on().unwrap_or(false) {
+                let _ = tx.send(AppEvent::RemoteStopped(
+                    "Radio rejected remote mode".to_string(),
+                ));
+                return;
+            }
+
+            let _ = tx.send(AppEvent::Status("Remote mode ON".to_string()));
+
+            loop {
+                if stop_signal.load(Ordering::SeqCst) {
+                    let _ = proto.remote_off();
+                    let _ = tx.send(AppEvent::RemoteStopped("Remote mode OFF".to_string()));
+                    break;
+                }
+
+                let mut key_failure = None;
+                while let Ok(key) = key_rx.try_recv() {
+                    if let Err(e) = proto.press_remote_key(key) {
+                        key_failure = Some(format!("Failed to send remote key: {}", e));
                         break;
                     }
+                }
+                if let Some(message) = key_failure {
+                    let _ = tx.send(AppEvent::RemoteStopped(message));
+                    break;
+                }
 
-                    // Check for outgoing keys
-                    if let Ok(key) = key_rx.try_recv() {
-                        let _ = proto.send_bytes(&[key]);
-                        std::thread::sleep(Duration::from_millis(100));
-                        let _ = proto.send_bytes(&[0xFF]);
+                match proto.parse_remote_packet() {
+                    Ok(Some(pkt)) => {
+                        let _ = tx.send(AppEvent::RemotePacket(pkt));
                     }
-
-                    match proto.parse_remote_packet() {
-                        Ok(Some(pkt)) => {
-                            let _ = tx.send(AppEvent::RemotePacket(pkt));
-                        }
-                        Ok(None) => {
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(_) => break,
+                    Ok(None) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::RemoteStopped(format!(
+                            "Remote connection lost: {}",
+                            e
+                        )));
+                        break;
                     }
                 }
             }
@@ -560,18 +478,24 @@ impl App {
         if self.remote_active {
             self.remote_stop_signal.store(true, Ordering::SeqCst);
             self.remote_active = false;
-            self.status_message = "Remote Mode OFF".to_string();
+            self.remote_tx = None;
+            self.status_message = "Stopping remote mode...".to_string();
         }
     }
 
     pub fn send_key(&mut self, key_code: u8) {
         if let Some(tx) = &self.remote_tx {
-            let _ = tx.send(key_code);
-            let tx_clone = tx.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(100));
-                let _ = tx_clone.send(0xFF);
-            });
+            if tx.send(key_code).is_ok() {
+                let label = remote_key_label(key_code);
+                self.status_message = format!("Sent remote key {label}");
+                self.log(&format!("Remote key {label}"));
+            } else {
+                self.remote_active = false;
+                self.remote_tx = None;
+                self.status_message = "Remote mode is not active".to_string();
+            }
+        } else {
+            self.status_message = "Remote mode is not active".to_string();
         }
     }
 
@@ -590,38 +514,28 @@ impl App {
         self.progress = 0.0;
 
         thread::spawn(move || {
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open port: {}", e)));
-                    return;
-                }
-            };
-
-            let _ = tx.send(AppEvent::Status("Handshaking...".to_string()));
-            if !proto.handshake().unwrap_or(false) {
-                let _ = tx.send(AppEvent::Error("Handshake failed".to_string()));
-                return;
-            }
-
-            let _ = tx.send(AppEvent::Status(format!(
-                "Writing Channel {}...",
-                channel.channel_num
-            )));
-            let blk = (channel.channel_num + 1) as u8; // Channels start at block 2
-            let data = RadioProtocol::pack_channel(&channel, endian);
-
-            match proto.write_block(blk, &data) {
-                Ok(true) => {
+            match write_radio_channels(
+                &port_name,
+                std::slice::from_ref(&channel),
+                &[],
+                endian,
+                false,
+                |event| match event {
+                    ProgressEvent::Status(status) => {
+                        let _ = tx.send(AppEvent::Status(status));
+                    }
+                    ProgressEvent::Progress(progress) => {
+                        let _ = tx.send(AppEvent::Progress(progress));
+                    }
+                },
+            ) {
+                Ok(()) => {
                     let _ = tx.send(AppEvent::Progress(1.0));
                     let _ = tx.send(AppEvent::Status("Channel written successfully".to_string()));
                     let _ = tx.send(AppEvent::WriteComplete);
                 }
-                Ok(false) => {
-                    let _ = tx.send(AppEvent::Error("Radio rejected write".to_string()));
-                }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Write failed: {}", e)));
+                    let _ = tx.send(AppEvent::Error(format!("Failed to write channel: {}", e)));
                 }
             }
         });
@@ -640,97 +554,31 @@ impl App {
         self.progress = 0.0;
 
         thread::spawn(move || {
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
+            match write_radio_channels(
+                &port_name,
+                &channels,
+                &deleted_channels,
+                endian,
+                reboot,
+                |event| match event {
+                    ProgressEvent::Status(status) => {
+                        let _ = tx.send(AppEvent::Status(status));
+                    }
+                    ProgressEvent::Progress(progress) => {
+                        let _ = tx.send(AppEvent::Progress(progress));
+                    }
+                },
+            ) {
+                Ok(()) => {
+                    let _ = tx.send(AppEvent::Status(
+                        "Channels updated successfully".to_string(),
+                    ));
+                    let _ = tx.send(AppEvent::WriteComplete);
+                }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open port: {}", e)));
-                    return;
+                    let _ = tx.send(AppEvent::Error(format!("Failed to update channels: {}", e)));
                 }
-            };
-
-            let _ = tx.send(AppEvent::Status("Handshaking...".to_string()));
-            if !proto.handshake().unwrap_or(false) {
-                let _ = tx.send(AppEvent::Error("Handshake failed".to_string()));
-                return;
             }
-
-            let _ = tx.send(AppEvent::Status("Detecting channel format...".to_string()));
-            let channel_endian = match proto.detect_channel_endianness() {
-                Ok(e) => e,
-                Err(_) => endian,
-            };
-
-            let active_channels: Vec<(u16, Channel)> = channels
-                .into_iter()
-                .filter(|ch| !deleted_channels.contains(&ch.channel_num))
-                .map(|ch| (ch.channel_num, ch))
-                .collect();
-
-            let total_operations = active_channels.len() + deleted_channels.len();
-            let mut progress = 0.0;
-
-            for (_, ch) in &active_channels {
-                let _ = tx.send(AppEvent::Status(format!(
-                    "Writing Channel {}...",
-                    ch.channel_num
-                )));
-                let blk = (ch.channel_num + 1) as u8;
-                let data = RadioProtocol::pack_channel(ch, channel_endian);
-                match proto.write_block(blk, &data) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let _ = tx.send(AppEvent::Error(format!(
-                            "Failed to write channel {}",
-                            ch.channel_num
-                        )));
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!(
-                            "Error writing channel {}: {}",
-                            ch.channel_num, e
-                        )));
-                        return;
-                    }
-                }
-                progress += 1.0;
-                let _ = tx.send(AppEvent::Progress(progress / total_operations as f64));
-            }
-
-            for &ch_num in &deleted_channels {
-                let _ = tx.send(AppEvent::Status(format!("Clearing Channel {}...", ch_num)));
-                let blk = (ch_num + 1) as u8;
-                let empty_data = vec![0xFFu8; 32];
-                match proto.write_block(blk, &empty_data) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let _ = tx.send(AppEvent::Error(format!(
-                            "Failed to clear channel {}",
-                            ch_num
-                        )));
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!(
-                            "Error clearing channel {}: {}",
-                            ch_num, e
-                        )));
-                        return;
-                    }
-                }
-                progress += 1.0;
-                let _ = tx.send(AppEvent::Progress(progress / total_operations as f64));
-            }
-
-            if reboot {
-                let _ = tx.send(AppEvent::Status("Rebooting radio...".to_string()));
-                let _ = proto.reboot();
-            }
-
-            let _ = tx.send(AppEvent::Status(
-                "Channels updated successfully".to_string(),
-            ));
-            let _ = tx.send(AppEvent::WriteComplete);
         });
     }
 
@@ -745,288 +593,42 @@ impl App {
         self.progress = 0.0;
 
         thread::spawn(move || {
-            let mut rdr = match csv::Reader::from_path(&path) {
-                Ok(r) => r,
+            let channels = match load_channels_from_path(&path) {
+                Ok(channels) => channels,
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open CSV: {}", e)));
+                    let _ = tx.send(AppEvent::Error(format!("Failed to load channels: {}", e)));
                     return;
                 }
             };
 
-            let mut channels = Vec::new();
-            for result in rdr.deserialize::<std::collections::HashMap<String, String>>() {
-                let row = match result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!("Failed to parse CSV row: {}", e)));
-                        return;
+            match write_radio_channels(&port_name, &channels, &[], endian, false, |event| {
+                match event {
+                    ProgressEvent::Status(status) => {
+                        let _ = tx.send(AppEvent::Status(status));
                     }
-                };
-
-                let get_val = |key: &str| -> Option<&String> {
-                    row.get(key).or_else(|| {
-                        let key_lower = key.to_lowercase();
-                        row.iter()
-                            .find(|(k, _)| k.to_lowercase() == key_lower)
-                            .map(|(_, v)| v)
-                    })
-                };
-
-                let ch_num = get_val("Channel_Num")
-                    .and_then(|s| s.parse::<u16>().ok())
-                    .unwrap_or(0);
-                if ch_num == 0 {
-                    continue;
-                }
-
-                let mut groups = [0u8; 4];
-                for (i, slot) in ["Slot1", "Slot2", "Slot3", "Slot4"].iter().enumerate() {
-                    if let Some(val_str) = get_val(slot) {
-                        groups[i] = match val_str.as_str() {
-                            "A" => 1,
-                            "B" => 2,
-                            "C" => 3,
-                            "D" => 4,
-                            "E" => 5,
-                            "F" => 6,
-                            "G" => 7,
-                            "H" => 8,
-                            "I" => 9,
-                            "J" => 10,
-                            "K" => 11,
-                            "L" => 12,
-                            "M" => 13,
-                            "N" => 14,
-                            "O" => 15,
-                            "P" => 16,
-                            "Q" => 17,
-                            "R" => 18,
-                            "S" => 19,
-                            "T" => 20,
-                            "U" => 21,
-                            "V" => 22,
-                            "W" => 23,
-                            "X" => 24,
-                            "Y" => 25,
-                            "Z" => 26,
-                            s => s.parse::<u8>().unwrap_or(0),
-                        };
+                    ProgressEvent::Progress(progress) => {
+                        let _ = tx.send(AppEvent::Progress(progress));
                     }
                 }
-
-                let ch = Channel {
-                    channel_num: ch_num,
-                    name: get_val("Name").cloned().unwrap_or_default(),
-                    rx_freq: get_val("RX")
-                        .or_else(|| get_val("RX_Freq"))
-                        .cloned()
-                        .unwrap_or_else(|| "0".to_string()),
-                    tx_freq: get_val("TX")
-                        .or_else(|| get_val("TX_Freq"))
-                        .cloned()
-                        .unwrap_or_else(|| "0".to_string()),
-                    rx_tone: get_val("RX_Tone")
-                        .cloned()
-                        .unwrap_or_else(|| "Off".to_string()),
-                    tx_tone: get_val("TX_Tone")
-                        .cloned()
-                        .unwrap_or_else(|| "Off".to_string()),
-                    power: get_val("TX_Power")
-                        .and_then(|s| s.parse::<u8>().ok())
-                        .unwrap_or(0),
-                    bandwidth: get_val("Bandwidth")
-                        .cloned()
-                        .unwrap_or_else(|| "Wide".to_string()),
-                    modulation: get_val("Modulation")
-                        .cloned()
-                        .unwrap_or_else(|| "FM".to_string()),
-                    reverse: get_val("Reversed")
-                        .map(|s| s.to_lowercase() == "true")
-                        .unwrap_or(false),
-                    busy_lock: get_val("BusyLock")
-                        .map(|s| s.to_lowercase() == "true")
-                        .unwrap_or(false),
-                    groups,
-                    ptt_id: match get_val("PTTID").map(|s| s.as_str()).unwrap_or("Off") {
-                        "Off" => 0,
-                        "BOT" => 1,
-                        "EOT" => 2,
-                        "Both" => 3,
-                        _ => 0,
-                    },
-                    position: if get_val("Active")
-                        .map(|s| s.to_lowercase() == "true")
-                        .unwrap_or(true)
-                    {
-                        1
-                    } else {
-                        0
-                    },
-                };
-                channels.push(ch);
-            }
-
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
+            }) {
+                Ok(()) => {
+                    let _ = tx.send(AppEvent::Status(
+                        "CSV Channels written successfully".to_string(),
+                    ));
+                    let _ = tx.send(AppEvent::WriteComplete);
+                }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to open port: {}", e)));
-                    return;
-                }
-            };
-
-            let _ = tx.send(AppEvent::Status("Handshaking...".to_string()));
-            if !proto.handshake().unwrap_or(false) {
-                let _ = tx.send(AppEvent::Error("Handshake failed".to_string()));
-                return;
-            }
-
-            let _ = tx.send(AppEvent::Status("Detecting channel format...".to_string()));
-            let channel_endian = match proto.detect_channel_endianness() {
-                Ok(e) => e,
-                Err(_) => endian,
-            };
-
-            let total = channels.len();
-            for (i, ch) in channels.iter().enumerate() {
-                let _ = tx.send(AppEvent::Status(format!(
-                    "Writing Channel {}...",
-                    ch.channel_num
-                )));
-                let blk = (ch.channel_num - 1 + 2) as u8;
-                let data = RadioProtocol::pack_channel(ch, channel_endian);
-
-                if let Err(e) = proto.write_block(blk, &data) {
                     let _ = tx.send(AppEvent::Error(format!(
-                        "Failed to write channel {}: {}",
-                        ch.channel_num, e
+                        "Failed to write CSV channels: {}",
+                        e
                     )));
-                    return;
                 }
-                let _ = tx.send(AppEvent::Progress((i + 1) as f64 / total as f64));
             }
-
-            let _ = tx.send(AppEvent::Status(
-                "CSV Channels written successfully".to_string(),
-            ));
-            let _ = tx.send(AppEvent::WriteComplete);
         });
     }
 
-    pub fn load_csv(&mut self, path: &PathBuf) -> Result<()> {
-        let mut rdr = csv::Reader::from_path(path)?;
-        let mut channels = Vec::new();
-        for result in rdr.deserialize::<std::collections::HashMap<String, String>>() {
-            let row = match result {
-                Ok(r) => r,
-                Err(e) => {
-                    self.log(&format!("Skipping invalid CSV row: {}", e));
-                    continue;
-                }
-            };
-
-            let get_val = |key: &str| -> Option<&String> {
-                row.get(key).or_else(|| {
-                    let key_lower = key.to_lowercase();
-                    row.iter()
-                        .find(|(k, _)| k.to_lowercase() == key_lower)
-                        .map(|(_, v)| v)
-                })
-            };
-
-            let ch_num = get_val("Channel_Num")
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or(0);
-            if ch_num == 0 {
-                continue;
-            }
-
-            let mut groups = [0u8; 4];
-            for (i, slot) in ["Slot1", "Slot2", "Slot3", "Slot4"].iter().enumerate() {
-                if let Some(val_str) = get_val(slot) {
-                    groups[i] = match val_str.as_str() {
-                        "A" => 1,
-                        "B" => 2,
-                        "C" => 3,
-                        "D" => 4,
-                        "E" => 5,
-                        "F" => 6,
-                        "G" => 7,
-                        "H" => 8,
-                        "I" => 9,
-                        "J" => 10,
-                        "K" => 11,
-                        "L" => 12,
-                        "M" => 13,
-                        "N" => 14,
-                        "O" => 15,
-                        "P" => 16,
-                        "Q" => 17,
-                        "R" => 18,
-                        "S" => 19,
-                        "T" => 20,
-                        "U" => 21,
-                        "V" => 22,
-                        "W" => 23,
-                        "X" => 24,
-                        "Y" => 25,
-                        "Z" => 26,
-                        s => s.parse::<u8>().unwrap_or(0),
-                    };
-                }
-            }
-
-            let ch = Channel {
-                channel_num: ch_num,
-                name: get_val("Name").cloned().unwrap_or_default(),
-                rx_freq: get_val("RX")
-                    .or_else(|| get_val("RX_Freq"))
-                    .cloned()
-                    .unwrap_or_else(|| "0".to_string()),
-                tx_freq: get_val("TX")
-                    .or_else(|| get_val("TX_Freq"))
-                    .cloned()
-                    .unwrap_or_else(|| "0".to_string()),
-                rx_tone: get_val("RX_Tone")
-                    .cloned()
-                    .unwrap_or_else(|| "Off".to_string()),
-                tx_tone: get_val("TX_Tone")
-                    .cloned()
-                    .unwrap_or_else(|| "Off".to_string()),
-                power: get_val("TX_Power")
-                    .and_then(|s| s.parse::<u8>().ok())
-                    .unwrap_or(0),
-                bandwidth: get_val("Bandwidth")
-                    .cloned()
-                    .unwrap_or_else(|| "Wide".to_string()),
-                modulation: get_val("Modulation")
-                    .cloned()
-                    .unwrap_or_else(|| "FM".to_string()),
-                reverse: get_val("Reversed")
-                    .map(|s| s.to_lowercase() == "true")
-                    .unwrap_or(false),
-                busy_lock: get_val("BusyLock")
-                    .map(|s| s.to_lowercase() == "true")
-                    .unwrap_or(false),
-                groups,
-                ptt_id: match get_val("PTTID").map(|s| s.as_str()).unwrap_or("Off") {
-                    "Off" => 0,
-                    "BOT" => 1,
-                    "EOT" => 2,
-                    "Both" => 3,
-                    _ => 0,
-                },
-                position: if get_val("Active")
-                    .map(|s| s.to_lowercase() == "true")
-                    .unwrap_or(true)
-                {
-                    1
-                } else {
-                    0
-                },
-            };
-            channels.push(ch);
-        }
-        self.channels = channels;
+    pub fn load_csv(&mut self, path: &Path) -> Result<()> {
+        self.channels = load_channels_from_path(path)?;
         self.channel_state.select(Some(0));
         self.log(&format!("Loaded {} channels from CSV", self.channels.len()));
         Ok(())
@@ -1044,11 +646,7 @@ impl App {
     }
 
     pub fn export_csv(&mut self, path: PathBuf) -> Result<()> {
-        let mut wtr = csv::Writer::from_path(&path)?;
-        for ch in &self.channels {
-            wtr.serialize(ch)?;
-        }
-        wtr.flush()?;
+        save_channels_to_path(&path, &self.channels)?;
         self.log(&format!("Exported {} channels to CSV", self.channels.len()));
         Ok(())
     }
@@ -1062,7 +660,7 @@ impl App {
 
         let mut dialog = rfd::FileDialog::new();
         for (name, extensions) in filters {
-            dialog = dialog.add_filter(name.to_string(), *extensions);
+            dialog = dialog.add_filter(name.to_string(), extensions);
         }
         let res = dialog.pick_file();
 
@@ -1086,7 +684,7 @@ impl App {
 
         let mut dialog = rfd::FileDialog::new().set_file_name(default_name);
         for (name, extensions) in filters {
-            dialog = dialog.add_filter(name.to_string(), *extensions);
+            dialog = dialog.add_filter(name.to_string(), extensions);
         }
         let res = dialog.save_file();
 
@@ -1178,6 +776,7 @@ impl App {
                     let _ = tx.send(AppEvent::Status("Extracting settings...".to_string()));
                     let _ = tx.send(AppEvent::Progress(0.8));
                     let scan_presets = codeplug::extract_scan_presets_from_codeplug(&data, endian);
+                    let group_labels = codeplug::extract_group_labels_from_codeplug(&data);
                     let scan_preset_count = scan_presets.len();
                     let _ = tx.send(AppEvent::Progress(1.0));
                     let _ = tx.send(AppEvent::CodeplugDataLoaded {
@@ -1186,11 +785,16 @@ impl App {
                         channels,
                         settings,
                         scan_presets,
+                        group_labels: group_labels.clone(),
                     });
                     let _ = tx.send(AppEvent::Status(format!(
-                        "Codeplug loaded: {} channels, {} scan presets, settings {}",
+                        "Codeplug loaded: {} channels, {} scan presets, {} named groups, settings {}",
                         channel_count,
                         scan_preset_count,
+                        group_labels
+                            .iter()
+                            .filter(|label| !label.trim().is_empty())
+                            .count(),
                         if settings_present {
                             "present"
                         } else {
@@ -1224,6 +828,7 @@ impl App {
         let scan_presets = self.scan_presets.clone();
         let band_plans = self.band_plans.clone();
         let dtmf_presets = self.dtmf_presets.clone();
+        let group_labels = self.group_labels.clone();
         let endian = self.endian;
         let tx = self.event_tx.clone();
 
@@ -1236,6 +841,7 @@ impl App {
                 &scan_presets,
                 &band_plans,
                 &dtmf_presets,
+                &group_labels,
                 endian,
             );
 
@@ -1277,50 +883,21 @@ impl App {
         self.progress = 0.0;
 
         thread::spawn(move || {
-            let _ = tx.send(AppEvent::Status("Writing codeplug to radio...".to_string()));
-
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
+            match write_radio_codeplug(&port_name, &codeplug_data, true, |event| match event {
+                ProgressEvent::Status(status) => {
+                    let _ = tx.send(AppEvent::Status(status));
+                }
+                ProgressEvent::Progress(progress) => {
+                    let _ = tx.send(AppEvent::Progress(progress));
+                }
+            }) {
+                Ok(()) => {
+                    let _ = tx.send(AppEvent::WriteComplete);
+                }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to connect: {}", e)));
-                    return;
-                }
-            };
-
-            if !proto.handshake().unwrap_or(false) {
-                let _ = tx.send(AppEvent::Error("Handshake failed".to_string()));
-                return;
-            }
-
-            let total_blocks = EEPROM_SIZE / BLOCK_SIZE;
-            for i in 0..total_blocks {
-                let offset = i * BLOCK_SIZE;
-                let block = &codeplug_data[offset..offset + BLOCK_SIZE];
-
-                match proto.write_block(i as u8, block) {
-                    Ok(_) => {
-                        let progress = (i + 1) as f64 / total_blocks as f64;
-                        let _ = tx.send(AppEvent::Progress(progress));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!(
-                            "Failed to write block {}: {}",
-                            i, e
-                        )));
-                        return;
-                    }
+                    let _ = tx.send(AppEvent::Error(format!("Failed to write codeplug: {}", e)));
                 }
             }
-
-            let _ = tx.send(AppEvent::Status(
-                "Codeplug written successfully! Rebooting radio...".to_string(),
-            ));
-
-            thread::sleep(Duration::from_millis(500));
-            let _ = proto.reboot();
-            thread::sleep(Duration::from_millis(500));
-
-            let _ = tx.send(AppEvent::WriteComplete);
         });
     }
 
@@ -1394,7 +971,7 @@ impl App {
                 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
             ];
 
-            let rounded_len = ((firmware_data.len() + 31) / 32) * 32;
+            let rounded_len = firmware_data.len().div_ceil(32) * 32;
             if rounded_len > 0xf800 {
                 let _ = tx.send(AppEvent::BinFlashFailed(
                     "Firmware file too large".to_string(),
@@ -1459,10 +1036,9 @@ impl App {
                         packet[4..4 + (firmware_data.len() - start_idx)]
                             .copy_from_slice(&firmware_data[start_idx..]);
                     }
-                    let mut checksum: u8 = 0;
-                    for i in 4..36 {
-                        checksum = checksum.wrapping_add(packet[i]);
-                    }
+                    let checksum = packet[4..36]
+                        .iter()
+                        .fold(0u8, |sum, &byte| sum.wrapping_add(byte));
                     packet[3] = checksum;
 
                     if let Err(e) = proto.send_bytes(&packet) {
@@ -1561,5 +1137,31 @@ impl App {
                 }
             }
         });
+    }
+}
+
+fn remote_key_label(key_code: u8) -> &'static str {
+    match key_code {
+        0x80 => "0",
+        0x81 => "1",
+        0x82 => "2",
+        0x83 => "3",
+        0x84 => "4",
+        0x85 => "5",
+        0x86 => "6",
+        0x87 => "7",
+        0x88 => "8",
+        0x89 => "9",
+        0x8A => "menu",
+        0x8B => "up",
+        0x8C => "down",
+        0x8D => "exit",
+        0x8E => "*",
+        0x8F => "#",
+        0x90 => "A/PTT",
+        0x91 => "B/PTT",
+        0x92 => "light",
+        0x94 => "V/M",
+        _ => "unknown",
     }
 }

@@ -1,9 +1,11 @@
 use ratatui::widgets::TableState;
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
 
+use crate::device::PortCandidate;
 use crate::protocol::{
     BandPlan, Channel, DTMFPreset, Endianness, RemotePacket, ScanPreset, SettingsBlock,
 };
@@ -19,14 +21,15 @@ pub enum AppMode {
     EditSetting(usize),
     EditDTMF(usize),
     EditScanPreset(usize),
+    EditGroupLabel(usize),
     EditBandPlan(usize),
     DeleteChannelConfirm(usize),
     Error(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RemoteScreen {
-    pub elements: Vec<RemotePacket>,
+    pub elements: VecDeque<RemotePacket>,
     pub signal_strength: u8,
     pub noise_level: u8,
     pub leds: u8,
@@ -42,6 +45,7 @@ pub enum MainTab {
     Channels,
     Settings,
     Scanning,
+    MemoryGroups,
     BandPlan,
     DTMF,
     Remote,
@@ -55,11 +59,13 @@ pub enum AppEvent {
     Status(String),
     Log(String),
     ReadChannelsComplete(Vec<Channel>, Endianness),
+    ReadGroupLabelsComplete(Vec<String>),
     ReadPresetsComplete(Vec<ScanPreset>),
     ReadBandPlanComplete(Vec<BandPlan>),
     ReadDTMFComplete(Vec<DTMFPreset>),
     ReadSettingsComplete(SettingsBlock, Endianness),
     RemotePacket(RemotePacket),
+    RemoteStopped(String),
     WriteComplete,
     LoadCSV(PathBuf),
     WriteCSV(PathBuf),
@@ -73,6 +79,7 @@ pub enum AppEvent {
         channels: Vec<Channel>,
         settings: Option<SettingsBlock>,
         scan_presets: Vec<ScanPreset>,
+        group_labels: Vec<String>,
     },
     LoadBinFirmware(PathBuf),
     BinFirmwareLoaded(PathBuf, Vec<u8>),
@@ -89,34 +96,20 @@ pub enum AppEvent {
     ResumeUI,
 }
 
-impl Default for RemoteScreen {
-    fn default() -> Self {
-        Self {
-            elements: Vec::new(),
-            signal_strength: 0,
-            noise_level: 0,
-            leds: 0,
-            battery_level: None,
-            last_signal_update: None,
-            last_noise_update: None,
-            last_battery_update: None,
-            last_led_update: None,
-        }
-    }
-}
-
 pub struct App {
     pub mode: AppMode,
+    pub port_candidates: Vec<PortCandidate>,
     pub ports: Vec<String>,
     pub selected_port_index: usize,
     pub channels: Vec<Channel>,
     pub deleted_channels: Vec<u16>,
     pub channel_state: TableState,
+    pub group_labels: Vec<String>,
     pub scan_presets: Vec<ScanPreset>,
     pub preset_state: TableState,
     pub editing_scan_preset: Option<ScanPreset>,
+    pub editing_group_label_idx: Option<usize>,
     pub scanning_group_state: TableState,
-    pub scanning_focus: u8, // 0=Presets, 1=Groups
     pub band_plans: Vec<BandPlan>,
     pub bandplan_state: TableState,
     pub editing_band_plan: Option<BandPlan>,
@@ -128,7 +121,7 @@ pub struct App {
     pub protocol_port_name: Option<String>,
     pub progress: f64,
     pub status_message: String,
-    pub logs: Vec<String>,
+    pub logs: VecDeque<String>,
     pub endian: Endianness,
     pub edit_buffer: String,
     pub selection_index: usize,
@@ -138,9 +131,11 @@ pub struct App {
     pub remote_stop_signal: Arc<AtomicBool>,
     pub remote_tx: Option<Sender<u8>>,
     pub last_main_tab: MainTab,
+    pub last_non_remote_tab: MainTab,
     pub settings_dirty: bool,
     pub channels_dirty: bool,
     pub dtmf_dirty: bool,
+    pub group_labels_dirty: bool,
     pub codeplug_data: Option<Vec<u8>>,
     pub codeplug_path: Option<PathBuf>,
     pub bin_firmware_data: Option<Vec<u8>>,

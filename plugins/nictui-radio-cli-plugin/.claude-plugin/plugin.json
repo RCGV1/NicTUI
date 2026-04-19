@@ -1,0 +1,5 @@
+{
+  "name": "nictui-radio-cli-plugin",
+  "description": "Adds a NicTUI skill that modifies the radio through the nictui CLI",
+  "version": "1.0.3"
+}

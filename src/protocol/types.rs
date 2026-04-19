@@ -5,6 +5,13 @@ pub const BIN_FLASH_BAUD_RATE: u32 = 115200;
 pub const EEPROM_SIZE: usize = 0x2000; // 8 KiB
 pub const BLOCK_SIZE: usize = 32;
 pub const TOTAL_BLOCKS: usize = EEPROM_SIZE / BLOCK_SIZE;
+pub const GROUP_LABEL_COUNT: usize = 16;
+pub const GROUP_LABEL_SIZE: usize = 6;
+pub const GROUP_LABELS_OFFSET: usize = 0x1C90;
+pub const GROUP_LABELS_BLOCK_START: usize = GROUP_LABELS_OFFSET / BLOCK_SIZE;
+pub const GROUP_LABELS_BLOCK_OFFSET: usize = GROUP_LABELS_OFFSET % BLOCK_SIZE;
+pub const GROUP_LABELS_BLOCK_COUNT: usize =
+    (GROUP_LABELS_BLOCK_OFFSET + (GROUP_LABEL_COUNT * GROUP_LABEL_SIZE)).div_ceil(BLOCK_SIZE);
 
 pub const PKT_PING1: u8 = 0x01;
 pub const PKT_DISABLE: u8 = 0x45;
@@ -63,6 +70,8 @@ pub struct BandPlan {
     pub wrap: bool,
     pub modulation: u8,
     pub bandwidth: u8,
+    #[serde(default)]
+    pub raw_flags: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -76,6 +85,10 @@ pub struct ScanPreset {
     pub modulation: u8,
     pub ultrascan: u8,
     pub label: String,
+    #[serde(default)]
+    pub raw_mode: u8,
+    #[serde(default)]
+    pub raw_tail: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -83,6 +96,52 @@ pub struct DTMFPreset {
     pub index: u8,
     pub digits: Vec<u8>,
     pub label: String,
+}
+
+pub fn normalize_group_labels(labels: &[String]) -> Vec<String> {
+    let mut normalized = vec![String::new(); GROUP_LABEL_COUNT];
+    for (slot, label) in normalized.iter_mut().zip(labels.iter()) {
+        *slot = label
+            .trim()
+            .chars()
+            .take(GROUP_LABEL_SIZE)
+            .collect::<String>();
+    }
+    normalized
+}
+
+pub fn group_letter(group: u8) -> Option<char> {
+    if (1..=26).contains(&group) {
+        Some((b'A' + group - 1) as char)
+    } else {
+        None
+    }
+}
+
+pub fn group_label(labels: &[String], group: u8) -> Option<&str> {
+    let index = group.checked_sub(1)? as usize;
+    let label = labels.get(index)?.trim();
+    if label.is_empty() { None } else { Some(label) }
+}
+
+pub fn group_display(group: u8, labels: &[String]) -> String {
+    match group_letter(group) {
+        Some(letter) => match group_label(labels, group) {
+            Some(label) => format!("{letter} {label}"),
+            None => letter.to_string(),
+        },
+        None => group.to_string(),
+    }
+}
+
+pub fn group_display_compact(group: u8, labels: &[String]) -> String {
+    match group_letter(group) {
+        Some(letter) => match group_label(labels, group) {
+            Some(label) => format!("{letter}/{label}"),
+            None => letter.to_string(),
+        },
+        None => group.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -317,5 +376,14 @@ mod tests {
         assert_eq!(result.channel_num, 1);
         assert_eq!(result.name, "TEST");
         assert_eq!(result.rx_freq, "144.0");
+    }
+
+    #[test]
+    fn group_label_block_count_covers_full_table() {
+        let covered_bytes = GROUP_LABELS_BLOCK_COUNT * BLOCK_SIZE;
+        let required_end = GROUP_LABELS_BLOCK_OFFSET + (GROUP_LABEL_COUNT * GROUP_LABEL_SIZE);
+
+        assert!(covered_bytes >= required_end);
+        assert_eq!(GROUP_LABELS_BLOCK_COUNT, 4);
     }
 }

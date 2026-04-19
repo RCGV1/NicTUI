@@ -1,40 +1,52 @@
 use ratatui::widgets::TableState;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
-use crate::protocol::Endianness;
+use crate::device::{PortCandidate, list_port_candidates};
+use crate::protocol::{Endianness, GROUP_LABEL_COUNT};
 
 pub mod actions;
+pub mod bandplan;
+pub mod channels;
+pub mod dtmf;
+pub mod group_labels;
 pub mod handlers;
 pub mod navigation;
+pub mod scan_presets;
+pub mod settings;
 pub mod state;
 
 pub use state::*;
 
 impl App {
     pub fn new() -> Self {
-        let ports = serialport::available_ports()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.port_name)
-            .collect();
+        let port_candidates = list_port_candidates().unwrap_or_default();
+        let ports = port_candidates
+            .iter()
+            .map(|candidate| candidate.port_name.clone())
+            .collect::<Vec<_>>();
+        let selected_port_index = Self::preferred_port_index(&port_candidates, None);
+        let status_message = Self::port_selection_message(&port_candidates);
 
         let (tx, rx) = mpsc::channel();
 
         Self {
             mode: AppMode::PortSelection,
+            port_candidates,
             ports,
-            selected_port_index: 0,
+            selected_port_index,
             channels: Vec::new(),
             deleted_channels: Vec::new(),
             channel_state: TableState::default(),
+            group_labels: vec![String::new(); GROUP_LABEL_COUNT],
             scan_presets: Vec::new(),
             preset_state: TableState::default(),
             editing_scan_preset: None,
+            editing_group_label_idx: None,
             scanning_group_state: TableState::default(),
-            scanning_focus: 0,
             band_plans: Vec::new(),
             bandplan_state: TableState::default(),
             editing_band_plan: None,
@@ -45,8 +57,8 @@ impl App {
             remote_screen: RemoteScreen::default(),
             protocol_port_name: None,
             progress: 0.0,
-            status_message: "Select a serial port to begin".to_string(),
-            logs: Vec::new(),
+            status_message,
+            logs: VecDeque::new(),
             endian: Endianness::Big,
             edit_buffer: String::new(),
             selection_index: 0,
@@ -56,9 +68,11 @@ impl App {
             remote_stop_signal: Arc::new(AtomicBool::new(false)),
             remote_tx: None,
             last_main_tab: MainTab::Channels,
+            last_non_remote_tab: MainTab::Channels,
             settings_dirty: false,
             channels_dirty: false,
             dtmf_dirty: false,
+            group_labels_dirty: false,
             codeplug_data: None,
             codeplug_path: None,
             bin_firmware_data: None,
@@ -70,25 +84,112 @@ impl App {
     }
 
     pub fn log(&mut self, message: &str) {
-        self.logs.push(format!(
+        self.logs.push_back(format!(
             "[{}] {}",
             chrono::Local::now().format("%H:%M:%S"),
             message
         ));
         if self.logs.len() > 100 {
-            self.logs.remove(0);
+            self.logs.pop_front();
         }
     }
 
     pub fn refresh_ports(&mut self) {
-        self.ports = serialport::available_ports()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.port_name)
+        let current = self.ports.get(self.selected_port_index).cloned();
+        self.port_candidates = list_port_candidates().unwrap_or_default();
+        self.ports = self
+            .port_candidates
+            .iter()
+            .map(|candidate| candidate.port_name.clone())
             .collect();
-        if self.selected_port_index >= self.ports.len() && !self.ports.is_empty() {
-            self.selected_port_index = 0;
+        self.selected_port_index =
+            Self::preferred_port_index(&self.port_candidates, current.as_deref());
+        if self.mode == AppMode::PortSelection {
+            self.status_message = Self::port_selection_message(&self.port_candidates);
         }
+    }
+
+    pub fn connect_to_port_by_name(&mut self, port_name: &str) {
+        match self
+            .ports
+            .iter()
+            .position(|candidate| candidate == port_name)
+        {
+            Some(index) => self.selected_port_index = index,
+            None => {
+                self.ports.push(port_name.to_string());
+                self.selected_port_index = self.ports.len().saturating_sub(1);
+            }
+        }
+        if !self
+            .port_candidates
+            .iter()
+            .any(|candidate| candidate.port_name == port_name)
+        {
+            self.refresh_ports();
+            if let Some(index) = self
+                .ports
+                .iter()
+                .position(|candidate| candidate == port_name)
+            {
+                self.selected_port_index = index;
+            }
+        }
+        self.select_port();
+    }
+
+    pub fn selected_port_candidate(&self) -> Option<&PortCandidate> {
+        self.port_candidates.get(self.selected_port_index)
+    }
+
+    fn port_selection_message(candidates: &[PortCandidate]) -> String {
+        let radio_ports: Vec<&PortCandidate> = candidates
+            .iter()
+            .filter(|candidate| candidate.is_radio())
+            .collect();
+        match candidates.len() {
+            0 => "No serial ports detected. Connect the radio and press r to refresh.".to_string(),
+            _ if radio_ports.len() == 1 => format!(
+                "Radio detected on {}. Press Enter to continue.",
+                radio_ports[0].port_name
+            ),
+            _ if radio_ports.len() > 1 => {
+                format!(
+                    "{} responsive radios detected. Select one to begin.",
+                    radio_ports.len()
+                )
+            }
+            1 => format!(
+                "1 serial port detected ({}). Press Enter to connect.",
+                candidates[0].port_name
+            ),
+            count => {
+                format!("{count} serial ports detected. The most likely radio port is preselected.")
+            }
+        }
+    }
+
+    fn preferred_port_index(
+        candidates: &[PortCandidate],
+        current_port_name: Option<&str>,
+    ) -> usize {
+        if let Some(current_port_name) = current_port_name
+            && let Some(index) = candidates
+                .iter()
+                .position(|candidate| candidate.port_name == current_port_name)
+        {
+            return index;
+        }
+
+        candidates
+            .iter()
+            .position(|candidate| candidate.is_radio())
+            .or_else(|| {
+                candidates.iter().position(|candidate| {
+                    matches!(candidate.kind, crate::device::PortKind::Candidate)
+                })
+            })
+            .unwrap_or(0)
     }
 
     pub fn suspend_ui(&self) {
@@ -146,5 +247,11 @@ impl App {
 
         let _ = stdout.flush();
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
     }
 }

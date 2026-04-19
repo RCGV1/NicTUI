@@ -1,4 +1,4 @@
-use nictui::protocol::{Endianness, RadioProtocol, SettingsBlock};
+use nictui::protocol::{Endianness, RadioProtocol};
 use std::thread;
 use std::time::Duration;
 

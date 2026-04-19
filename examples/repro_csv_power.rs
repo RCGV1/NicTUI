@@ -25,7 +25,8 @@ fn main() {
         let power = get_val("TX_Power")
             .and_then(|s| s.parse::<u8>().ok())
             .unwrap_or(0);
+        let channel = Channel { power };
 
-        println!("Parsed Power: {}", power);
+        println!("Parsed Power: {}", channel.power);
     }
 }

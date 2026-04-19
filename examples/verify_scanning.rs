@@ -1,7 +1,5 @@
 use anyhow::Result;
 use nictui::protocol::RadioProtocol;
-use std::thread;
-use std::time::Duration;
 
 fn main() -> Result<()> {
     let ports = serialport::available_ports()?;

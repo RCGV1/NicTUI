@@ -40,6 +40,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             render_main_layout(f, app, area, MainTab::Scanning);
             render_scan_preset_editor(f, app);
         }
+        AppMode::EditGroupLabel(_) => {
+            render_main_layout(f, app, area, MainTab::MemoryGroups);
+            render_group_label_editor(f, app);
+        }
         AppMode::EditBandPlan(_) => {
             render_main_layout(f, app, area, MainTab::BandPlan);
             render_bandplan_editor(f, app);
@@ -52,12 +56,12 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     }
 }
 
-pub fn render_shortcut(key: &str) -> Span {
+pub fn render_shortcut(key: &str) -> Span<'_> {
     Span::styled(
         format!(" {} ", key),
         Style::default()
-            .fg(COLOR_HEADER)
-            .bg(COLOR_PRIMARY)
+            .fg(COLOR_TEXT)
+            .bg(COLOR_SURFACE_3)
             .add_modifier(Modifier::BOLD),
     )
 }

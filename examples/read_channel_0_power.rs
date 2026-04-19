@@ -29,7 +29,7 @@ fn main() -> Result<()> {
 
         println!("  Handshaking...");
         let mut connected = false;
-        for i in 0..3 {
+        for _attempt in 0..3 {
             if proto.handshake().unwrap_or(false) {
                 connected = true;
                 break;

@@ -1,1 +1,4 @@
 /target
+/.ui-captures
+/.live-debug
+.DS_Store

@@ -3,8 +3,18 @@ use super::state::{App, AppEvent, AppMode, MainTab};
 use crate::protocol::*;
 
 impl App {
-    pub fn update(&mut self) {
+    pub fn leave_remote_tab(&mut self) {
+        if self.remote_active {
+            self.remote_off();
+        }
+        self.mode = AppMode::Main(self.last_non_remote_tab);
+        self.last_main_tab = self.last_non_remote_tab;
+    }
+
+    pub fn update(&mut self) -> bool {
+        let mut updated = false;
         while let Ok(event) = self.event_rx.try_recv() {
+            updated = true;
             match event {
                 AppEvent::Progress(p) => self.progress = p,
                 AppEvent::Status(s) => self.status_message = s,
@@ -13,8 +23,17 @@ impl App {
                     self.channels = channels;
                     self.endian = endian;
                     self.channel_state.select(Some(0));
-                    self.mode = AppMode::Main(MainTab::Channels);
-                    self.status_message = "Channels read complete".to_string();
+                    self.ensure_group_selection();
+                    self.mode = AppMode::Main(self.last_main_tab);
+                    self.status_message =
+                        format!("Channels read complete: {} loaded", self.channels.len());
+                }
+                AppEvent::ReadGroupLabelsComplete(labels) => {
+                    self.group_labels = normalize_group_labels(&labels);
+                    self.group_labels_dirty = false;
+                    if self.scanning_group_state.selected().is_none() {
+                        self.scanning_group_state.select(Some(0));
+                    }
                 }
                 AppEvent::ReadPresetsComplete(presets) => {
                     self.scan_presets = presets;
@@ -56,17 +75,18 @@ impl App {
                             self.remote_screen.noise_level = level;
                             self.remote_screen.last_noise_update = Some(now);
                         }
-                        RemotePacket::LedStatus { status } => {
-                            self.remote_screen.leds = status;
-                            self.remote_screen.last_led_update = Some(now);
-                        }
                         _ => {
-                            self.remote_screen.elements.push(pkt);
+                            self.remote_screen.elements.push_back(pkt);
                             if self.remote_screen.elements.len() > 50 {
-                                self.remote_screen.elements.remove(0);
+                                self.remote_screen.elements.pop_front();
                             }
                         }
                     }
+                }
+                AppEvent::RemoteStopped(message) => {
+                    self.remote_active = false;
+                    self.remote_tx = None;
+                    self.status_message = message;
                 }
                 AppEvent::WriteComplete => {
                     self.mode = AppMode::Main(self.last_main_tab);
@@ -74,6 +94,7 @@ impl App {
                     self.deleted_channels.clear();
                     self.dtmf_dirty = false;
                     self.settings_dirty = false;
+                    self.group_labels_dirty = false;
                 }
                 AppEvent::LoadCSV(path) => self.start_import_and_write(path),
                 AppEvent::WriteCSV(path) => self.start_write_csv_channels(path),
@@ -101,16 +122,23 @@ impl App {
                     channels,
                     settings,
                     scan_presets,
+                    group_labels,
                 } => {
                     self.codeplug_data = Some(data);
                     self.codeplug_path = Some(path);
                     self.channels = channels;
                     self.settings = settings;
                     self.scan_presets = scan_presets;
+                    self.group_labels = normalize_group_labels(&group_labels);
+                    self.group_labels_dirty = false;
                     self.status_message = format!(
-                        "Codeplug loaded: {} channels, {} scan presets",
+                        "Codeplug loaded: {} channels, {} scan presets, {} named groups",
                         self.channels.len(),
-                        self.scan_presets.len()
+                        self.scan_presets.len(),
+                        self.group_labels
+                            .iter()
+                            .filter(|label| !label.trim().is_empty())
+                            .count()
                     );
                     self.mode = AppMode::Main(MainTab::Codeplug);
                 }
@@ -138,6 +166,7 @@ impl App {
                 AppEvent::ResumeUI => self.resume_ui(),
             }
         }
+        updated
     }
 
     pub fn next_channel(&mut self) {
@@ -168,92 +197,75 @@ impl App {
         prev_item(self.band_plans.len(), &mut self.bandplan_state);
     }
 
-    pub fn next_setting(&mut self) {
-        if self.settings.is_some() {
-            next_item(SETTINGS_METADATA.len(), &mut self.settings_state);
-        }
-    }
-
-    pub fn prev_setting(&mut self) {
-        if self.settings.is_some() {
-            prev_item(SETTINGS_METADATA.len(), &mut self.settings_state);
-        }
-    }
-
     pub fn next_scanning_item(&mut self) {
-        if self.scanning_focus == 0 {
-            if !self.scan_presets.is_empty() {
-                next_item(self.scan_presets.len(), &mut self.preset_state);
-            }
-        } else if !self.channels.is_empty() {
-            next_item(self.channels.len(), &mut self.scanning_group_state);
+        if !self.scan_presets.is_empty() {
+            next_item(self.scan_presets.len(), &mut self.preset_state);
         }
     }
 
     pub fn prev_scanning_item(&mut self) {
-        if self.scanning_focus == 0 {
-            if !self.scan_presets.is_empty() {
-                prev_item(self.scan_presets.len(), &mut self.preset_state);
-            }
-        } else if !self.channels.is_empty() {
-            prev_item(self.channels.len(), &mut self.scanning_group_state);
+        if !self.scan_presets.is_empty() {
+            prev_item(self.scan_presets.len(), &mut self.preset_state);
         }
     }
 
-    pub fn toggle_scanning_focus(&mut self) {
-        self.scanning_focus = 1 - self.scanning_focus;
-        if self.scanning_focus == 1
-            && self.scanning_group_state.selected().is_none()
-            && !self.channels.is_empty()
-        {
+    pub fn next_group_item(&mut self) {
+        next_item(GROUP_LABEL_COUNT, &mut self.scanning_group_state);
+    }
+
+    pub fn prev_group_item(&mut self) {
+        prev_item(GROUP_LABEL_COUNT, &mut self.scanning_group_state);
+    }
+
+    pub fn ensure_group_selection(&mut self) {
+        if self.scanning_group_state.selected().is_none() {
             self.scanning_group_state.select(Some(0));
         }
     }
 
     pub fn start_edit_scan_preset(&mut self) {
-        if let Some(i) = self.preset_state.selected() {
-            if i < self.scan_presets.len() {
-                if let Some(sp) = self.scan_presets.get(i).cloned() {
-                    self.last_main_tab = MainTab::Scanning;
-                    self.editing_scan_preset = Some(sp);
-                    self.mode = AppMode::EditScanPreset(0);
-                    self.edit_buffer.clear();
-                    self.selection_index = 0;
-                    self.update_scan_preset_edit_buffer();
-                }
-            }
+        if let Some(i) = self.preset_state.selected()
+            && i < self.scan_presets.len()
+            && let Some(sp) = self.scan_presets.get(i).cloned()
+        {
+            self.last_main_tab = MainTab::Scanning;
+            self.editing_scan_preset = Some(sp);
+            self.mode = AppMode::EditScanPreset(0);
+            self.edit_buffer.clear();
+            self.selection_index = 0;
+            self.update_scan_preset_edit_buffer();
         }
     }
 
     pub fn update_scan_preset_edit_buffer(&mut self) {
-        if let AppMode::EditScanPreset(field_idx) = self.mode {
-            if let Some(sp) = self.editing_scan_preset.as_ref() {
-                self.edit_buffer = match field_idx {
-                    0 => sp.label.clone(),
-                    1 => format!("{:.5}", sp.start_freq as f64 / 100000.0),
-                    2 => sp.range.to_string(),
-                    3 => sp.step.to_string(),
-                    4 => sp.persist.to_string(),
-                    5 => sp.resume.to_string(),
-                    6 => {
-                        self.selection_index = match sp.modulation {
-                            1 => 1,
-                            2 => 2,
-                            _ => 0,
-                        };
-                        match sp.modulation {
-                            1 => "AM".to_string(),
-                            2 => "USB".to_string(),
-                            _ => "FM".to_string(),
-                        }
+        if let AppMode::EditScanPreset(field_idx) = self.mode
+            && let Some(sp) = self.editing_scan_preset.as_ref()
+        {
+            self.edit_buffer = match field_idx {
+                0 => sp.label.clone(),
+                1 => format!("{:.5}", sp.start_freq as f64 / 100000.0),
+                2 => sp.range.to_string(),
+                3 => sp.step.to_string(),
+                4 => sp.persist.to_string(),
+                5 => sp.resume.to_string(),
+                6 => {
+                    self.selection_index = match sp.modulation {
+                        1 => 1,
+                        2 => 2,
+                        _ => 0,
+                    };
+                    match sp.modulation {
+                        1 => "AM".to_string(),
+                        2 => "USB".to_string(),
+                        _ => "FM".to_string(),
                     }
-                    7 => {
-                        self.selection_index = sp.ultrascan as usize;
-                        sp.ultrascan.to_string()
-                    }
-                    _ => String::new(),
-                };
-            }
+                }
+                7 => {
+                    self.selection_index = sp.ultrascan as usize;
+                    sp.ultrascan.to_string()
+                }
+                _ => String::new(),
+            };
         }
     }
 
@@ -262,8 +274,8 @@ impl App {
             match field_idx {
                 0 => sp.label = self.edit_buffer.clone(),
                 1 => {
-                    if let Ok(freq) = self.edit_buffer.parse::<u32>() {
-                        sp.start_freq = freq * 100000;
+                    if let Ok(freq) = self.edit_buffer.parse::<f64>() {
+                        sp.start_freq = (freq * 100000.0).round() as u32;
                     }
                 }
                 2 => {
@@ -306,13 +318,12 @@ impl App {
             self.save_current_scan_preset_field(field_idx);
         }
 
-        if let Some(edited_sp) = self.editing_scan_preset.take() {
-            if let Some(i) = self.preset_state.selected() {
-                if i < self.scan_presets.len() {
-                    self.scan_presets[i] = edited_sp;
-                    self.status_message = format!("Scan preset {} saved", i + 1);
-                }
-            }
+        if let Some(edited_sp) = self.editing_scan_preset.take()
+            && let Some(i) = self.preset_state.selected()
+            && i < self.scan_presets.len()
+        {
+            self.scan_presets[i] = edited_sp;
+            self.status_message = format!("Scan preset {} saved", i + 1);
         }
         self.mode = AppMode::Main(MainTab::Scanning);
     }
@@ -325,19 +336,27 @@ impl App {
 
     pub fn previous_port(&mut self) {
         if !self.ports.is_empty() {
-            self.selected_port_index = self.selected_port_index.saturating_sub(1);
+            self.selected_port_index = if self.selected_port_index == 0 {
+                self.ports.len() - 1
+            } else {
+                self.selected_port_index - 1
+            };
         }
     }
 
     pub fn next_tab(&mut self) {
         if let AppMode::Main(tab) = self.mode {
+            if tab != MainTab::Remote {
+                self.last_non_remote_tab = tab;
+            }
             if tab == MainTab::Remote {
                 self.remote_off();
             }
             let next = match tab {
                 MainTab::Channels => MainTab::Settings,
                 MainTab::Settings => MainTab::Scanning,
-                MainTab::Scanning => MainTab::BandPlan,
+                MainTab::Scanning => MainTab::MemoryGroups,
+                MainTab::MemoryGroups => MainTab::BandPlan,
                 MainTab::BandPlan => MainTab::DTMF,
                 MainTab::DTMF => MainTab::Remote,
                 MainTab::Remote => MainTab::Codeplug,
@@ -347,11 +366,17 @@ impl App {
             };
             self.mode = AppMode::Main(next);
             self.last_main_tab = next;
+            if next != MainTab::Remote {
+                self.last_non_remote_tab = next;
+            }
         }
     }
 
     pub fn prev_tab(&mut self) {
         if let AppMode::Main(tab) = self.mode {
+            if tab != MainTab::Remote {
+                self.last_non_remote_tab = tab;
+            }
             if tab == MainTab::Remote {
                 self.remote_off();
             }
@@ -359,7 +384,8 @@ impl App {
                 MainTab::Channels => MainTab::Debug,
                 MainTab::Settings => MainTab::Channels,
                 MainTab::Scanning => MainTab::Settings,
-                MainTab::BandPlan => MainTab::Scanning,
+                MainTab::MemoryGroups => MainTab::Scanning,
+                MainTab::BandPlan => MainTab::MemoryGroups,
                 MainTab::DTMF => MainTab::BandPlan,
                 MainTab::Remote => MainTab::DTMF,
                 MainTab::Codeplug => MainTab::Remote,
@@ -368,73 +394,81 @@ impl App {
             };
             self.mode = AppMode::Main(prev);
             self.last_main_tab = prev;
+            if prev != MainTab::Remote {
+                self.last_non_remote_tab = prev;
+            }
         }
     }
 
     pub fn start_edit_channel(&mut self) {
-        if let Some(i) = self.channel_state.selected() {
-            if let Some(ch) = self.channels.get(i).cloned() {
-                self.last_main_tab = MainTab::Channels;
-                self.pending_channel_edit = Some(ch);
-                self.mode = AppMode::EditChannel(0);
-                self.edit_buffer.clear();
-                self.selection_index = 0;
-                self.update_edit_buffer();
-            }
+        if let Some(i) = self.channel_state.selected()
+            && let Some(ch) = self.channels.get(i).cloned()
+        {
+            self.last_main_tab = MainTab::Channels;
+            self.pending_channel_edit = Some(ch);
+            self.mode = AppMode::EditChannel(0);
+            self.edit_buffer.clear();
+            self.selection_index = 0;
+            self.update_edit_buffer();
         }
     }
 
     pub fn update_edit_buffer(&mut self) {
-        if let AppMode::EditChannel(field_idx) = self.mode {
-            if let Some(ch) = self.pending_channel_edit.as_ref() {
-                self.edit_buffer = match field_idx {
-                    0 => ch.name.clone(),
-                    1 => ch.rx_freq.clone(),
-                    2 => ch.tx_freq.clone(),
-                    3 => ch.rx_tone.clone(),
-                    4 => ch.tx_tone.clone(),
-                    5 => {
-                        if ch.power == 0 {
-                            "Off".to_string()
-                        } else {
-                            ch.power.to_string()
-                        }
+        if let AppMode::EditChannel(field_idx) = self.mode
+            && let Some(ch) = self.pending_channel_edit.as_ref()
+        {
+            self.edit_buffer = match field_idx {
+                0 => ch.name.clone(),
+                1 => ch.rx_freq.clone(),
+                2 => ch.tx_freq.clone(),
+                3 => ch.rx_tone.clone(),
+                4 => ch.tx_tone.clone(),
+                5 => {
+                    if ch.power == 0 {
+                        "Off".to_string()
+                    } else {
+                        ch.power.to_string()
                     }
-                    6 => {
-                        self.selection_index = if ch.position == 1 { 1 } else { 0 };
-                        if ch.position == 1 {
-                            "On".to_string()
-                        } else {
-                            "Off".to_string()
-                        }
+                }
+                6 => {
+                    self.selection_index = if ch.position == 1 { 1 } else { 0 };
+                    if ch.position == 1 {
+                        "On".to_string()
+                    } else {
+                        "Off".to_string()
                     }
-                    7 => {
-                        self.selection_index = if ch.bandwidth == "Narrow" { 1 } else { 0 };
-                        ch.bandwidth.clone()
-                    }
-                    8 => {
-                        self.selection_index = match ch.modulation.as_str() {
-                            "AM" => 1,
-                            "USB" => 2,
-                            "LSB" => 3,
-                            "CW" => 4,
-                            _ => 0,
-                        };
-                        ch.modulation.clone()
-                    }
-                    9 => {
-                        let mut s = String::new();
-                        for &g in ch.groups.iter() {
-                            if g != 0 && g != 0xFF && g >= 1 && g <= 26 {
-                                s.push((b'A' + g - 1) as char);
-                            }
-                        }
-                        s
-                    }
-                    10 => ch.channel_num.to_string(),
-                    _ => String::new(),
-                };
-            }
+                }
+                7 => {
+                    self.selection_index = if ch.bandwidth == "Narrow" { 1 } else { 0 };
+                    ch.bandwidth.clone()
+                }
+                8 => {
+                    self.selection_index = match ch.modulation.as_str() {
+                        "AM" => 1,
+                        "USB" => 2,
+                        "LSB" => 3,
+                        "CW" => 4,
+                        _ => 0,
+                    };
+                    ch.modulation.clone()
+                }
+                9 => {
+                    let group = ch
+                        .groups
+                        .iter()
+                        .copied()
+                        .find(|group| (1..=GROUP_LABEL_COUNT as u8).contains(group))
+                        .unwrap_or(0);
+                    self.selection_index = if (1..=GROUP_LABEL_COUNT as u8).contains(&group) {
+                        group as usize
+                    } else {
+                        0
+                    };
+                    self.group_option_label(group)
+                }
+                10 => ch.channel_num.to_string(),
+                _ => String::new(),
+            };
         }
     }
 
@@ -472,15 +506,12 @@ impl App {
                     }
                 }
                 9 => {
-                    let mut groups = [0; 4];
-                    let mut current_slot = 0;
-                    for c in self.edit_buffer.to_uppercase().chars().take(4) {
-                        if c >= 'A' && c <= 'O' {
-                            groups[current_slot] = c as u8 - b'A' + 1;
-                            current_slot += 1;
-                        }
-                    }
-                    ch.groups = groups;
+                    let selected_group = if self.selection_index == 0 {
+                        0
+                    } else {
+                        self.selection_index as u8
+                    };
+                    ch.groups = [selected_group, 0, 0, 0];
                 }
                 10 => {
                     if let Ok(num) = self.edit_buffer.parse::<u16>() {
@@ -504,40 +535,27 @@ impl App {
         if let Some(pending_ch) = self.pending_channel_edit.take() {
             let new_channel_num = pending_ch.channel_num;
 
-            if let Some(i) = self.channel_state.selected() {
-                if i < self.channels.len() {
-                    // Check if another channel already has this number
-                    let duplicate = self
-                        .channels
-                        .iter()
-                        .enumerate()
-                        .any(|(idx, c)| idx != i && c.channel_num == new_channel_num);
+            if let Some(i) = self.channel_state.selected()
+                && i < self.channels.len()
+            {
+                let duplicate = self
+                    .channels
+                    .iter()
+                    .enumerate()
+                    .any(|(idx, c)| idx != i && c.channel_num == new_channel_num);
 
-                    if duplicate {
-                        self.status_message =
-                            format!("Channel {} already exists!", new_channel_num);
-                        self.channels_dirty = false;
-                    } else {
-                        self.channels[i] = pending_ch;
+                if duplicate {
+                    self.status_message = format!("Channel {} already exists!", new_channel_num);
+                    self.channels_dirty = false;
+                } else {
+                    self.channels[i] = pending_ch;
+                    self.channel_state.select(Some(i));
 
-                        // Find the new position based on channel number
-                        let mut sorted_channels: Vec<_> =
-                            self.channels.iter().enumerate().collect();
-                        sorted_channels.sort_by_key(|(_, c)| c.channel_num);
-
-                        if let Some((new_pos, _)) = sorted_channels
-                            .iter()
-                            .find(|(_, c)| c.channel_num == new_channel_num)
-                        {
-                            self.channel_state.select(Some(*new_pos));
-                        }
-                    }
-
-                    if index_changed && !duplicate {
+                    if index_changed {
                         self.channels_dirty = true;
                         self.status_message =
                             format!("Channel {} saved (Unsaved)", new_channel_num);
-                    } else if !duplicate {
+                    } else {
                         self.status_message = format!("Channel {} saved", new_channel_num);
                     }
                 }
@@ -552,93 +570,57 @@ impl App {
         }
     }
 
-    pub fn start_edit_setting(&mut self) {
-        if let Some(i) = self.settings_state.selected() {
-            self.mode = AppMode::EditSetting(i);
-            if let Some(s) = &self.settings {
-                let meta = &crate::protocol::SETTINGS_METADATA[i];
-                match meta.setting_type {
-                    crate::protocol::SettingType::Enum(_)
-                    | crate::protocol::SettingType::Boolean => {
-                        self.selection_index = s.get_value(i) as usize;
-                    }
-                    _ => {}
-                }
-            }
-            self.update_setting_edit_buffer();
-        }
-    }
-
-    pub fn update_setting_edit_buffer(&mut self) {
-        if let AppMode::EditSetting(idx) = self.mode {
-            if let Some(s) = &self.settings {
-                self.edit_buffer = s.get_value(idx).to_string();
-            }
-        }
-    }
-
-    pub fn commit_setting_edit(&mut self) {
-        if let AppMode::EditSetting(idx) = self.mode {
-            if let Some(s) = &mut self.settings {
-                let meta = &crate::protocol::SETTINGS_METADATA[idx];
-                match meta.setting_type {
-                    crate::protocol::SettingType::Enum(_)
-                    | crate::protocol::SettingType::Boolean => {
-                        s.set_value(idx, self.selection_index as u32);
-                    }
-                    _ => {
-                        if let Ok(val) = self.edit_buffer.parse::<u32>() {
-                            s.set_value(idx, val);
-                        }
-                    }
-                }
-                self.settings_dirty = true;
-                self.status_message = "Setting changed (Unsaved)".to_string();
-            }
-            self.mode = AppMode::Main(MainTab::Settings);
+    fn group_option_label(&self, group: u8) -> String {
+        if group == 0 || group == 0xFF {
+            "None".to_string()
+        } else if let Some(label) = group_label(&self.group_labels, group) {
+            label.to_string()
+        } else if let Some(letter) = group_letter(group) {
+            letter.to_string()
+        } else {
+            group.to_string()
         }
     }
 
     pub fn save_current_dtmf_field_to_pending(&mut self, field_idx: usize) {
-        if let Some(preset_idx) = self.dtmf_edit_preset_idx {
-            if let Some(dtmf) = self.dtmf_presets.get_mut(preset_idx) {
-                match field_idx {
-                    0 => dtmf.label = self.edit_buffer.clone(),
-                    1 => {
-                        let mut digits = Vec::new();
-                        for c in self.edit_buffer.to_uppercase().chars() {
-                            match c {
-                                '0'..='9' => digits.push(c as u8 - b'0'),
-                                'A' => digits.push(10),
-                                'B' => digits.push(11),
-                                'C' => digits.push(12),
-                                'D' => digits.push(13),
-                                'E' => digits.push(14),
-                                'F' => digits.push(15),
-                                '*' => digits.push(12),
-                                '#' => digits.push(15),
-                                _ => {}
-                            }
+        if let Some(preset_idx) = self.dtmf_edit_preset_idx
+            && let Some(dtmf) = self.dtmf_presets.get_mut(preset_idx)
+        {
+            match field_idx {
+                0 => dtmf.label = self.edit_buffer.clone(),
+                1 => {
+                    let mut digits = Vec::new();
+                    for c in self.edit_buffer.to_uppercase().chars() {
+                        match c {
+                            '0'..='9' => digits.push(c as u8 - b'0'),
+                            'A' => digits.push(10),
+                            'B' => digits.push(11),
+                            'C' => digits.push(12),
+                            'D' => digits.push(13),
+                            'E' => digits.push(14),
+                            'F' => digits.push(15),
+                            '*' => digits.push(12),
+                            '#' => digits.push(15),
+                            _ => {}
                         }
-                        dtmf.digits = digits;
                     }
-                    _ => {}
+                    dtmf.digits = digits;
                 }
+                _ => {}
             }
         }
     }
 
     pub fn update_dtmf_edit_buffer(&mut self) {
-        if let AppMode::EditDTMF(field_idx) = self.mode {
-            if let Some(preset_idx) = self.dtmf_edit_preset_idx {
-                if let Some(dtmf) = self.dtmf_presets.get(preset_idx) {
-                    self.edit_buffer = match field_idx {
-                        0 => dtmf.label.clone(),
-                        1 => dtmf.digits.iter().map(|d| format!("{:X}", d)).collect(),
-                        _ => String::new(),
-                    };
-                }
-            }
+        if let AppMode::EditDTMF(field_idx) = self.mode
+            && let Some(preset_idx) = self.dtmf_edit_preset_idx
+            && let Some(dtmf) = self.dtmf_presets.get(preset_idx)
+        {
+            self.edit_buffer = match field_idx {
+                0 => dtmf.label.clone(),
+                1 => dtmf.digits.iter().map(|d| format!("{:X}", d)).collect(),
+                _ => String::new(),
+            };
         }
     }
 
@@ -656,15 +638,14 @@ impl App {
     }
 
     pub fn delete_selected_channel(&mut self) {
-        if let Some(i) = self.channel_state.selected() {
-            if i < self.channels.len() {
-                let ch_num = self.channels[i].channel_num;
-                if !self.deleted_channels.contains(&ch_num) {
-                    self.deleted_channels.push(ch_num);
-                    self.channels_dirty = true;
-                    self.status_message =
-                        format!("Channel {} marked for deletion (Unsaved)", ch_num);
-                }
+        if let Some(i) = self.channel_state.selected()
+            && i < self.channels.len()
+        {
+            let ch_num = self.channels[i].channel_num;
+            if !self.deleted_channels.contains(&ch_num) {
+                self.deleted_channels.push(ch_num);
+                self.channels_dirty = true;
+                self.status_message = format!("Channel {} marked for deletion (Unsaved)", ch_num);
             }
         }
     }
@@ -682,28 +663,27 @@ impl App {
     }
 
     pub fn undelete_channel(&mut self) {
-        if let Some(i) = self.channel_state.selected() {
-            if i < self.channels.len() {
-                let ch_num = self.channels[i].channel_num;
-                if let Some(pos) = self.deleted_channels.iter().position(|&x| x == ch_num) {
-                    self.deleted_channels.remove(pos);
-                    self.channels_dirty = !self.deleted_channels.is_empty();
-                    self.status_message = format!("Channel {} undeleted", ch_num);
-                }
+        if let Some(i) = self.channel_state.selected()
+            && i < self.channels.len()
+        {
+            let ch_num = self.channels[i].channel_num;
+            if let Some(pos) = self.deleted_channels.iter().position(|&x| x == ch_num) {
+                self.deleted_channels.remove(pos);
+                self.channels_dirty = !self.deleted_channels.is_empty();
+                self.status_message = format!("Channel {} undeleted", ch_num);
             }
         }
     }
 
     pub fn change_channel_index(&mut self, new_index: u16) {
-        if let Some(i) = self.channel_state.selected() {
-            if i < self.channels.len() {
-                let old_index = self.channels[i].channel_num;
-                if new_index != old_index {
-                    self.channels[i].channel_num = new_index;
-                    self.channels_dirty = true;
-                    self.status_message =
-                        format!("Channel {} -> {} (Unsaved)", old_index, new_index);
-                }
+        if let Some(i) = self.channel_state.selected()
+            && i < self.channels.len()
+        {
+            let old_index = self.channels[i].channel_num;
+            if new_index != old_index {
+                self.channels[i].channel_num = new_index;
+                self.channels_dirty = true;
+                self.status_message = format!("Channel {} -> {} (Unsaved)", old_index, new_index);
             }
         }
     }
@@ -754,67 +734,66 @@ impl App {
     }
 
     pub fn start_edit_bandplan(&mut self) {
-        if let Some(i) = self.bandplan_state.selected() {
-            if i < self.band_plans.len() {
-                if let Some(bp) = self.band_plans.get(i).cloned() {
-                    self.last_main_tab = MainTab::BandPlan;
-                    self.editing_band_plan = Some(bp);
-                    self.mode = AppMode::EditBandPlan(0);
-                    self.edit_buffer.clear();
-                    self.selection_index = 0;
-                    self.update_bandplan_edit_buffer();
-                }
-            }
+        if let Some(i) = self.bandplan_state.selected()
+            && i < self.band_plans.len()
+            && let Some(bp) = self.band_plans.get(i).cloned()
+        {
+            self.last_main_tab = MainTab::BandPlan;
+            self.editing_band_plan = Some(bp);
+            self.mode = AppMode::EditBandPlan(0);
+            self.edit_buffer.clear();
+            self.selection_index = 0;
+            self.update_bandplan_edit_buffer();
         }
     }
 
     pub fn update_bandplan_edit_buffer(&mut self) {
-        if let AppMode::EditBandPlan(field_idx) = self.mode {
-            if let Some(bp) = self.editing_band_plan.as_ref() {
-                self.edit_buffer = match field_idx {
-                    0 => bp.index.to_string(),
-                    1 => format!("{:.5}", bp.start_freq as f64 / 100000.0),
-                    2 => format!("{:.5}", bp.end_freq as f64 / 100000.0),
-                    3 => bp.max_power.to_string(),
-                    4 => {
-                        self.selection_index = if bp.tx_allowed { 1 } else { 0 };
-                        if bp.tx_allowed {
-                            "Yes".to_string()
-                        } else {
-                            "No".to_string()
-                        }
+        if let AppMode::EditBandPlan(field_idx) = self.mode
+            && let Some(bp) = self.editing_band_plan.as_ref()
+        {
+            self.edit_buffer = match field_idx {
+                0 => bp.index.to_string(),
+                1 => format!("{:.5}", bp.start_freq as f64 / 100000.0),
+                2 => format!("{:.5}", bp.end_freq as f64 / 100000.0),
+                3 => bp.max_power.to_string(),
+                4 => {
+                    self.selection_index = if bp.tx_allowed { 1 } else { 0 };
+                    if bp.tx_allowed {
+                        "Yes".to_string()
+                    } else {
+                        "No".to_string()
                     }
-                    5 => {
-                        self.selection_index = if bp.wrap { 1 } else { 0 };
-                        if bp.wrap {
-                            "Yes".to_string()
-                        } else {
-                            "No".to_string()
-                        }
+                }
+                5 => {
+                    self.selection_index = if bp.wrap { 1 } else { 0 };
+                    if bp.wrap {
+                        "Yes".to_string()
+                    } else {
+                        "No".to_string()
                     }
-                    6 => {
-                        self.selection_index = match bp.modulation {
-                            1 => 1,
-                            2 => 2,
-                            _ => 0,
-                        };
-                        match bp.modulation {
-                            1 => "AM".to_string(),
-                            2 => "USB".to_string(),
-                            _ => "FM".to_string(),
-                        }
+                }
+                6 => {
+                    self.selection_index = match bp.modulation {
+                        1 => 1,
+                        2 => 2,
+                        _ => 0,
+                    };
+                    match bp.modulation {
+                        1 => "AM".to_string(),
+                        2 => "USB".to_string(),
+                        _ => "FM".to_string(),
                     }
-                    7 => {
-                        self.selection_index = if bp.bandwidth == 1 { 1 } else { 0 };
-                        if bp.bandwidth == 1 {
-                            "Narrow".to_string()
-                        } else {
-                            "Wide".to_string()
-                        }
+                }
+                7 => {
+                    self.selection_index = if bp.bandwidth == 1 { 1 } else { 0 };
+                    if bp.bandwidth == 1 {
+                        "Narrow".to_string()
+                    } else {
+                        "Wide".to_string()
                     }
-                    _ => String::new(),
-                };
-            }
+                }
+                _ => String::new(),
+            };
         }
     }
 
@@ -827,13 +806,13 @@ impl App {
                     }
                 }
                 1 => {
-                    if let Ok(freq) = self.edit_buffer.parse::<u32>() {
-                        bp.start_freq = freq * 100000;
+                    if let Ok(freq) = self.edit_buffer.parse::<f64>() {
+                        bp.start_freq = (freq * 100000.0).round() as u32;
                     }
                 }
                 2 => {
-                    if let Ok(freq) = self.edit_buffer.parse::<u32>() {
-                        bp.end_freq = freq * 100000;
+                    if let Ok(freq) = self.edit_buffer.parse::<f64>() {
+                        bp.end_freq = (freq * 100000.0).round() as u32;
                     }
                 }
                 3 => {
@@ -861,13 +840,12 @@ impl App {
             self.save_current_bandplan_field(field_idx);
         }
 
-        if let Some(edited_bp) = self.editing_band_plan.take() {
-            if let Some(i) = self.bandplan_state.selected() {
-                if i < self.band_plans.len() {
-                    self.band_plans[i] = edited_bp;
-                    self.status_message = format!("Band plan {} saved", i + 1);
-                }
-            }
+        if let Some(edited_bp) = self.editing_band_plan.take()
+            && let Some(i) = self.bandplan_state.selected()
+            && i < self.band_plans.len()
+        {
+            self.band_plans[i] = edited_bp;
+            self.status_message = format!("Band plan {} saved", i + 1);
         }
         self.mode = AppMode::Main(MainTab::BandPlan);
     }

@@ -3,130 +3,134 @@ use crate::ui::editors::render_progress_overlay;
 use crate::ui::render_shortcut;
 use crate::ui::theme::*;
 use ratatui::{
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
     Frame,
+    layout::{Constraint, Direction, Layout, Rect},
+    prelude::Stylize,
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 pub fn render_bin_flash_view(f: &mut Frame, app: &mut App, area: Rect) {
-    let mut content_lines = vec![];
+    let compact = area.width < 90;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(12),
+            Constraint::Length(if compact { 2 } else { 3 }),
+        ])
+        .split(area);
 
-    content_lines.push(Line::from(vec![Span::styled(
-        " BIN FIRMWARE FLASHER ",
-        Style::default()
-            .fg(COLOR_PRIMARY)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    content_lines.push(Line::from(""));
-
-    content_lines.push(Line::from(vec![Span::styled(
-        " INSTRUCTIONS: ",
-        Style::default()
-            .fg(COLOR_ACCENT)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    content_lines.push(Line::from(""));
-    content_lines.push(Line::from(vec![Span::raw(" 1. Turn OFF your radio")]));
-    content_lines.push(Line::from(vec![Span::raw(" 2. Hold PTT button")]));
-    content_lines.push(Line::from(vec![Span::raw(
-        " 3. While holding the button, turn ON the radio",
-    )]));
-    content_lines.push(Line::from(vec![Span::raw(
-        " 4. Select a .bin firmware file and press F to flash",
-    )]));
-    content_lines.push(Line::from(""));
-
-    if let Some(path) = &app.bin_file_path {
-        let path_str = path.to_string_lossy().into_owned();
-        content_lines.push(Line::from(vec![
-            Span::styled(
-                " Selected File: ",
-                Style::default()
-                    .fg(COLOR_ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(path_str, Style::default().fg(Color::White)),
-        ]));
-
-        if let Some(data) = &app.bin_firmware_data {
-            let size_kb = data.len() as f64 / 1024.0;
-            let blocks = data.len() / 32;
-            content_lines.push(Line::from(vec![
-                Span::styled(" Size: ", Style::default().fg(COLOR_ACCENT)),
-                Span::styled(
-                    format!("{:.1} KB ({} blocks)", size_kb, blocks),
-                    Style::default().fg(Color::White),
-                ),
-            ]));
-            content_lines.push(Line::from(""));
-        }
+    let file_ready = app.bin_firmware_data.is_some();
+    let radio_ready = app.protocol_port_name.is_some();
+    let flash_ready = file_ready && radio_ready;
+    let card_width = if compact {
+        chunks[0].width.saturating_sub(4).clamp(48, 64)
     } else {
-        content_lines.push(Line::from(vec![Span::raw(" No firmware file selected")]));
-        content_lines.push(Line::from(""));
-    }
+        chunks[0].width.saturating_sub(12).clamp(58, 78)
+    };
+    let card_height = if compact { 13 } else { 15 };
+    let card_col = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(card_width),
+            Constraint::Fill(1),
+        ])
+        .split(chunks[0]);
+    let card_row = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(card_height.min(chunks[0].height.saturating_sub(1))),
+            Constraint::Fill(1),
+        ])
+        .split(card_col[1]);
 
-    let connected = app.protocol_port_name.is_some();
-    content_lines.push(Line::from(vec![
-        Span::styled(" Connection: ", Style::default().fg(COLOR_ACCENT)),
-        if connected {
-            Span::styled("Connected", Style::default().fg(COLOR_SUCCESS))
-        } else {
-            Span::styled("Not Connected", Style::default().fg(Color::Red))
-        },
-    ]));
-
-    content_lines.push(Line::from(""));
-    content_lines.push(Line::from(vec![Span::styled(
-        " ACTIONS: ",
-        Style::default()
-            .fg(COLOR_PRIMARY)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    content_lines.push(Line::from(""));
-
-    content_lines.push(Line::from(vec![
-        Span::raw("    "),
-        render_shortcut("i"),
-        Span::raw("  Select .bin firmware file"),
-    ]));
-
-    if app.bin_firmware_data.is_some() && app.protocol_port_name.is_some() {
-        content_lines.push(Line::from(vec![
-            Span::raw("    "),
-            render_shortcut("f"),
-            Span::styled("  Start Flashing", Style::default().fg(COLOR_SUCCESS)),
-        ]));
-    }
-
-    let status_text = if app.bin_firmware_data.is_some() && app.protocol_port_name.is_none() {
-        Span::styled(
-            " (Connect to radio first)",
-            Style::default().fg(Color::Yellow),
-        )
-    } else if app.bin_firmware_data.is_none() {
-        Span::styled(
-            " (Select firmware file first)",
-            Style::default().fg(Color::Yellow),
-        )
+    let title = if flash_ready {
+        "Ready To Flash"
     } else {
-        Span::raw("")
+        "Flash Firmware"
+    };
+    let subtitle = if flash_ready {
+        "The image and radio are ready. Follow the last step to start."
+    } else if !file_ready {
+        "Import the firmware first, then follow the bootloader steps."
+    } else {
+        "The firmware is loaded. Put the radio into bootloader mode next."
     };
 
-    if app.bin_firmware_data.is_some() && app.protocol_port_name.is_some() {
-        content_lines.push(Line::from(status_text));
-    } else {
-        content_lines.push(Line::from(""));
-        content_lines.push(Line::from(status_text));
-    }
-
-    let content = Paragraph::new(content_lines).block(
+    let workflow = Paragraph::new(vec![
+        Line::from(Span::styled(
+            title,
+            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(subtitle, Style::default().fg(COLOR_DIM))),
+        Line::from(""),
+        workflow_step(
+            1,
+            vec![
+                Span::raw("Press "),
+                render_shortcut("i"),
+                Span::raw(" to import the firmware "),
+                Span::styled(".bin", Style::default().fg(COLOR_ACCENT)),
+            ],
+        ),
+        workflow_step(2, vec![Span::raw("Power the radio fully off")]),
+        workflow_step(
+            3,
+            vec![Span::raw(
+                "Hold PTT while powering on to enter bootloader mode",
+            )],
+        ),
+        workflow_step(
+            4,
+            vec![
+                Span::raw("Press "),
+                render_shortcut("f"),
+                Span::raw(" once the image and radio are both ready"),
+            ],
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            if flash_ready {
+                "Then hold PTT, power on, and press f."
+            } else if !file_ready {
+                "Start with step 1."
+            } else if radio_ready {
+                "The remaining step is bootloader mode."
+            } else {
+                "Connect the radio, then enter bootloader mode."
+            },
+            Style::default().fg(COLOR_DIM),
+        )),
+    ])
+    .style(Style::default().fg(COLOR_TEXT).bg(COLOR_SURFACE_1))
+    .wrap(Wrap { trim: true })
+    .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(COLOR_PRIMARY)),
+            .title(" Flash ")
+            .border_style(Style::default().fg(COLOR_BORDER))
+            .bg(COLOR_SURFACE_1),
     );
-    f.render_widget(content, area);
+    f.render_widget(workflow, card_row[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        render_shortcut("i"),
+        Span::raw(" import firmware | "),
+        render_shortcut("f"),
+        Span::raw(" flash"),
+    ]))
+    .style(Style::default().fg(COLOR_TEXT).bg(COLOR_SURFACE_1))
+    .block(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(COLOR_BORDER))
+            .bg(COLOR_SURFACE_1),
+    );
+    f.render_widget(footer, chunks[1]);
 }
 
 pub fn render_bin_flash_overlay(f: &mut Frame, app: &App, area: Rect) {
@@ -137,4 +141,15 @@ pub fn render_bin_flash_overlay(f: &mut Frame, app: &App, area: Rect) {
         "FLASHING IN PROGRESS",
         Some("1. Turn OFF radio\n2. Hold PTT, turn ON radio"),
     )
+}
+
+fn workflow_step(number: usize, content: Vec<Span<'static>>) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{number}. "),
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(content);
+    Line::from(spans)
 }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "NicTUI Radio CLI"
+  short_description: "Modify a NicSure-flashed TD-H3 through the NicTUI CLI"
+  default_prompt: "Use the installed nictui CLI to inspect or modify this radio safely. Start with `nictui probe --json`, stop if the firmware is not NicSure, create `.live-debug/ai-radio-session`, run `nictui doctor --output-dir .live-debug/ai-radio-session --json --codeplug` before the first write, prefer targeted single-record commands, run `--validate-only` before real writes, and re-read the changed item to verify the result."

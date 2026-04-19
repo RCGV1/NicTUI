@@ -1,0 +1,16 @@
+{
+  "name": "nictui-marketplace",
+  "owner": {
+    "name": "Benjamin Faershtein"
+  },
+  "plugins": [
+    {
+      "name": "nictui-radio-cli-plugin",
+      "source": "./plugins/nictui-radio-cli-plugin",
+      "description": "Adds the NicTUI CLI radio automation skill for Claude Code"
+    }
+  ],
+  "metadata": {
+    "description": "Marketplace for NicTUI automation skills and plugins"
+  }
+}

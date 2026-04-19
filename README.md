@@ -12,6 +12,7 @@ A terminal-based user interface for programming the TIDRADIO TD-H3 HAM radio.
 - **Codeplug Operations** - Import/export full codeplugs
 - **Firmware Flashing** - Flash firmware updates
 - **Remote Control** - Control the radio remotely via USB serial
+- **AI Skill Installer** - Install a bundled Codex or Claude Code skill that drives the NicTUI CLI
 
 ## Installation
 
@@ -34,7 +35,7 @@ This will:
 source ~/.bashrc  # or ~/.zshrc, ~/.profile, etc.
 ```
 
-Then start NicTUI with:
+Then start the interactive UI with:
 ```bash
 nictui
 ```
@@ -85,15 +86,253 @@ nictui --version
 ### Uninstall
 
 ```bash
-~/.local/bin/nictui --uninstall
+rm -f ~/.local/bin/nictui
 ```
 
 ## Usage
+
+Running `nictui` with no arguments launches the full-screen TUI.
 
 1. Connect your TD-H3 radio to the computer via USB
 2. Select the appropriate serial port
 3. Use the arrow keys to navigate between tabs
 4. Press the indicated keys to perform actions
+
+When you exit the TUI, NicTUI will print a hint about the bundled AI skill if it detects `codex` or `claude` on your system.
+
+## AI Skill
+
+NicTUI ships with a bundled skill for Codex and Claude Code. The skill uses the NicTUI CLI only, requires NicSure mod firmware on the radio, backs up the radio data it changes, prefers targeted updates over bulk writes, and runs `--validate-only` before real writes.
+
+Install into detected agent directories:
+
+```bash
+nictui skill install
+```
+
+Inspect the bundled skill and install paths:
+
+```bash
+nictui skill show
+nictui skill paths
+```
+
+Force a specific target:
+
+```bash
+nictui skill install --agent codex
+nictui skill install --agent claude
+nictui skill install --agent all
+```
+
+Installed locations:
+
+- Codex: `$CODEX_HOME/skills/nictui-radio-cli` or `~/.codex/skills/nictui-radio-cli`
+- Claude Code: `~/.claude/skills/nictui-radio-cli`
+
+### Publishing and Discovery
+
+This repo also includes a Claude Code marketplace definition at [.claude-plugin/marketplace.json](.claude-plugin/marketplace.json) and a plugin package at [plugins/nictui-radio-cli-plugin](plugins/nictui-radio-cli-plugin). That gives Claude Code users a directory-style install path through the official plugin marketplace flow.
+
+For local validation and install testing:
+
+```bash
+claude plugin validate .
+claude plugin marketplace add ./ --scope user
+claude plugin install nictui-radio-cli-plugin@nictui-marketplace
+```
+
+For Codex, the bundled skill lives at [skills/nictui-radio-cli](skills/nictui-radio-cli). Codex does not currently expose a first-party skill marketplace in this repo, so the practical distribution path is to host the skill in a public GitHub repository and submit it to a community registry that indexes GitHub-hosted Codex skills.
+
+## CLI
+
+NicTUI now includes a non-interactive CLI for scripting, inspection, and batch workflows.
+When `--port` is omitted, NicTUI will automatically select the only detected port or the only likely radio USB serial port if auxiliary Bluetooth/debug ports are also present.
+The safest non-interactive workflow is: `ports` -> `probe` -> `read` -> `--validate-only` -> actual write.
+If `probe` reports `stock/original` firmware, install NicSure mod firmware before using NicTUI live read/write commands.
+For focused edits, prefer the single-record commands like `channels get`, `channels update`, `settings get`, and `settings set`.
+Use `ports --verbose` or `ports --json` when you need precise port metadata, and `probe --json` when an agent or script needs structured radio facts.
+
+### Discover Ports
+
+```bash
+nictui ports
+nictui ports --verbose
+nictui ports --json
+nictui probe --port /dev/cu.usbserial-210
+nictui probe --json
+```
+
+### Recommended Health Check
+
+```bash
+# Quick read-only check
+nictui doctor --port /dev/cu.usbserial-210
+
+# Save JSON artifacts for every readable section
+nictui doctor --port /dev/cu.usbserial-210 --output-dir ./doctor-artifacts
+
+# Include the full EEPROM dump and print the report as JSON
+nictui doctor --port /dev/cu.usbserial-210 --codeplug --json --output-dir ./doctor-artifacts
+```
+
+### Work With Channels
+
+```bash
+# Read channels from the radio to CSV
+nictui channels read --port /dev/cu.usbserial-210 --output channels.csv
+
+# Read channels as JSON to stdout
+nictui channels read --port /dev/cu.usbserial-210
+
+# Validate a CSV or JSON channel file without touching the radio
+nictui channels write --input channels.json --validate-only
+
+# Write channels from CSV or JSON back to the radio
+nictui channels write --port /dev/cu.usbserial-210 --input channels.csv --reboot
+```
+
+### Target One Channel
+
+```bash
+# Read one channel as JSON
+nictui channels get --port /dev/cu.usbserial-210 --channel 25
+
+# Save one channel as CSV or JSON
+nictui channels get --port /dev/cu.usbserial-210 --channel 25 --output channel-25.json
+nictui channels get --port /dev/cu.usbserial-210 --channel 25 --output channel-25.csv
+
+# Validate a one-channel patch file without touching the radio
+nictui channels update --channel 25 --input channel-25.json --validate-only
+
+# Replace one channel slot from a single CSV row or JSON record
+nictui channels update --port /dev/cu.usbserial-210 --channel 25 --input channel-25.json
+
+# Clear one channel slot
+nictui channels clear --port /dev/cu.usbserial-210 --channel 25
+
+# Clear an inclusive range of channel slots
+nictui channels clear-range --port /dev/cu.usbserial-210 --start 26 --end 198
+```
+
+### Read Radio Sections
+
+```bash
+nictui settings read --port /dev/cu.usbserial-210 --output settings.json
+
+nictui scan-presets read --port /dev/cu.usbserial-210 --output scan-presets.json
+
+nictui band-plan read --port /dev/cu.usbserial-210 --output band-plan.json
+
+nictui dtmf read --port /dev/cu.usbserial-210 --output dtmf.json
+```
+
+### Target One Setting
+
+```bash
+# Read one setting by menu number
+nictui settings get --port /dev/cu.usbserial-210 --setting 17
+
+# Read one setting by name
+nictui settings get --port /dev/cu.usbserial-210 --setting "LCD Brightness"
+
+# Validate one setting change without touching the radio
+nictui settings set --setting 17 --value 12 --validate-only
+
+# Update one setting by menu number or name
+nictui settings set --port /dev/cu.usbserial-210 --setting 17 --value 12
+nictui settings set --port /dev/cu.usbserial-210 --setting "Key Tones" --value Voice
+```
+
+### Validate Before Writing
+
+```bash
+nictui settings write --input settings.json --validate-only
+nictui scan-presets write --input scan-presets.json --validate-only
+nictui band-plan write --input band-plan.json --validate-only
+nictui dtmf write --input dtmf.json --validate-only
+nictui codeplug write --input radio.nfw --validate-only
+nictui firmware flash --input firmware.bin --validate-only
+```
+
+### Write Radio Sections
+
+```bash
+nictui settings write --port /dev/cu.usbserial-210 --input settings.json
+nictui scan-presets write --port /dev/cu.usbserial-210 --input scan-presets.json
+nictui band-plan write --port /dev/cu.usbserial-210 --input band-plan.json
+nictui dtmf write --port /dev/cu.usbserial-210 --input dtmf.json
+```
+
+### Target One Indexed Record
+
+```bash
+# Read one scan preset, band plan, or DTMF preset
+nictui scan-presets get --port /dev/cu.usbserial-210 --index 2
+nictui band-plan get --port /dev/cu.usbserial-210 --index 4
+nictui dtmf get --port /dev/cu.usbserial-210 --index 1
+
+# Validate one record update without touching the radio
+nictui scan-presets update --index 2 --input scan-preset-2.json --validate-only
+nictui band-plan update --index 4 --input band-plan-4.json --validate-only
+nictui dtmf update --index 1 --input dtmf-1.json --validate-only
+
+# Update one record in place
+nictui scan-presets update --port /dev/cu.usbserial-210 --index 2 --input scan-preset-2.json
+nictui band-plan update --port /dev/cu.usbserial-210 --index 4 --input band-plan-4.json
+nictui dtmf update --port /dev/cu.usbserial-210 --index 1 --input dtmf-1.json
+```
+
+### Read, Inspect, or Write Codeplugs
+
+```bash
+# Read the full EEPROM into a .nfw file
+nictui codeplug read --port /dev/cu.usbserial-210 --output radio.nfw
+
+# Inspect a codeplug summary
+nictui codeplug inspect --input radio.nfw
+
+# Dump the full inspection payload as JSON
+nictui codeplug inspect --input radio.nfw --json
+
+# Validate a .nfw file before writing it
+nictui codeplug write --input radio.nfw --validate-only
+
+# Write a .nfw file back to the radio
+nictui codeplug write --port /dev/cu.usbserial-210 --input radio.nfw
+```
+
+### Flash Firmware
+
+```bash
+# Validate the firmware image first
+nictui firmware flash --input firmware.bin --validate-only
+
+# Flash the validated image
+nictui firmware flash --port /dev/cu.usbserial-210 --input firmware.bin
+```
+
+### Serial Port Notes
+
+- Only one NicTUI or serial tool can own `/dev/cu.*` at a time.
+- If a command says the port is busy, close other NicTUI sessions, serial monitors, or flashing tools first.
+- For repeatable scripting, prefer `/dev/cu.*` instead of `/dev/tty.*` on macOS.
+
+### Remote CLI
+
+```bash
+nictui remote key --port /dev/cu.usbserial-210 --key flashlight
+nictui remote key --port /dev/cu.usbserial-210 --key ptt-a
+```
+
+### Full Help
+
+```bash
+nictui --help
+nictui channels --help
+nictui settings write --help
+nictui codeplug inspect --help
+```
 
 ### Key Bindings
 
@@ -143,6 +382,39 @@ nictui --version
 **BIN Flash Tab:**
 - `i` - Import firmware file
 - `f` - Start flash
+
+## UI Capture Pipeline
+
+For TUI polish work on macOS, NicTUI includes a local capture script that can launch the debug TUI, send navigation keys, and save a screenshot plus JSON metadata.
+
+Example:
+
+```bash
+python3 scripts/tui_capture_macos.py \
+  --build \
+  --port /dev/cu.usbserial-2110 \
+  --keys "r,wait:2,down,down" \
+  --output .ui-captures/channels-review.png
+```
+
+The script prints two paths:
+
+- the captured PNG
+- a JSON file with the launch command, key script, and captured window bounds
+
+Useful options:
+
+```bash
+python3 scripts/tui_capture_macos.py --help
+python3 scripts/tui_capture_macos.py --keys "tab,wait:1,down"
+python3 scripts/tui_capture_macos.py --keep-window
+```
+
+Key script tokens support single characters plus named keys such as `up`, `down`, `left`, `right`, `tab`, `backtab`, `enter`, `esc`, and `wait:SECONDS`.
+
+If you use `--keys`, macOS must allow `osascript` / Terminal under **System Settings > Privacy & Security > Accessibility** so the script can send navigation keystrokes into the TUI.
+
+For Codex-driven UI iteration, run the capture script, then attach the generated PNG in the next prompt or reference the saved path directly.
 
 ## Building from Source
 

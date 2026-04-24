@@ -9,6 +9,9 @@ use crate::device::PortCandidate;
 use crate::protocol::{
     BandPlan, Channel, DTMFPreset, Endianness, RemotePacket, ScanPreset, SettingsBlock,
 };
+use crate::remote::{
+    RemoteControlCommand, RemoteControlReport, RemoteSessionFailure, RemoteSessionPhase,
+};
 
 #[derive(PartialEq, Clone, Debug)]
 pub enum AppMode {
@@ -34,10 +37,19 @@ pub struct RemoteScreen {
     pub noise_level: u8,
     pub leds: u8,
     pub battery_level: Option<u8>,
+    pub battery_text: Option<String>,
+    pub last_small_status: Option<(u8, u8, u8)>,
     pub last_signal_update: Option<std::time::Instant>,
     pub last_noise_update: Option<std::time::Instant>,
     pub last_battery_update: Option<std::time::Instant>,
+    pub last_text_update: Option<std::time::Instant>,
+    pub last_status_update: Option<std::time::Instant>,
     pub last_led_update: Option<std::time::Instant>,
+    pub phase: RemoteSessionPhase,
+    pub last_control_report: Option<RemoteControlReport>,
+    pub last_failure: Option<RemoteSessionFailure>,
+    pub last_delta: Option<String>,
+    pub unknown_packet_count: usize,
 }
 
 #[derive(PartialEq, Clone, Debug, Copy)]
@@ -58,15 +70,23 @@ pub enum AppEvent {
     Progress(f64),
     Status(String),
     Log(String),
+    BleScanComplete(Vec<PortCandidate>),
+    BleScanFailed(String),
     ReadChannelsComplete(Vec<Channel>, Endianness),
     ReadGroupLabelsComplete(Vec<String>),
     ReadPresetsComplete(Vec<ScanPreset>),
     ReadBandPlanComplete(Vec<BandPlan>),
     ReadDTMFComplete(Vec<DTMFPreset>),
     ReadSettingsComplete(SettingsBlock, Endianness),
+    RemotePhase(RemoteSessionPhase),
+    RemoteControl(RemoteControlReport),
+    RemoteDelta(String),
     RemotePacket(RemotePacket),
-    RemoteStopped(String),
-    WriteComplete,
+    RemoteStopped {
+        message: String,
+        failure: Option<RemoteSessionFailure>,
+    },
+    WriteComplete(WriteScope),
     LoadCSV(PathBuf),
     WriteCSV(PathBuf),
     ExportCSV(PathBuf),
@@ -96,7 +116,19 @@ pub enum AppEvent {
     ResumeUI,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteScope {
+    Channels,
+    Dtmf,
+    GroupLabels,
+    Settings,
+    Codeplug,
+    None,
+}
+
 pub struct App {
+    pub serial_port_candidates: Vec<PortCandidate>,
+    pub ble_port_candidates: Vec<PortCandidate>,
     pub mode: AppMode,
     pub port_candidates: Vec<PortCandidate>,
     pub ports: Vec<String>,
@@ -119,6 +151,9 @@ pub struct App {
     pub settings_state: TableState,
     pub remote_screen: RemoteScreen,
     pub protocol_port_name: Option<String>,
+    pub ble_scan_in_progress: bool,
+    pub ble_scan_ui_suspended: bool,
+    pub ble_reconnect_required: bool,
     pub progress: f64,
     pub status_message: String,
     pub logs: VecDeque<String>,
@@ -129,7 +164,7 @@ pub struct App {
     pub event_rx: Receiver<AppEvent>,
     pub remote_active: bool,
     pub remote_stop_signal: Arc<AtomicBool>,
-    pub remote_tx: Option<Sender<u8>>,
+    pub remote_tx: Option<Sender<RemoteControlCommand>>,
     pub last_main_tab: MainTab,
     pub last_non_remote_tab: MainTab,
     pub settings_dirty: bool,

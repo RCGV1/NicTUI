@@ -50,7 +50,7 @@ pub fn render_debug_logs(f: &mut Frame, app: &App, area: Rect) {
 
     let hero = Paragraph::new(vec![
         Line::from(Span::styled(
-            "Activity Debug",
+            "Activity Logs",
             Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(

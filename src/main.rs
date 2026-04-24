@@ -48,6 +48,8 @@ fn launch_tui(port: Option<String>) -> Result<()> {
     let mut app = App::new();
     if let Some(port_name) = port {
         app.connect_to_port_by_name(&port_name);
+    } else if should_auto_start_ble_scan() {
+        app.start_ble_scan(should_prepare_ui_for_startup_ble_scan());
     }
     let res = run_app(&mut terminal, &mut app);
 
@@ -66,6 +68,14 @@ fn launch_tui(port: Option<String>) -> Result<()> {
     print_post_exit_skill_hint();
 
     Ok(())
+}
+
+fn should_auto_start_ble_scan() -> bool {
+    true
+}
+
+fn should_prepare_ui_for_startup_ble_scan() -> bool {
+    cfg!(target_os = "macos")
 }
 
 fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
@@ -109,7 +119,8 @@ where
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Up => app.previous_port(),
                     KeyCode::Down => app.next_port(),
-                    KeyCode::Char('r') => app.refresh_ports(),
+                    KeyCode::Char('r') => app.refresh_radio_targets_from_tui(),
+                    KeyCode::Char('b') => app.start_ble_scan_from_tui(),
                     KeyCode::Enter => app.select_port(),
                     _ => {}
                 },
@@ -289,26 +300,26 @@ fn maybe_send_remote_key(app: &mut App, code: KeyCode) -> bool {
     }
 
     let key = match code {
-        KeyCode::Char('0') => Some(0x80),
-        KeyCode::Char('1') => Some(0x81),
-        KeyCode::Char('2') => Some(0x82),
-        KeyCode::Char('3') => Some(0x83),
-        KeyCode::Char('4') => Some(0x84),
-        KeyCode::Char('5') => Some(0x85),
-        KeyCode::Char('6') => Some(0x86),
-        KeyCode::Char('7') => Some(0x87),
-        KeyCode::Char('8') => Some(0x88),
-        KeyCode::Char('9') => Some(0x89),
-        KeyCode::Enter | KeyCode::Char('m') => Some(0x8A),
-        KeyCode::Up | KeyCode::Char('u') => Some(0x8B),
-        KeyCode::Down | KeyCode::Char('d') => Some(0x8C),
-        KeyCode::Esc | KeyCode::Char('e') => Some(0x8D),
-        KeyCode::Char('*') => Some(0x8E),
-        KeyCode::Char('#') => Some(0x8F),
-        KeyCode::Char('a') => Some(0x90),
-        KeyCode::Char('b') => Some(0x91),
-        KeyCode::Char('f') => Some(0x92),
-        KeyCode::Char('v') => Some(0x94),
+        KeyCode::Char('0') => Some(0x01),
+        KeyCode::Char('1') => Some(0x02),
+        KeyCode::Char('2') => Some(0x03),
+        KeyCode::Char('3') => Some(0x04),
+        KeyCode::Char('4') => Some(0x05),
+        KeyCode::Char('5') => Some(0x06),
+        KeyCode::Char('6') => Some(0x07),
+        KeyCode::Char('7') => Some(0x08),
+        KeyCode::Char('8') => Some(0x09),
+        KeyCode::Char('9') => Some(0x0A),
+        KeyCode::Enter | KeyCode::Char('m') => Some(0x0B),
+        KeyCode::Up | KeyCode::Char('u') => Some(0x0C),
+        KeyCode::Down | KeyCode::Char('d') => Some(0x0D),
+        KeyCode::Esc | KeyCode::Char('e') => Some(0x0E),
+        KeyCode::Char('*') => Some(0x0F),
+        KeyCode::Char('#') => Some(0x10),
+        KeyCode::Char('a') => Some(0x13),
+        KeyCode::Char('b') => Some(0x1A),
+        KeyCode::Char('f') => Some(0x12),
+        KeyCode::Char('v') => Some(0x11),
         _ => None,
     };
 
@@ -323,6 +334,19 @@ fn maybe_send_remote_key(app: &mut App, code: KeyCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_ble_auto_scan_matches_platform_policy() {
+        assert!(should_auto_start_ble_scan());
+    }
+
+    #[test]
+    fn startup_ble_scan_prepares_ui_only_when_platform_needs_it() {
+        assert_eq!(
+            should_prepare_ui_for_startup_ble_scan(),
+            cfg!(target_os = "macos")
+        );
+    }
 
     #[test]
     fn live_remote_tab_keeps_digit_shortcuts_for_keypad() {

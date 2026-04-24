@@ -1,5 +1,6 @@
 use crate::app::App;
 use crate::app::MainTab;
+use crate::protocol::SETTINGS_METADATA;
 use crate::ui::theme::{
     COLOR_BORDER, COLOR_DIM, COLOR_PRIMARY, COLOR_SELECTION_BG, COLOR_SELECTION_FG, COLOR_SIDEBAR,
     COLOR_SUCCESS, COLOR_SURFACE_2, COLOR_TEXT, COLOR_WARNING,
@@ -27,17 +28,10 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
         .constraints([Constraint::Length(7), Constraint::Min(0)])
         .split(inner);
     let content_width = sections[1].width.saturating_sub(2) as usize;
+    let session_width = sections[0].width.saturating_sub(4) as usize;
 
-    let connected = app.protocol_port_name.is_some();
-    let port_label = app
-        .protocol_port_name
-        .as_deref()
-        .or_else(|| {
-            app.selected_port_candidate()
-                .map(|candidate| candidate.port_name.as_str())
-        })
-        .map(|port| port.rsplit('/').next().unwrap_or(port))
-        .unwrap_or("not selected");
+    let has_target = app.selected_port_candidate().is_some();
+    let port_label = app.selected_port_short_label();
     let changes = [
         app.channels_dirty || !app.deleted_channels.is_empty(),
         app.settings_dirty,
@@ -47,6 +41,14 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
     .into_iter()
     .filter(|dirty| *dirty)
     .count();
+    let transport_summary = app.selected_port_status();
+    let dirty_label = if changes == 0 {
+        "Clean".to_string()
+    } else {
+        format!("{changes} dirty")
+    };
+    let (transport_display, dirty_display) =
+        fit_session_status(&transport_summary, &dirty_label, session_width);
     let overview = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -58,25 +60,32 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
             ),
             Span::raw(" "),
             Span::styled(
-                if connected { "live" } else { "idle" },
+                if has_target { "ready" } else { "idle" },
                 Style::default()
-                    .fg(if connected { COLOR_SUCCESS } else { COLOR_DIM })
+                    .fg(if has_target { COLOR_SUCCESS } else { COLOR_DIM })
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(Span::styled(port_label, Style::default().fg(COLOR_TEXT))),
         Line::from(Span::styled(
-            if changes == 0 {
-                "Clean".to_string()
-            } else {
-                format!("{changes} dirty")
-            },
-            Style::default().fg(if changes == 0 {
-                COLOR_DIM
-            } else {
-                COLOR_WARNING
-            }),
+            fit_word_boundary(&port_label, session_width),
+            Style::default().fg(COLOR_TEXT),
         )),
+        Line::from(vec![
+            Span::styled(transport_display, Style::default().fg(COLOR_DIM)),
+            Span::raw(if dirty_display.is_empty() || session_width < 8 {
+                ""
+            } else {
+                "  "
+            }),
+            Span::styled(
+                dirty_display,
+                Style::default().fg(if changes == 0 {
+                    COLOR_DIM
+                } else {
+                    COLOR_WARNING
+                }),
+            ),
+        ]),
     ])
     .block(
         Block::default()
@@ -141,7 +150,7 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
         (
             0,
             MainTab::Debug,
-            "Debug",
+            "Logs",
             sidebar_badge(app, MainTab::Debug),
         ),
     ];
@@ -217,11 +226,12 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
     f.render_widget(list, body_chunks[0]);
 
     if body_chunks.len() > 1 {
-        let context = Paragraph::new(sidebar_context_lines(app, active_tab))
+        let action_width = body_chunks[1].width.saturating_sub(4) as usize;
+        let context = Paragraph::new(sidebar_context_lines(app, active_tab, action_width))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Focus ")
+                    .title(" Actions ")
                     .border_style(Style::default().fg(COLOR_BORDER))
                     .bg(COLOR_SURFACE_2)
                     .padding(Padding::horizontal(1)),
@@ -230,6 +240,29 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
             .wrap(ratatui::widgets::Wrap { trim: true });
         f.render_widget(context, body_chunks[1]);
     }
+}
+
+fn fit_session_status(transport: &str, dirty: &str, max_width: usize) -> (String, String) {
+    if max_width == 0 {
+        return (String::new(), String::new());
+    }
+
+    let dirty = dirty.trim();
+    let dirty_width = dirty.chars().count();
+    if dirty_width >= max_width {
+        return (String::new(), fit_word_boundary(dirty, max_width));
+    }
+
+    let gap = if dirty.is_empty() { 0 } else { 2 };
+    let transport_width = max_width.saturating_sub(dirty_width + gap);
+    if transport_width == 0 {
+        return (String::new(), dirty.to_string());
+    }
+
+    (
+        fit_word_boundary(transport, transport_width),
+        dirty.to_string(),
+    )
 }
 
 fn fit_sidebar_row(
@@ -254,7 +287,7 @@ fn fit_sidebar_row(
         available
     };
     let label = if label.chars().count() > label_width {
-        let compact = compact_sidebar_label(label);
+        let compact = compact_sidebar_label(label, label_width);
         if compact.chars().count() <= label_width {
             compact
         } else {
@@ -265,32 +298,63 @@ fn fit_sidebar_row(
     };
 
     (
-        truncate_text(label, label_width),
+        fit_word_boundary(label, label_width),
         if show_badge {
-            truncate_text(badge, badge.len())
+            fit_word_boundary(badge, badge.len())
         } else {
             String::new()
         },
     )
 }
 
-fn compact_sidebar_label(label: &str) -> &str {
-    match label {
-        "Scan Presets" => "Scan",
-        "Memory Groups" => "Groups",
+fn compact_sidebar_label(label: &str, max_width: usize) -> &str {
+    match (label, max_width) {
+        ("Scan Presets", _) => "Scan",
+        ("Memory Groups", 0..=5) => "Grp",
+        ("Memory Groups", _) => "Groups",
         _ => label,
     }
 }
 
-fn truncate_text(value: &str, max_width: usize) -> String {
-    value.chars().take(max_width).collect()
+fn fit_word_boundary(value: &str, max_width: usize) -> String {
+    let value = value.trim();
+    if value.chars().count() <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width <= 2 {
+        return value.chars().take(max_width).collect();
+    }
+
+    let marker = "..";
+    let room = max_width.saturating_sub(marker.len());
+    let mut fitted = String::new();
+
+    for word in value.split_whitespace() {
+        let next_width =
+            fitted.chars().count() + usize::from(!fitted.is_empty()) + word.chars().count();
+        if next_width > room {
+            break;
+        }
+        if !fitted.is_empty() {
+            fitted.push(' ');
+        }
+        fitted.push_str(word);
+    }
+
+    if fitted.is_empty() {
+        fitted = value.chars().take(room).collect();
+    }
+    format!("{}{}", fitted.trim_end(), marker)
 }
 
 fn sidebar_badge(app: &App, tab: MainTab) -> String {
     match tab {
         MainTab::Channels => {
             let mut badge = if app.channels.is_empty() {
-                "--".to_string()
+                String::new()
             } else {
                 app.channels.len().to_string()
             };
@@ -301,29 +365,33 @@ fn sidebar_badge(app: &App, tab: MainTab) -> String {
         }
         MainTab::Settings => {
             let mut badge = if app.settings.is_some() {
-                String::new()
+                SETTINGS_METADATA.len().to_string()
             } else {
-                "--".to_string()
+                String::new()
             };
             if app.settings_dirty {
-                badge = "*".to_string();
+                badge.push('*');
             }
             badge
         }
         MainTab::Scanning => {
             if app.scan_presets.is_empty() {
-                "--".to_string()
+                String::new()
             } else {
                 app.scan_presets.len().to_string()
             }
         }
         MainTab::MemoryGroups => {
-            let mut badge = app
+            let named_groups = app
                 .group_labels
                 .iter()
                 .filter(|label| !label.trim().is_empty())
-                .count()
-                .to_string();
+                .count();
+            let mut badge = if named_groups == 0 {
+                String::new()
+            } else {
+                named_groups.to_string()
+            };
             if app.group_labels_dirty {
                 badge.push('*');
             }
@@ -331,14 +399,14 @@ fn sidebar_badge(app: &App, tab: MainTab) -> String {
         }
         MainTab::BandPlan => {
             if app.band_plans.is_empty() {
-                "--".to_string()
+                String::new()
             } else {
                 app.band_plans.len().to_string()
             }
         }
         MainTab::DTMF => {
             let mut badge = if app.dtmf_presets.is_empty() {
-                "--".to_string()
+                String::new()
             } else {
                 app.dtmf_presets.len().to_string()
             };
@@ -358,67 +426,42 @@ fn sidebar_badge(app: &App, tab: MainTab) -> String {
             if app.codeplug_data.is_some() {
                 "nfw".to_string()
             } else {
-                "--".to_string()
+                String::new()
             }
         }
         MainTab::BinFlash => {
             if app.bin_firmware_data.is_some() {
                 "bin".to_string()
             } else {
-                "--".to_string()
+                String::new()
             }
         }
         MainTab::Debug => String::new(),
     }
 }
 
-fn sidebar_context_lines(app: &App, active_tab: MainTab) -> Vec<Line<'static>> {
+fn sidebar_context_lines(app: &App, active_tab: MainTab, width: usize) -> Vec<Line<'static>> {
     match active_tab {
-        MainTab::Channels => app
-            .channel_state
-            .selected()
-            .and_then(|index| app.channels.get(index))
-            .map(|channel| {
-                vec![
-                    Line::from(Span::styled(
-                        if channel.name.is_empty() {
-                            format!("CH {:03}", channel.channel_num)
-                        } else {
-                            format!("CH {:03} {}", channel.channel_num, channel.name)
-                        },
-                        Style::default()
-                            .fg(COLOR_PRIMARY)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(Span::styled(
-                        format!(
-                            "{} {} / {}",
-                            channel.modulation, channel.rx_freq, channel.tx_freq
-                        ),
-                        Style::default().fg(COLOR_TEXT),
-                    )),
-                    Line::from(Span::styled(
-                        "Enter edit | R read",
-                        Style::default().fg(COLOR_DIM),
-                    )),
-                ]
-            })
-            .unwrap_or_else(|| {
-                vec![
-                    Line::from(Span::styled(
-                        "No selection",
-                        Style::default().fg(COLOR_DIM).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(Span::styled(
-                        "Read or import channels",
-                        Style::default().fg(COLOR_TEXT),
-                    )),
-                    Line::from(Span::styled(
-                        "R reads radio",
-                        Style::default().fg(COLOR_DIM),
-                    )),
-                ]
-            }),
+        MainTab::Channels => vec![
+            Line::from(Span::styled(
+                "Channels",
+                Style::default()
+                    .fg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                if app.channels.is_empty() {
+                    fit_word_boundary("Read radio or import", width)
+                } else {
+                    fit_word_boundary("Enter edits row", width)
+                },
+                Style::default().fg(COLOR_TEXT),
+            )),
+            Line::from(Span::styled(
+                fit_word_boundary("R read  N new  D delete", width),
+                Style::default().fg(COLOR_DIM),
+            )),
+        ],
         MainTab::Settings => vec![
             Line::from(Span::styled(
                 "Settings",
@@ -428,14 +471,14 @@ fn sidebar_context_lines(app: &App, active_tab: MainTab) -> Vec<Line<'static>> {
             )),
             Line::from(Span::styled(
                 if app.settings.is_some() {
-                    "Enter edits"
+                    fit_word_boundary("Enter edits field", width)
                 } else {
-                    "Read settings first"
+                    fit_word_boundary("Read settings first", width)
                 },
                 Style::default().fg(COLOR_TEXT),
             )),
             Line::from(Span::styled(
-                "R reads  •  W writes",
+                fit_word_boundary("R read  W write", width),
                 Style::default().fg(COLOR_DIM),
             )),
         ],
@@ -448,13 +491,16 @@ fn sidebar_context_lines(app: &App, active_tab: MainTab) -> Vec<Line<'static>> {
             )),
             Line::from(Span::styled(
                 if app.scan_presets.is_empty() {
-                    "No presets loaded"
+                    fit_word_boundary("No presets loaded", width)
                 } else {
-                    "Enter edits"
+                    fit_word_boundary("Enter edits", width)
                 },
                 Style::default().fg(COLOR_TEXT),
             )),
-            Line::from(Span::styled("R refreshes", Style::default().fg(COLOR_DIM))),
+            Line::from(Span::styled(
+                fit_word_boundary("R refresh", width),
+                Style::default().fg(COLOR_DIM),
+            )),
         ],
         _ => vec![
             Line::from(Span::styled(
@@ -464,11 +510,11 @@ fn sidebar_context_lines(app: &App, active_tab: MainTab) -> Vec<Line<'static>> {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                "Tab keys switch views",
+                fit_word_boundary("Tab switches views", width),
                 Style::default().fg(COLOR_TEXT),
             )),
             Line::from(Span::styled(
-                "Tab / 1-9 navigate",
+                fit_word_boundary("1-9 navigate", width),
                 Style::default().fg(COLOR_DIM),
             )),
         ],
@@ -477,7 +523,8 @@ fn sidebar_context_lines(app: &App, active_tab: MainTab) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use super::fit_sidebar_row;
+    use super::{fit_session_status, fit_sidebar_row, fit_word_boundary, sidebar_badge};
+    use crate::app::{App, MainTab};
 
     #[test]
     fn sidebar_row_keeps_channel_count_visible() {
@@ -491,5 +538,34 @@ mod tests {
         let (label, badge) = fit_sidebar_row(6, "Remote", "idle", 20);
         assert_eq!(label, "Remote");
         assert_eq!(badge, "idle");
+    }
+
+    #[test]
+    fn sidebar_row_compacts_labels_without_half_words() {
+        let (label, badge) = fit_sidebar_row(4, "Memory Groups", "", 10);
+        assert_eq!(label, "Grp");
+        assert_eq!(badge, "");
+    }
+
+    #[test]
+    fn word_boundary_fit_prefers_whole_words() {
+        assert_eq!(fit_word_boundary("BLE reconnect needed", 14), "BLE..");
+        assert_eq!(fit_word_boundary("Clean", 4), "Cl..");
+    }
+
+    #[test]
+    fn session_status_preserves_clean_label() {
+        let (transport, dirty) = fit_session_status("BLE reconnect needed -69 dBm", "Clean", 18);
+        assert_eq!(transport, "BLE..");
+        assert_eq!(dirty, "Clean");
+    }
+
+    #[test]
+    fn empty_sidebar_badges_do_not_render_placeholders() {
+        let app = App::new();
+        assert_eq!(sidebar_badge(&app, MainTab::Channels), "");
+        assert_eq!(sidebar_badge(&app, MainTab::Settings), "");
+        assert_eq!(sidebar_badge(&app, MainTab::MemoryGroups), "");
+        assert_eq!(sidebar_badge(&app, MainTab::Codeplug), "");
     }
 }

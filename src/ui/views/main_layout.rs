@@ -21,9 +21,9 @@ pub fn render_main_layout(f: &mut Frame, app: &mut App, area: Rect, tab: MainTab
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
-            Constraint::Min(0),
             Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(2),
         ])
         .split(area);
 

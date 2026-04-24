@@ -15,9 +15,11 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 pub mod app;
+pub mod ble;
 pub mod channel_file;
 pub mod cli;
 pub mod device;
 pub mod protocol;
+pub mod remote;
 pub mod skill;
 pub mod ui;

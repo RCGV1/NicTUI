@@ -45,10 +45,11 @@ pub(crate) fn render_progress_overlay(
             .style(Style::default().fg(COLOR_ACCENT));
         f.render_widget(instruction_text, chunks[0]);
 
-        let status = Paragraph::new(app.status_message.as_str())
+        let status = Paragraph::new(sanitized_progress_status(&app.status_message))
             .alignment(ratatui::layout::Alignment::Center);
         f.render_widget(status, chunks[1]);
 
+        let progress_percent = progress_percent(app.progress);
         let gauge = Gauge::default()
             .gauge_style(
                 Style::default()
@@ -56,8 +57,8 @@ pub(crate) fn render_progress_overlay(
                     .bg(COLOR_SURFACE_1)
                     .add_modifier(Modifier::BOLD),
             )
-            .percent((app.progress * 100.0) as u16)
-            .label(format!("{:.1}%", app.progress * 100.0));
+            .percent(progress_percent)
+            .label(format!("{}%", progress_percent));
         f.render_widget(gauge, chunks[2]);
 
         let help = Paragraph::new("Press Esc to abort")
@@ -74,10 +75,11 @@ pub(crate) fn render_progress_overlay(
             ])
             .split(inner_area);
 
-        let status = Paragraph::new(app.status_message.as_str())
+        let status = Paragraph::new(sanitized_progress_status(&app.status_message))
             .alignment(ratatui::layout::Alignment::Center);
         f.render_widget(status, chunks[0]);
 
+        let progress_percent = progress_percent(app.progress);
         let gauge = Gauge::default()
             .gauge_style(
                 Style::default()
@@ -85,8 +87,8 @@ pub(crate) fn render_progress_overlay(
                     .bg(COLOR_SURFACE_1)
                     .add_modifier(Modifier::BOLD),
             )
-            .percent((app.progress * 100.0) as u16)
-            .label(format!("{:.1}%", app.progress * 100.0));
+            .percent(progress_percent)
+            .label(format!("{}%", progress_percent));
         f.render_widget(gauge, chunks[1]);
 
         let help = Paragraph::new("Press Esc to cancel")
@@ -94,6 +96,27 @@ pub(crate) fn render_progress_overlay(
             .style(Style::default().fg(COLOR_DIM));
         f.render_widget(help, chunks[2]);
     }
+}
+
+fn progress_percent(progress: f64) -> u16 {
+    if !progress.is_finite() {
+        return 0;
+    }
+
+    progress.clamp(0.0, 1.0).mul_add(100.0, 0.0).round() as u16
+}
+
+fn sanitized_progress_status(status: &str) -> String {
+    if let Some(rest) = status.strip_prefix("Opening ")
+        && let Some((_, action)) = rest.split_once(" and ")
+    {
+        let mut chars = action.chars();
+        if let Some(first) = chars.next() {
+            return first.to_uppercase().collect::<String>() + chars.as_str();
+        }
+    }
+
+    status.to_string()
 }
 
 pub(crate) fn render_error(f: &mut Frame, msg: &str, area: Rect) {

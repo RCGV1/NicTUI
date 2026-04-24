@@ -1,7 +1,11 @@
 use anyhow::{Result, anyhow};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use std::fs;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::time::{Duration, Instant};
+
+use crate::ble::{BleLink, parse_ble_device_uri};
 
 use super::metadata::SETTINGS_METADATA;
 use super::types::*;
@@ -13,6 +17,13 @@ pub const SCAN_PRESET_RECORD_COUNT: usize = 8;
 pub const SCAN_PRESET_RECORD_SIZE: usize = 20;
 pub const GROUP_LABEL_RECORD_COUNT: usize = GROUP_LABEL_COUNT;
 pub const GROUP_LABEL_RECORD_SIZE: usize = GROUP_LABEL_SIZE;
+const LIVE_TRANSACTION_MAGIC: [u8; 7] = [0x50, 0x56, 0x4F, 0x4A, 0x48, 0x5C, 0x14];
+const LIVE_ACK: u8 = 0x06;
+const LIVE_ID_REQ: u8 = 0x02;
+const LIVE_READ_BLOCK: u8 = 0x52;
+const LIVE_WRITE_BLOCK: u8 = 0x57;
+const LIVE_END: u8 = 0x45;
+const LIVE_ID_LEN: usize = 8;
 
 #[derive(Debug, Clone)]
 pub enum RemotePacket {
@@ -56,6 +67,10 @@ pub enum RemotePacket {
         value1: u8,
         value2: u8,
     },
+    UnknownFrame {
+        opcode: u8,
+        payload: Vec<u8>,
+    },
 }
 
 impl RemotePacket {
@@ -90,6 +105,96 @@ impl RemotePacket {
             RemotePacket::SmallStatus { id, value1, value2 } => {
                 format!("STS {id:02X}  {value1:02X} {value2:02X}")
             }
+            RemotePacket::UnknownFrame { opcode, payload } => {
+                if payload.is_empty() {
+                    format!("UNK {opcode:02X} len=0")
+                } else {
+                    format!(
+                        "UNK {opcode:02X} len={} {}",
+                        payload.len(),
+                        hex_bytes(payload)
+                    )
+                }
+            }
+        }
+    }
+
+    pub fn family_key(&self) -> String {
+        match self {
+            RemotePacket::DisplayText { x, y, text, .. } => {
+                if *y >= 60 && looks_like_voltage_text(text) {
+                    "battery_text".to_string()
+                } else {
+                    format!("text:{x}:{y}")
+                }
+            }
+            RemotePacket::DrawRectangle {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => format!("box:{x}:{y}:{width}:{height}"),
+            RemotePacket::DrawSymbol {
+                symbol_id, x, y, ..
+            } => {
+                format!("sym:{symbol_id:02X}:{x}:{y}")
+            }
+            RemotePacket::SignalStrength { .. } => "signal_strength".to_string(),
+            RemotePacket::NoiseLevel { .. } => "noise_level".to_string(),
+            RemotePacket::SignalBarPos { .. } => "signal_bar".to_string(),
+            RemotePacket::SmallStatus { id, .. } => format!("status:{id:02X}"),
+            RemotePacket::UnknownFrame { opcode, .. } => format!("unknown:{opcode:02X}"),
+        }
+    }
+
+    pub fn is_idle_telemetry(&self) -> bool {
+        match self {
+            RemotePacket::DisplayText { y, text, .. } => *y >= 60 && looks_like_voltage_text(text),
+            RemotePacket::SmallStatus { id, value1, value2 } => {
+                *id == 0x70 && *value1 == 0x00 && *value2 == 0x00
+            }
+            _ => false,
+        }
+    }
+
+    pub fn detail_key(&self) -> String {
+        match self {
+            RemotePacket::DisplayText {
+                font_size,
+                x,
+                y,
+                fg_color,
+                bg_color,
+                text,
+            } => format!("TXT:{font_size}:{x}:{y}:{fg_color:04X}:{bg_color:04X}:{text}"),
+            RemotePacket::DrawRectangle {
+                x,
+                y,
+                width,
+                height,
+                color,
+            } => format!("BOX:{x}:{y}:{width}:{height}:{color:04X}"),
+            RemotePacket::DrawSymbol {
+                symbol_id,
+                x,
+                y,
+                fg_color,
+                bg_color,
+            } => format!("SYM:{symbol_id:02X}:{x}:{y}:{fg_color:04X}:{bg_color:04X}"),
+            RemotePacket::SignalStrength {
+                strength,
+                mode,
+                battery,
+            } => format!("RSSI:{strength}:{mode}:{battery}"),
+            RemotePacket::NoiseLevel { level, mode } => format!("NOISE:{level}:{mode}"),
+            RemotePacket::SignalBarPos { y, aux } => format!("SBAR:{y}:{aux}"),
+            RemotePacket::SmallStatus { id, value1, value2 } => {
+                format!("STS:{id:02X}:{value1:02X}:{value2:02X}")
+            }
+            RemotePacket::UnknownFrame { opcode, payload } => {
+                format!("UNK:{opcode:02X}:{}", hex_bytes(payload))
+            }
         }
     }
 }
@@ -107,8 +212,83 @@ fn truncate_remote_text(text: &str, max_len: usize) -> String {
     }
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn additive_checksum(bytes: &[u8]) -> u8 {
+    bytes.iter().fold(0u8, |acc, &byte| acc.wrapping_add(byte))
+}
+
+fn looks_like_voltage_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.ends_with('V')
+        && trimmed
+            .strip_suffix('V')
+            .is_some_and(|value| value.parse::<f32>().is_ok())
+}
+
+fn validate_live_address(address: u16) -> Result<()> {
+    if address as usize >= EEPROM_SIZE {
+        return Err(anyhow!(
+            "Live-mode address 0x{address:04X} is outside the {}-byte EEPROM window",
+            EEPROM_SIZE
+        ));
+    }
+    if !(address as usize).is_multiple_of(BLOCK_SIZE) {
+        return Err(anyhow!(
+            "Live-mode address 0x{address:04X} must be aligned to {} bytes",
+            BLOCK_SIZE
+        ));
+    }
+    Ok(())
+}
+
+fn parse_live_read_response(address: u16, response: &[u8]) -> Result<Vec<u8>> {
+    if response.len() != 4 + BLOCK_SIZE + 1 {
+        return Err(anyhow!(
+            "Live-mode read response length mismatch: got {}, expected {}",
+            response.len(),
+            4 + BLOCK_SIZE + 1
+        ));
+    }
+    let addr_hi = (address >> 8) as u8;
+    let addr_lo = address as u8;
+    if response[0] != LIVE_WRITE_BLOCK
+        || response[1] != addr_hi
+        || response[2] != addr_lo
+        || response[3] != BLOCK_SIZE as u8
+    {
+        return Err(anyhow!(
+            "Live-mode read header mismatch for 0x{address:04X}: {:02X?}",
+            &response[..4]
+        ));
+    }
+
+    let data = &response[4..4 + BLOCK_SIZE];
+    let checksum = response[4 + BLOCK_SIZE];
+    let expected = additive_checksum(data);
+    if checksum != expected {
+        return Err(anyhow!(
+            "Live-mode read checksum mismatch for 0x{address:04X}: got {:02X}, expected {:02X}",
+            checksum,
+            expected
+        ));
+    }
+    Ok(data.to_vec())
+}
+
+enum PortHandle {
+    Serial(Box<dyn serialport::SerialPort>),
+    Ble(Box<BleLink>),
+}
+
 pub struct RadioProtocol {
-    port: Box<dyn serialport::SerialPort>,
+    port: PortHandle,
     pub log_callback: Option<Box<dyn Fn(String) + Send + Sync>>,
 }
 
@@ -118,19 +298,27 @@ impl RadioProtocol {
     }
 
     pub fn new_with_baud(port_name: &str, baud_rate: u32) -> Result<Self> {
-        let builder = serialport::new(port_name, baud_rate).timeout(Duration::from_millis(50));
-        #[cfg(unix)]
-        let port: Box<dyn serialport::SerialPort> = {
-            let mut port = builder.open_native()?;
-            #[cfg(target_os = "macos")]
-            {
-                let _ = port.set_exclusive(false);
-            }
-            Box::new(port)
+        let port = if let Some(device_id) = parse_ble_device_uri(port_name) {
+            let mut port = BleLink::connect(device_id)?;
+            port.set_timeout(Duration::from_millis(50));
+            PortHandle::Ble(Box::new(port))
+        } else {
+            let builder = serialport::new(port_name, effective_baud_rate(port_name, baud_rate))
+                .timeout(Duration::from_millis(50));
+            #[cfg(unix)]
+            let port: Box<dyn serialport::SerialPort> = {
+                let mut port = builder.open_native()?;
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = port.set_exclusive(false);
+                }
+                Box::new(port)
+            };
+            #[cfg(not(unix))]
+            let mut port = builder.open()?;
+            let _ = port.clear(serialport::ClearBuffer::All);
+            PortHandle::Serial(port)
         };
-        #[cfg(not(unix))]
-        let mut port = builder.open()?;
-        let _ = port.clear(serialport::ClearBuffer::All);
         Ok(Self {
             port,
             log_callback: None,
@@ -145,8 +333,8 @@ impl RadioProtocol {
 
     fn send(&mut self, data: &[u8]) -> Result<()> {
         self.log(format!("TX: {:02X?}", data));
-        self.port.write_all(data)?;
-        self.port.flush()?;
+        self.port_write_all(data)?;
+        self.port_flush()?;
         Ok(())
     }
 
@@ -155,10 +343,16 @@ impl RadioProtocol {
     }
 
     pub fn read_byte(&mut self) -> Result<Option<u8>> {
+        self.read_byte_with_logging(true)
+    }
+
+    fn read_byte_with_logging(&mut self, should_log: bool) -> Result<Option<u8>> {
         let mut buf = [0u8; 1];
-        match self.port.read(&mut buf) {
+        match self.port_read(&mut buf) {
             Ok(1) => {
-                self.log(format!("RX: [{:02X}]", buf[0]));
+                if should_log {
+                    self.log(format!("RX: [{:02X}]", buf[0]));
+                }
                 Ok(Some(buf[0]))
             }
             Ok(_) => Ok(None),
@@ -168,12 +362,21 @@ impl RadioProtocol {
     }
 
     pub fn recv(&mut self, length: usize, timeout: Duration) -> Result<Vec<u8>> {
+        self.recv_with_logging(length, timeout, true)
+    }
+
+    fn recv_with_logging(
+        &mut self,
+        length: usize,
+        timeout: Duration,
+        should_log: bool,
+    ) -> Result<Vec<u8>> {
         let mut buffer = vec![0u8; length];
         let start = Instant::now();
         let mut read_bytes = 0;
 
         while read_bytes < length && start.elapsed() < timeout {
-            match self.port.read(&mut buffer[read_bytes..]) {
+            match self.port_read(&mut buffer[read_bytes..]) {
                 Ok(n) => read_bytes += n,
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
                 Err(e) => return Err(e.into()),
@@ -188,8 +391,40 @@ impl RadioProtocol {
             ));
         }
 
-        self.log(format!("RX: {:02X?}", buffer));
+        if should_log {
+            self.log(format!("RX: {:02X?}", buffer));
+        }
         Ok(buffer)
+    }
+
+    fn port_write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match &mut self.port {
+            PortHandle::Serial(port) => port.write_all(data),
+            PortHandle::Ble(port) => port.write_all(data),
+        }
+    }
+
+    fn port_flush(&mut self) -> std::io::Result<()> {
+        match &mut self.port {
+            PortHandle::Serial(port) => port.flush(),
+            PortHandle::Ble(port) => port.flush(),
+        }
+    }
+
+    fn port_read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match &mut self.port {
+            PortHandle::Serial(port) => port.read(buffer),
+            PortHandle::Ble(port) => port.read(buffer),
+        }
+    }
+
+    fn port_clear(&mut self, clear: serialport::ClearBuffer) -> std::io::Result<()> {
+        match &mut self.port {
+            PortHandle::Serial(port) => port
+                .clear(clear)
+                .map_err(|error| std::io::Error::other(error.to_string())),
+            PortHandle::Ble(port) => port.clear(clear),
+        }
     }
 
     pub fn ping(&mut self) -> Result<bool> {
@@ -241,7 +476,8 @@ impl RadioProtocol {
         std::thread::sleep(Duration::from_millis(50));
         self.send_key(key_code)?;
         std::thread::sleep(Duration::from_millis(60));
-        self.send_bytes(&[0xFF])?;
+        // NicSure's published keypad IDs use 0x00 for "no key", so release with 0x00.
+        self.send_bytes(&[0x00])?;
         std::thread::sleep(Duration::from_millis(20));
         Ok(())
     }
@@ -382,7 +618,7 @@ impl RadioProtocol {
 
     pub fn read_block(&mut self, block_num: u8) -> Result<Vec<u8>> {
         for attempt in 0..6 {
-            let _ = self.port.clear(serialport::ClearBuffer::Input);
+            let _ = self.port_clear(serialport::ClearBuffer::Input);
             std::thread::sleep(Duration::from_millis(15));
             self.send(&[PKT_READ_EEPROM, block_num])?;
 
@@ -422,10 +658,106 @@ impl RadioProtocol {
                 }
             }
 
-            let _ = self.port.clear(serialport::ClearBuffer::All);
+            let _ = self.port_clear(serialport::ClearBuffer::All);
             std::thread::sleep(Duration::from_millis(120 + attempt as u64 * 30));
         }
         Err(anyhow!("Failed to read block {} after retries", block_num))
+    }
+
+    pub fn live_mode_begin(&mut self) -> Result<[u8; LIVE_ID_LEN]> {
+        self.send(&LIVE_TRANSACTION_MAGIC)?;
+        let mut retried_after_remote_on = false;
+        let mut ack = self.recv(1, Duration::from_millis(500))?;
+        if ack[0] == PKT_REMOTE_ON {
+            self.log(
+                "Live mode begin received 4A REMOTE_ON; sending 45 recovery and retrying"
+                    .to_string(),
+            );
+            retried_after_remote_on = true;
+            self.send(&[LIVE_END])?;
+            let _ = self.recv(1, Duration::from_millis(250));
+            self.send(&LIVE_TRANSACTION_MAGIC)?;
+            ack = self.recv(1, Duration::from_millis(500))?;
+        }
+        if ack[0] != LIVE_ACK {
+            if ack[0] == PKT_REMOTE_ON && retried_after_remote_on {
+                return Err(anyhow!(
+                    "Live mode start ack mismatch: got 4A after recovery retry. This NicSure build appears to route the documented PVOJH opener into the remote-control parser (the opener contains byte 4A), so the public live-mode handshake is not available on this device/firmware."
+                ));
+            }
+            return Err(anyhow!(
+                "Live mode start ack mismatch: got {:02X}, expected {:02X}",
+                ack[0],
+                LIVE_ACK
+            ));
+        }
+
+        self.send(&[LIVE_ID_REQ])?;
+        let id = self.recv(LIVE_ID_LEN, Duration::from_millis(500))?;
+        let id_bytes: [u8; LIVE_ID_LEN] = id
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Live mode ID response length mismatch"))?;
+
+        self.send(&[LIVE_ACK])?;
+        let final_ack = self.recv(1, Duration::from_millis(500))?;
+        if final_ack[0] != LIVE_ACK {
+            return Err(anyhow!(
+                "Live mode ready ack mismatch: got {:02X}, expected {:02X}",
+                final_ack[0],
+                LIVE_ACK
+            ));
+        }
+
+        Ok(id_bytes)
+    }
+
+    pub fn live_mode_end(&mut self) -> Result<[u8; LIVE_ID_LEN]> {
+        self.send(&[LIVE_END])?;
+        let ack = self.recv(1, Duration::from_millis(500))?;
+        if ack[0] != LIVE_ACK {
+            return Err(anyhow!(
+                "Live mode end ack mismatch: got {:02X}, expected {:02X}",
+                ack[0],
+                LIVE_ACK
+            ));
+        }
+
+        self.send(&[LIVE_ID_REQ])?;
+        let id = self.recv(LIVE_ID_LEN, Duration::from_millis(500))?;
+        let id_bytes: [u8; LIVE_ID_LEN] = id
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Live mode trailing ID response length mismatch"))?;
+        Ok(id_bytes)
+    }
+
+    pub fn live_read_block(&mut self, address: u16) -> Result<Vec<u8>> {
+        validate_live_address(address)?;
+        let addr_hi = (address >> 8) as u8;
+        let addr_lo = address as u8;
+        self.send(&[LIVE_READ_BLOCK, addr_hi, addr_lo, BLOCK_SIZE as u8])?;
+        let response = self.recv(4 + BLOCK_SIZE + 1, Duration::from_millis(1000))?;
+        parse_live_read_response(address, &response)
+    }
+
+    pub fn live_write_block(&mut self, address: u16, data: &[u8]) -> Result<bool> {
+        validate_live_address(address)?;
+        if data.len() != BLOCK_SIZE {
+            return Err(anyhow!(
+                "Live-mode writes must be exactly {} bytes",
+                BLOCK_SIZE
+            ));
+        }
+
+        let addr_hi = (address >> 8) as u8;
+        let addr_lo = address as u8;
+        let mut packet = vec![LIVE_WRITE_BLOCK, addr_hi, addr_lo, BLOCK_SIZE as u8];
+        packet.extend_from_slice(data);
+        packet.push(additive_checksum(data));
+        self.send(&packet)?;
+        let ack = self.recv(1, Duration::from_millis(1000))?;
+        Ok(ack[0] == LIVE_ACK)
     }
 
     pub fn write_block(&mut self, block_num: u8, data: &[u8]) -> Result<bool> {
@@ -438,7 +770,7 @@ impl RadioProtocol {
         pkt.push(checksum);
 
         for attempt in 0..5 {
-            let _ = self.port.clear(serialport::ClearBuffer::Input);
+            let _ = self.port_clear(serialport::ClearBuffer::Input);
             std::thread::sleep(Duration::from_millis(15));
             self.send(&pkt)?;
 
@@ -465,13 +797,17 @@ impl RadioProtocol {
                 }
             }
 
-            let _ = self.port.clear(serialport::ClearBuffer::All);
+            let _ = self.port_clear(serialport::ClearBuffer::All);
             std::thread::sleep(Duration::from_millis(120 + attempt as u64 * 30));
         }
         Ok(false)
     }
 
     pub fn parse_channel(raw: &[u8], channel_num: u16, endian: Endianness) -> Option<Channel> {
+        if raw.len() < BLOCK_SIZE {
+            return None;
+        }
+
         let rx_freq_raw = match endian {
             Endianness::Little => LittleEndian::read_u32(&raw[0..4]),
             Endianness::Big => BigEndian::read_u32(&raw[0..4]),
@@ -872,7 +1208,15 @@ impl RadioProtocol {
     }
 
     pub fn parse_remote_packet(&mut self) -> Result<Option<RemotePacket>> {
-        let Some(id) = self.read_byte()? else {
+        self.parse_remote_packet_with_options(24, Duration::from_millis(8))
+    }
+
+    pub fn parse_remote_packet_with_options(
+        &mut self,
+        unknown_capture_limit: usize,
+        unknown_capture_gap: Duration,
+    ) -> Result<Option<RemotePacket>> {
+        let Some(id) = self.read_byte_with_logging(false)? else {
             return Ok(None);
         };
 
@@ -881,12 +1225,21 @@ impl RadioProtocol {
             return Ok(None);
         }
 
-        let packet =
-            Self::parse_remote_packet_inner(id, |length, timeout| self.recv(length, timeout))?;
-        if packet.is_none() {
-            self.log(format!("REMOTE: unhandled packet {:02X}", id));
+        let packet = Self::parse_remote_packet_inner(id, |length, timeout| {
+            self.recv_with_logging(length, timeout, false)
+        })?;
+        if let Some(packet) = packet {
+            return Ok(Some(packet));
         }
-        Ok(packet)
+
+        let payload =
+            self.recv_unknown_remote_payload(unknown_capture_limit, unknown_capture_gap)?;
+        let packet = RemotePacket::UnknownFrame {
+            opcode: id,
+            payload,
+        };
+        self.log(format!("REMOTE {}", packet.summary()));
+        Ok(Some(packet))
     }
 
     fn parse_remote_packet_inner<F>(id: u8, mut recv: F) -> Result<Option<RemotePacket>>
@@ -912,9 +1265,6 @@ impl RadioProtocol {
                     }
                     text_bytes.push(b);
                 }
-                // Skip padding
-                let _ = recv(2, Duration::from_millis(10));
-
                 Ok(Some(RemotePacket::DisplayText {
                     font_size,
                     x,
@@ -932,7 +1282,6 @@ impl RadioProtocol {
                 let width = data[2];
                 let height = data[3];
                 let color = LittleEndian::read_u16(&data[4..6]);
-                let _ = recv(2, Duration::from_millis(10));
                 Ok(Some(RemotePacket::DrawRectangle {
                     x,
                     y,
@@ -949,7 +1298,6 @@ impl RadioProtocol {
                 let y = data[2];
                 let fg_color = LittleEndian::read_u16(&data[3..5]);
                 let bg_color = LittleEndian::read_u16(&data[5..7]);
-                let _ = recv(2, Duration::from_millis(10));
                 Ok(Some(RemotePacket::DrawSymbol {
                     symbol_id,
                     x,
@@ -959,18 +1307,13 @@ impl RadioProtocol {
                 }))
             }
             0x67 => {
-                // Signal Strength (2 bytes data + 2 bytes padding)
+                // The programmer consumes exactly two bytes here.
                 let data = recv(2, Duration::from_millis(100))?;
-                let padding = recv(2, Duration::from_millis(10))?;
-
-                // Based on empirical testing, battery might be in padding bytes
-                // Documentation doesn't mention battery, but hardware seems to send it
-                let battery = if padding[0] <= 100 { padding[0] } else { 0 };
 
                 Ok(Some(RemotePacket::SignalStrength {
                     strength: data[0],
                     mode: data[1],
-                    battery,
+                    battery: 0,
                 }))
             }
             // The Nicsure helper used by these packets shifts out two data bytes after the opcode.
@@ -983,22 +1326,36 @@ impl RadioProtocol {
                 }))
             }
             0x69 | 0xE9 => {
-                let data = recv(2, Duration::from_millis(100))?;
-                Ok(Some(RemotePacket::SignalBarPos {
-                    y: data[0],
-                    aux: data[1],
-                }))
+                let data = recv(1, Duration::from_millis(100))?;
+                Ok(Some(RemotePacket::SignalBarPos { y: data[0], aux: 0 }))
             }
-            0x70..=0x7F => {
-                let data = recv(2, Duration::from_millis(100))?;
-                Ok(Some(RemotePacket::SmallStatus {
-                    id,
-                    value1: data[0],
-                    value2: data[1],
-                }))
-            }
+            0x70..=0x7F => Ok(Some(RemotePacket::SmallStatus {
+                id,
+                value1: 0,
+                value2: 0,
+            })),
             _ => Ok(None),
         }
+    }
+
+    fn recv_unknown_remote_payload(&mut self, max_len: usize, gap: Duration) -> Result<Vec<u8>> {
+        let start = Instant::now();
+        let mut payload = Vec::new();
+
+        while payload.len() < max_len && start.elapsed() < Duration::from_millis(80) {
+            match self.read_byte_with_logging(false)? {
+                Some(byte) => payload.push(byte),
+                None => {
+                    if !payload.is_empty() {
+                        break;
+                    }
+                    std::thread::sleep(gap);
+                    break;
+                }
+            }
+        }
+
+        Ok(payload)
     }
 
     pub fn parse_bandplan(raw: &[u8], index: u8, endian: Endianness) -> BandPlan {
@@ -1401,6 +1758,39 @@ impl SettingsBlock {
     }
 }
 
+fn effective_baud_rate(port_name: &str, baud_rate: u32) -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        if should_use_pty_safe_baud(port_name) {
+            return 0;
+        }
+    }
+
+    baud_rate
+}
+
+#[cfg(target_os = "macos")]
+fn should_use_pty_safe_baud(port_name: &str) -> bool {
+    if parse_ble_device_uri(port_name).is_some() {
+        return false;
+    }
+
+    let path = Path::new(port_name);
+    if port_name.starts_with("/dev/ttys") || port_name.starts_with("/dev/pts/") {
+        return true;
+    }
+
+    fs::read_link(path)
+        .ok()
+        .and_then(|target| target.to_str().map(str::to_owned))
+        .is_some_and(|target| target.starts_with("/dev/ttys") || target.starts_with("/dev/pts/"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn should_use_pty_safe_baud(_port_name: &str) -> bool {
+    false
+}
+
 fn parse_tone(raw: u16) -> String {
     if raw == 0 {
         return "Off".to_string();
@@ -1454,7 +1844,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_small_status_packets_with_two_payload_bytes() {
+    fn parses_small_status_packets_without_payload() {
         let mut queue = VecDeque::from([0x12, 0x34]);
         let packet = RadioProtocol::parse_remote_packet_inner(0x72, |length, timeout| {
             recv_from_queue(&mut queue, length, timeout)
@@ -1464,13 +1854,13 @@ mod tests {
         match packet {
             Some(RemotePacket::SmallStatus { id, value1, value2 }) => {
                 assert_eq!(id, 0x72);
-                assert_eq!(value1, 0x12);
-                assert_eq!(value2, 0x34);
+                assert_eq!(value1, 0x00);
+                assert_eq!(value2, 0x00);
             }
             other => panic!("unexpected packet: {other:?}"),
         }
 
-        assert!(queue.is_empty());
+        assert_eq!(queue, VecDeque::from([0x12, 0x34]));
     }
 
     #[test]
@@ -1484,12 +1874,12 @@ mod tests {
         match packet {
             Some(RemotePacket::SignalBarPos { y, aux }) => {
                 assert_eq!(y, 0x55);
-                assert_eq!(aux, 0xAA);
+                assert_eq!(aux, 0x00);
             }
             other => panic!("unexpected packet: {other:?}"),
         }
 
-        assert!(queue.is_empty());
+        assert_eq!(queue, VecDeque::from([0xAA]));
     }
 
     #[test]
@@ -1509,6 +1899,118 @@ mod tests {
         }
 
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn parses_display_text_without_consuming_padding_bytes() {
+        let mut queue =
+            VecDeque::from([0x01, 0x02, 0x03, 0x34, 0x12, 0x78, 0x56, b'A', 0x00, 0xEE]);
+        let packet = RadioProtocol::parse_remote_packet_inner(0x64, |length, timeout| {
+            recv_from_queue(&mut queue, length, timeout)
+        })
+        .unwrap();
+
+        match packet {
+            Some(RemotePacket::DisplayText { text, .. }) => assert_eq!(text, "A"),
+            other => panic!("unexpected packet: {other:?}"),
+        }
+
+        assert_eq!(queue, VecDeque::from([0xEE]));
+    }
+
+    #[test]
+    fn parses_rectangle_without_consuming_extra_padding_bytes() {
+        let mut queue = VecDeque::from([0x01, 0x02, 0x03, 0x04, 0x34, 0x12, 0xEE]);
+        let packet = RadioProtocol::parse_remote_packet_inner(0x65, |length, timeout| {
+            recv_from_queue(&mut queue, length, timeout)
+        })
+        .unwrap();
+
+        match packet {
+            Some(RemotePacket::DrawRectangle {
+                x,
+                y,
+                width,
+                height,
+                color,
+            }) => {
+                assert_eq!(
+                    (x, y, width, height, color),
+                    (0x01, 0x02, 0x03, 0x04, 0x1234)
+                );
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+
+        assert_eq!(queue, VecDeque::from([0xEE]));
+    }
+
+    #[test]
+    fn parses_symbol_without_consuming_extra_padding_bytes() {
+        let mut queue = VecDeque::from([0x05, 0x06, 0x07, 0x34, 0x12, 0x78, 0x56, 0xEE]);
+        let packet = RadioProtocol::parse_remote_packet_inner(0x66, |length, timeout| {
+            recv_from_queue(&mut queue, length, timeout)
+        })
+        .unwrap();
+
+        match packet {
+            Some(RemotePacket::DrawSymbol {
+                symbol_id,
+                x,
+                y,
+                fg_color,
+                bg_color,
+            }) => {
+                assert_eq!(
+                    (symbol_id, x, y, fg_color, bg_color),
+                    (0x05, 0x06, 0x07, 0x1234, 0x5678)
+                );
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+
+        assert_eq!(queue, VecDeque::from([0xEE]));
+    }
+
+    #[test]
+    fn parses_signal_strength_without_consuming_battery_padding_bytes() {
+        let mut queue = VecDeque::from([0x09, 0x02, 0xEE]);
+        let packet = RadioProtocol::parse_remote_packet_inner(0x67, |length, timeout| {
+            recv_from_queue(&mut queue, length, timeout)
+        })
+        .unwrap();
+
+        match packet {
+            Some(RemotePacket::SignalStrength {
+                strength,
+                mode,
+                battery,
+            }) => {
+                assert_eq!((strength, mode, battery), (0x09, 0x02, 0x00));
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+
+        assert_eq!(queue, VecDeque::from([0xEE]));
+    }
+
+    #[test]
+    fn parses_documented_live_read_response() {
+        let response = [
+            0x57, 0x1B, 0x40, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let block = parse_live_read_response(0x1B40, &response).unwrap();
+        assert_eq!(block.len(), BLOCK_SIZE);
+        assert!(block.iter().all(|byte| *byte == 0x00));
+    }
+
+    #[test]
+    fn rejects_misaligned_live_mode_address() {
+        let error = validate_live_address(0x0CA1).unwrap_err().to_string();
+        assert!(error.contains("aligned"));
     }
 
     #[test]
@@ -1594,6 +2096,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_channel_rejects_short_raw_buffers() {
+        assert!(RadioProtocol::parse_channel(&[0x00, 0xDD, 0xB9], 1, Endianness::Big).is_none());
+    }
+
+    #[test]
     fn parses_live_like_bandplan_record_big_endian() {
         let raw = [0x00, 0xA4, 0xCB, 0x80, 0x00, 0xD1, 0x0B, 0xA0, 0x00, 0x4A];
         let plan = RadioProtocol::parse_bandplan(&raw, 0, Endianness::Big);
@@ -1657,5 +2164,15 @@ mod tests {
         assert_eq!(&packed[6..12], b"Dispat");
         assert_eq!(&packed[12..18], b"Air\0\0\0");
         assert_eq!(&packed[18..24], b"Weathe");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uses_pty_safe_baud_for_real_ptys_only() {
+        assert!(should_use_pty_safe_baud("/dev/ttys036"));
+        assert!(!should_use_pty_safe_baud("/dev/cu.usbserial-210"));
+        assert!(!should_use_pty_safe_baud(
+            "ble://12345678-1234-5678-9ABC-DEF012345678"
+        ));
     }
 }

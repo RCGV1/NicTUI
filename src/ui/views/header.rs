@@ -1,7 +1,7 @@
 use crate::app::{App, AppMode, MainTab};
 use crate::ui::theme::{
     COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_ERROR, COLOR_HEADER, COLOR_PRIMARY, COLOR_SUCCESS,
-    COLOR_SURFACE_2, COLOR_SURFACE_3, COLOR_TEXT, COLOR_WARNING,
+    COLOR_SURFACE_3, COLOR_TEXT, COLOR_WARNING,
 };
 use ratatui::{
     Frame,
@@ -23,11 +23,7 @@ pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(inner);
 
     let compact = inner.width < 90;
@@ -76,38 +72,16 @@ pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let tab_label = tab_label(active_tab, compact);
     let tab_summary = tab_summary(app, active_tab, compact);
 
-    let selected_port = app
-        .protocol_port_name
-        .as_deref()
-        .or_else(|| {
-            app.selected_port_candidate()
-                .map(|candidate| candidate.port_name.as_str())
-        })
-        .unwrap_or("not selected");
-    let middle_text = if compact {
-        format!(" {tab_label} | {}", compact_port_name(selected_port))
+    let selected_port = app.selected_port_short_label();
+    let state_summary = dirty_summary(app);
+    let detail_text = if compact {
+        format!(" {tab_label} | {tab_summary} | {state_summary}")
+    } else if app.status_message.trim().is_empty() {
+        format!(" {tab_label}  |  {tab_summary}  |  {selected_port}  |  {state_summary}")
     } else {
         format!(
-            " {tab_label}  |  {tab_summary}  |  {}",
-            compact_port_name(selected_port)
-        )
-    };
-    let bottom_text = if compact {
-        format!(
-            "{} | {}",
-            tab_summary,
-            if has_unsaved_state(app) {
-                "dirty"
-            } else {
-                "clean"
-            }
-        )
-    } else {
-        format!(
-            "{}  |  Port {}  |  {}",
-            app.status_message,
-            compact_port_name(selected_port),
-            dirty_summary(app)
+            " {tab_label}  |  {tab_summary}  |  {selected_port}  |  {}  |  {state_summary}",
+            app.status_message
         )
     };
 
@@ -120,18 +94,9 @@ pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
                     .bg(COLOR_SURFACE_3)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(middle_text, Style::default().fg(COLOR_TEXT)),
+            Span::styled(detail_text, Style::default().fg(COLOR_TEXT)),
         ])),
         rows[1],
-    );
-
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            bottom_text,
-            Style::default().fg(COLOR_TEXT).bg(COLOR_SURFACE_2),
-        ))
-        .wrap(ratatui::widgets::Wrap { trim: true }),
-        rows[2],
     );
 }
 
@@ -150,7 +115,7 @@ fn tab_label(tab: MainTab, compact: bool) -> &'static str {
         (MainTab::Codeplug, _) => "Codeplug",
         (MainTab::BinFlash, true) => "Flash",
         (MainTab::BinFlash, false) => "BIN Flash",
-        (MainTab::Debug, _) => "Debug",
+        (MainTab::Debug, _) => "Logs",
     }
 }
 
@@ -169,7 +134,7 @@ fn header_status(app: &App) -> (&'static str, ratatui::style::Color) {
         AppMode::Error(_) => ("ERROR", COLOR_ERROR),
         _ if app.remote_active => ("REMOTE", COLOR_SUCCESS),
         _ if has_unsaved_state(app) => ("DIRTY", COLOR_WARNING),
-        _ if app.protocol_port_name.is_some() => ("CONNECTED", COLOR_ACCENT),
+        _ if app.selected_port_candidate().is_some() => ("READY", COLOR_SUCCESS),
         _ => ("NO RADIO", COLOR_DIM),
     }
 }
@@ -187,11 +152,7 @@ fn tab_summary(app: &App, tab: MainTab, compact: bool) -> String {
         }
         MainTab::Settings => {
             if app.settings.is_some() {
-                if compact {
-                    format!("{} set", crate::protocol::SETTINGS_METADATA.len())
-                } else {
-                    format!("{} fields", crate::protocol::SETTINGS_METADATA.len())
-                }
+                format!("{} fields", crate::protocol::SETTINGS_METADATA.len())
             } else {
                 "empty".to_string()
             }
@@ -315,8 +276,4 @@ fn dirty_summary(app: &App) -> String {
     } else {
         format!("pending {}", parts.join(" "))
     }
-}
-
-fn compact_port_name(value: &str) -> String {
-    value.rsplit('/').next().unwrap_or(value).to_string()
 }

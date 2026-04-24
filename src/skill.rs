@@ -201,13 +201,17 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn bundled_skill_mentions_safe_write_flow() {
+    fn bundled_skill_mentions_safe_write_and_ble_workflows() {
         let skill = bundled_skill_markdown();
         assert!(skill.contains("Safe write workflow"));
         assert!(skill.contains("--validate-only"));
-        assert!(
-            skill.contains("doctor --output-dir .live-debug/ai-radio-session --json --codeplug")
-        );
+        assert!(skill.contains("nictui bluetooth on"));
+        assert!(skill.contains("ble://<uuid>"));
+        assert!(skill.contains("nictui remote key"));
+        assert!(skill.contains("0000ff00-0000-1000-8000-00805f9b34fb"));
+        assert!(skill.contains(
+            "doctor \"${NICTUI_TARGET[@]}\" --output-dir nictui-radio-session --json --codeplug"
+        ));
     }
 
     #[test]

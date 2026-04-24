@@ -9,6 +9,8 @@ use ratatui::{
     widgets::{Block, Cell, Paragraph, Row, Table},
 };
 
+const BLUETOOTH_SETTING_INDEX: usize = 30;
+
 pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
     if let AppMode::EditSetting(idx) = app.mode {
         let (_, inner_area) = begin_editor(
@@ -49,7 +51,7 @@ pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
                     format!("Range {}-{} {}", min, max, unit)
                 };
                 f.render_widget(
-                    Paragraph::new(format!("Current value: {}\n{}", current_value, help_text))
+                    Paragraph::new(format!("Current: {}\n{}", current_value, help_text))
                         .style(Style::default().fg(COLOR_TEXT))
                         .block(
                             Block::default()
@@ -71,7 +73,7 @@ pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
                 );
 
                 f.render_widget(
-                    Paragraph::new("Type a new value, then press Enter to save it.")
+                    Paragraph::new("Type a value, then press Enter to save it.")
                         .style(Style::default().fg(COLOR_DIM)),
                     numeric_chunks[2],
                 );
@@ -82,22 +84,30 @@ pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
                     SettingType::Enum(opts) => opts.to_vec(),
                     _ => unreachable!(),
                 };
+                let detail_text = if idx == BLUETOOTH_SETTING_INDEX {
+                    format!(
+                        "Current: {}\nUse ↑ for previous and ↓ for next. Turn this on to connect over BLE.",
+                        current_value
+                    )
+                } else {
+                    format!(
+                        "Current: {}\nUse ↑ for previous and ↓ for next.",
+                        current_value
+                    )
+                };
                 let option_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(3), Constraint::Min(1)])
                     .split(chunks[0]);
 
                 f.render_widget(
-                    Paragraph::new(format!(
-                        "Current value: {}\nUse ↑ for previous and ↓ for next.",
-                        current_value
-                    ))
-                    .style(Style::default().fg(COLOR_DIM))
-                    .block(
-                        Block::default()
-                            .borders(ratatui::widgets::Borders::BOTTOM)
-                            .title(" Details "),
-                    ),
+                    Paragraph::new(detail_text)
+                        .style(Style::default().fg(COLOR_DIM))
+                        .block(
+                            Block::default()
+                                .borders(ratatui::widgets::Borders::BOTTOM)
+                                .title(" Details "),
+                        ),
                     option_chunks[0],
                 );
 
@@ -118,7 +128,7 @@ pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
                     Row::new(vec![Cell::from(display_value).style(style)])
                 });
 
-                let table = Table::new(rows, [Constraint::Length(50)])
+                let table = Table::new(rows, [Constraint::Min(1)])
                     .block(
                         Block::default()
                             .borders(ratatui::widgets::Borders::ALL)
@@ -136,7 +146,7 @@ pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
         }
 
         f.render_widget(
-            Paragraph::new("↑/↓: Change | Enter: Save | Esc: Cancel")
+            Paragraph::new("↑/↓ change | Enter save | Esc cancel")
                 .style(Style::default().fg(COLOR_DIM))
                 .alignment(ratatui::layout::Alignment::Center),
             chunks[1],

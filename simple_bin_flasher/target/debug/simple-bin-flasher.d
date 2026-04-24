@@ -1,1 +1,0 @@
-/Users/benjaminfaershtein/Desktop/TerminalNicSure/radio-flasher-rs/simple_bin_flasher/target/debug/simple-bin-flasher: /Users/benjaminfaershtein/Desktop/TerminalNicSure/radio-flasher-rs/simple_bin_flasher/src/main.rs

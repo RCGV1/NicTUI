@@ -1,8 +1,16 @@
 use super::navigation::{next_item, prev_item, update_selection_after_add};
-use super::state::{App, AppEvent, AppMode, MainTab};
+use super::state::{App, AppEvent, AppMode, MainTab, WriteScope};
 use crate::protocol::*;
 
 impl App {
+    fn finish_ble_scan_ui_handoff(&mut self) {
+        if self.ble_scan_ui_suspended {
+            self.resume_ui();
+            self.dialog_open = false;
+            self.ble_scan_ui_suspended = false;
+        }
+    }
+
     pub fn leave_remote_tab(&mut self) {
         if self.remote_active {
             self.remote_off();
@@ -19,6 +27,60 @@ impl App {
                 AppEvent::Progress(p) => self.progress = p,
                 AppEvent::Status(s) => self.status_message = s,
                 AppEvent::Log(l) => self.log(&l),
+                AppEvent::BleScanComplete(candidates) => {
+                    self.finish_ble_scan_ui_handoff();
+                    let current_ble = self
+                        .selected_port_candidate()
+                        .filter(|candidate| candidate.is_ble())
+                        .map(|candidate| candidate.port_name.clone());
+                    let current = current_ble
+                        .as_deref()
+                        .or_else(|| self.ports.get(self.selected_port_index).map(String::as_str))
+                        .map(str::to_string);
+                    let first_ble = candidates
+                        .first()
+                        .map(|candidate| candidate.port_name.clone());
+                    self.ble_scan_in_progress = false;
+                    self.ble_port_candidates = candidates;
+                    self.rebuild_port_candidates(current.as_deref());
+                    if current_ble.as_ref().is_none_or(|name| {
+                        !self
+                            .ble_port_candidates
+                            .iter()
+                            .any(|candidate| &candidate.port_name == name)
+                    }) && let Some(first_ble) = first_ble
+                        && let Some(index) = self
+                            .port_candidates
+                            .iter()
+                            .position(|candidate| candidate.port_name == first_ble)
+                    {
+                        self.selected_port_index = index;
+                    }
+                    self.status_message = match self.ble_port_candidates.len() {
+                        0 => "No TD-H3 BLE radios found. Keep Bluetooth enabled on the radio and scan again. On macOS, open NicTUI.app once if permission is needed."
+                            .to_string(),
+                        1 => format!(
+                            "Found 1 BLE radio ({}). Press Enter to connect.",
+                            self.ble_port_candidates[0].port_name
+                        ),
+                        count => format!(
+                            "{count} BLE radios found. Select one, then press Enter to connect."
+                        ),
+                    };
+                    self.log(&format!(
+                        "BLE scan complete: {} radio(s) found",
+                        self.ble_port_candidates.len()
+                    ));
+                }
+                AppEvent::BleScanFailed(error) => {
+                    self.finish_ble_scan_ui_handoff();
+                    self.ble_scan_in_progress = false;
+                    self.log(&format!("BLE scan failed: {error}"));
+                    self.status_message = Self::ble_scan_failure_message(
+                        &error,
+                        !self.ble_port_candidates.is_empty(),
+                    );
+                }
                 AppEvent::ReadChannelsComplete(channels, endian) => {
                     self.channels = channels;
                     self.endian = endian;
@@ -56,25 +118,85 @@ impl App {
                 AppEvent::ReadSettingsComplete(settings, endian) => {
                     self.settings = Some(settings);
                     self.endian = endian;
+                    self.settings_dirty = false;
                     self.settings_state.select(Some(0));
                     self.mode = AppMode::Main(MainTab::Settings);
                     self.status_message = "Settings read complete".to_string();
                 }
+                AppEvent::RemotePhase(phase) => {
+                    self.remote_screen.phase = phase;
+                    if matches!(phase, crate::remote::RemoteSessionPhase::Live) {
+                        self.remote_active = true;
+                    }
+                }
+                AppEvent::RemoteControl(report) => {
+                    self.remote_screen.last_control_report = Some(report.clone());
+                    self.status_message = if report.success {
+                        if let Some(reaction) = report.reaction.as_ref() {
+                            if reaction.deltas > 0 {
+                                format!("Remote {} confirmed via {}", report.label, report.strategy)
+                            } else if reaction.surfaced_packets > 0
+                                || reaction.unknown_packets > 0
+                                || reaction.rx_first_ms.is_some()
+                            {
+                                format!(
+                                    "Remote {} sent via {}; telemetry only so far",
+                                    report.label, report.strategy
+                                )
+                            } else {
+                                format!(
+                                    "Remote {} sent via {}; no reaction yet",
+                                    report.label, report.strategy
+                                )
+                            }
+                        } else {
+                            format!("Remote {} sent via {}", report.label, report.strategy)
+                        }
+                    } else {
+                        format!("Remote {} failed: {}", report.label, report.detail)
+                    };
+                    self.log(&format!(
+                        "Remote {} [{}] {}",
+                        report.label, report.strategy, report.detail
+                    ));
+                }
+                AppEvent::RemoteDelta(delta) => {
+                    self.remote_screen.last_delta = Some(delta.clone());
+                    self.log(&format!("Remote delta: {delta}"));
+                }
                 AppEvent::RemotePacket(pkt) => {
                     let now = std::time::Instant::now();
-                    match pkt {
+                    match &pkt {
                         RemotePacket::SignalStrength {
                             strength, battery, ..
                         } => {
-                            self.remote_screen.signal_strength = strength;
-                            self.remote_screen.battery_level = Some(battery);
+                            self.remote_screen.signal_strength = *strength;
+                            self.remote_screen.battery_level = Some(*battery);
                             self.remote_screen.last_signal_update = Some(now);
                             self.remote_screen.last_battery_update = Some(now);
                         }
                         RemotePacket::NoiseLevel { level, .. } => {
-                            self.remote_screen.noise_level = level;
+                            self.remote_screen.noise_level = *level;
                             self.remote_screen.last_noise_update = Some(now);
                         }
+                        RemotePacket::DisplayText { text, y, .. } => {
+                            if *y >= 60 && looks_like_battery_text(text) {
+                                self.remote_screen.battery_text = Some(text.clone());
+                                self.remote_screen.last_text_update = Some(now);
+                            }
+                        }
+                        RemotePacket::SmallStatus { id, value1, value2 } => {
+                            self.remote_screen.last_small_status = Some((*id, *value1, *value2));
+                            self.remote_screen.last_status_update = Some(now);
+                        }
+                        RemotePacket::UnknownFrame { .. } => {
+                            self.remote_screen.unknown_packet_count += 1;
+                        }
+                        _ => {}
+                    }
+
+                    match pkt {
+                        RemotePacket::SignalStrength { .. } | RemotePacket::NoiseLevel { .. } => {}
                         _ => {
                             self.remote_screen.elements.push_back(pkt);
                             if self.remote_screen.elements.len() > 50 {
@@ -83,18 +205,46 @@ impl App {
                         }
                     }
                 }
-                AppEvent::RemoteStopped(message) => {
+                AppEvent::RemoteStopped { message, failure } => {
                     self.remote_active = false;
                     self.remote_tx = None;
+                    self.remote_screen.phase = crate::remote::RemoteSessionPhase::Stopped;
+                    self.remote_screen.last_failure = failure;
+                    if self.ble_transport_selected() {
+                        self.ble_reconnect_required = true;
+                    }
                     self.status_message = message;
                 }
-                AppEvent::WriteComplete => {
+                AppEvent::WriteComplete(scope) => {
                     self.mode = AppMode::Main(self.last_main_tab);
-                    self.channels_dirty = false;
-                    self.deleted_channels.clear();
-                    self.dtmf_dirty = false;
-                    self.settings_dirty = false;
-                    self.group_labels_dirty = false;
+                    match scope {
+                        WriteScope::Channels => {
+                            self.channels_dirty = false;
+                            self.deleted_channels.clear();
+                        }
+                        WriteScope::Dtmf => {
+                            self.dtmf_dirty = false;
+                        }
+                        WriteScope::GroupLabels => {
+                            self.group_labels_dirty = false;
+                        }
+                        WriteScope::Settings => {
+                            self.settings_dirty = false;
+                        }
+                        WriteScope::Codeplug => {
+                            self.channels_dirty = false;
+                            self.deleted_channels.clear();
+                            self.dtmf_dirty = false;
+                            self.settings_dirty = false;
+                            self.group_labels_dirty = false;
+                        }
+                        WriteScope::None => {}
+                    }
+                    if self.ble_reconnect_required && self.ble_transport_selected() {
+                        self.status_message =
+                            "Radio write finished. BLE will reconnect on the next action."
+                                .to_string();
+                    }
                 }
                 AppEvent::LoadCSV(path) => self.start_import_and_write(path),
                 AppEvent::WriteCSV(path) => self.start_write_csv_channels(path),
@@ -160,6 +310,9 @@ impl App {
                     self.mode = AppMode::Error(msg);
                 }
                 AppEvent::Error(e) => {
+                    if self.ble_transport_selected() {
+                        self.ble_reconnect_required = true;
+                    }
                     self.mode = AppMode::Error(e);
                 }
                 AppEvent::SuspendUI => self.suspend_ui(),
@@ -524,12 +677,8 @@ impl App {
     }
 
     pub fn commit_edit(&mut self) {
-        let mut index_changed = false;
         if let AppMode::EditChannel(field_idx) = self.mode {
             self.save_current_field_to_pending(field_idx);
-            if field_idx == 10 {
-                index_changed = true;
-            }
         }
 
         if let Some(pending_ch) = self.pending_channel_edit.take() {
@@ -546,12 +695,12 @@ impl App {
 
                 if duplicate {
                     self.status_message = format!("Channel {} already exists!", new_channel_num);
-                    self.channels_dirty = false;
                 } else {
+                    let changed = channel_changed(&self.channels[i], &pending_ch);
                     self.channels[i] = pending_ch;
                     self.channel_state.select(Some(i));
 
-                    if index_changed {
+                    if changed {
                         self.channels_dirty = true;
                         self.status_message =
                             format!("Channel {} saved (Unsaved)", new_channel_num);
@@ -848,5 +997,93 @@ impl App {
             self.status_message = format!("Band plan {} saved", i + 1);
         }
         self.mode = AppMode::Main(MainTab::BandPlan);
+    }
+}
+
+fn looks_like_battery_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.ends_with('V')
+        && trimmed
+            .strip_suffix('V')
+            .is_some_and(|value| value.parse::<f32>().is_ok())
+}
+
+fn channel_changed(left: &Channel, right: &Channel) -> bool {
+    left.channel_num != right.channel_num
+        || left.name != right.name
+        || left.rx_freq != right.rx_freq
+        || left.tx_freq != right.tx_freq
+        || left.rx_tone != right.rx_tone
+        || left.tx_tone != right.tx_tone
+        || left.power != right.power
+        || left.bandwidth != right.bandwidth
+        || left.modulation != right.modulation
+        || left.reverse != right.reverse
+        || left.busy_lock != right.busy_lock
+        || left.groups != right.groups
+        || left.ptt_id != right.ptt_id
+        || left.position != right.position
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn write_complete_clears_only_matching_dirty_scope() {
+        let mut app = App::new();
+        app.channels_dirty = true;
+        app.deleted_channels.push(7);
+        app.dtmf_dirty = true;
+        app.group_labels_dirty = true;
+        app.settings_dirty = true;
+
+        app.event_tx
+            .send(AppEvent::WriteComplete(WriteScope::Settings))
+            .unwrap();
+
+        assert!(app.update());
+        assert!(app.channels_dirty);
+        assert_eq!(app.deleted_channels, vec![7]);
+        assert!(app.dtmf_dirty);
+        assert!(app.group_labels_dirty);
+        assert!(!app.settings_dirty);
+    }
+
+    #[test]
+    fn committing_any_changed_channel_field_marks_channels_dirty() {
+        let mut app = App::new();
+        let channel = Channel {
+            channel_num: 1,
+            name: "OLD".to_string(),
+            ..Channel::default()
+        };
+        app.channels = vec![channel.clone()];
+        app.channel_state.select(Some(0));
+        app.pending_channel_edit = Some(channel);
+        app.mode = AppMode::EditChannel(0);
+        app.edit_buffer = "NEW".to_string();
+
+        app.commit_edit();
+
+        assert!(app.channels_dirty);
+        assert_eq!(app.channels[0].name, "NEW");
+    }
+
+    #[test]
+    fn remote_off_keeps_session_active_until_stop_event() {
+        let mut app = App::new();
+        app.remote_active = true;
+        app.remote_stop_signal.store(false, Ordering::SeqCst);
+
+        app.remote_off();
+
+        assert!(app.remote_active);
+        assert!(app.remote_stop_signal.load(Ordering::SeqCst));
+
+        app.remote_on();
+
+        assert_eq!(app.status_message, "Remote mode is still stopping");
     }
 }

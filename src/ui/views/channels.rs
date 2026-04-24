@@ -16,15 +16,7 @@ use ratatui::{
 
 pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
     if app.channels.is_empty() && app.deleted_channels.is_empty() {
-        let port_label = app
-            .protocol_port_name
-            .as_deref()
-            .or_else(|| {
-                app.selected_port_candidate()
-                    .map(|candidate| candidate.port_name.as_str())
-            })
-            .map(|port| port.rsplit('/').next().unwrap_or(port))
-            .unwrap_or("no radio selected");
+        let port_label = app.selected_port_short_label();
         render_ready_state(
             f,
             area,
@@ -33,9 +25,11 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
                 card_title: "Ready To Load",
                 heading: "No Channels Loaded",
                 description: format!(
-                    "Connected to {port_label}. Read the radio to populate the workspace."
+                    "Selected {port_label}. Read the radio or import a file to populate the workspace."
                 ),
-                note: Some("Use focused imports or read live channels before editing."),
+                note: Some(
+                    "Read the radio first for live changes, or import a file to edit offline.",
+                ),
             },
             &[
                 ReadyStateAction {
@@ -218,6 +212,7 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
         };
 
         let groups_str = format_groups(&ch.groups, &app.group_labels);
+        let power = display_power(ch.power);
 
         let ch_num = if is_deleted {
             format!("{} (DEL)", ch.channel_num)
@@ -230,28 +225,25 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
         let row = if compact {
             Row::new(vec![
                 Cell::from(ch_num),
-                Cell::from(ch.name.clone()),
+                Cell::from(truncate_line(&ch.name, 8)),
                 Cell::from(ch.rx_freq.clone()),
                 Cell::from(ch.tx_freq.clone()),
-                Cell::from(compact_tone(&ch.rx_tone, &ch.tx_tone)),
+                Cell::from(truncate_line(&compact_tone(&ch.rx_tone, &ch.tx_tone), 7)),
                 Cell::from(compact_mode(&ch.bandwidth, &ch.modulation)),
-                Cell::from(groups_str),
+                Cell::from(truncate_line(&groups_str, 12)),
             ])
         } else {
             Row::new(vec![
                 Cell::from(ch_num),
-                Cell::from(ch.name.clone()),
+                Cell::from(truncate_line(&ch.name, 12)),
                 Cell::from(ch.rx_freq.clone()),
                 Cell::from(ch.tx_freq.clone()),
-                Cell::from(ch.rx_tone.clone()),
-                Cell::from(ch.tx_tone.clone()),
-                Cell::from(match ch.power {
-                    0 => "Off".to_string(),
-                    _ => ch.power.to_string(),
-                }),
+                Cell::from(truncate_line(&ch.rx_tone, 8)),
+                Cell::from(truncate_line(&ch.tx_tone, 8)),
+                Cell::from(power),
                 Cell::from(ch.bandwidth.clone()),
                 Cell::from(ch.modulation.clone()),
-                Cell::from(groups_str),
+                Cell::from(truncate_line(&groups_str, 18)),
             ])
         };
 
@@ -335,7 +327,16 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
 
     if let Some(channel) = detail {
         let groups = format_groups(&channel.groups, &app.group_labels);
+        let power = display_power(channel.power);
+        let name = if channel.name.is_empty() {
+            "<unnamed>".to_string()
+        } else {
+            channel.name.clone()
+        };
         if compact {
+            let header_width = detail_inner.width.saturating_sub(9) as usize;
+            let freq_width = detail_inner.width.saturating_sub(10) as usize;
+            let tone_width = detail_inner.width.saturating_sub(21) as usize;
             let detail_lines = vec![
                 Line::from(vec![
                     Span::styled(
@@ -346,23 +347,25 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
                     ),
                     Span::raw("  "),
                     Span::styled(
-                        if channel.name.is_empty() {
-                            "<unnamed>".to_string()
-                        } else {
-                            channel.name.clone()
-                        },
+                        truncate_line(&name, header_width),
                         Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
                     ),
                 ]),
-                Line::from(format!(
-                    "{} {} | RX {} | TX {}",
-                    channel.bandwidth, channel.modulation, channel.rx_freq, channel.tx_freq
+                Line::from(truncate_line(
+                    &format!(
+                        "{} {} | RX {} | TX {}",
+                        channel.bandwidth, channel.modulation, channel.rx_freq, channel.tx_freq
+                    ),
+                    freq_width,
                 )),
-                Line::from(format!(
-                    "Tone {} | Pwr {} | Group {}",
-                    compact_tone(&channel.rx_tone, &channel.tx_tone),
-                    channel.power,
-                    groups
+                Line::from(truncate_line(
+                    &format!(
+                        "Tone {} | Pwr {} | Group {}",
+                        compact_tone(&channel.rx_tone, &channel.tx_tone),
+                        power,
+                        groups
+                    ),
+                    tone_width,
                 )),
             ];
             let detail_view = Paragraph::new(detail_lines)
@@ -389,16 +392,15 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
                     ),
                     Span::raw("  "),
                     Span::styled(
-                        if channel.name.is_empty() {
-                            "<unnamed>".to_string()
-                        } else {
-                            channel.name.clone()
-                        },
+                        truncate_line(&name, detail_chunks[0].width.saturating_sub(9) as usize),
                         Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
                     ),
                 ]),
                 Line::from(Span::styled(
-                    format!("{} {}", channel.bandwidth, channel.modulation),
+                    truncate_line(
+                        &format!("{} {}", channel.bandwidth, channel.modulation),
+                        detail_chunks[0].width as usize,
+                    ),
                     Style::default().fg(COLOR_DIM),
                 )),
             ])
@@ -409,14 +411,17 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
                 Line::from(vec![
                     Span::styled("RX ", Style::default().fg(COLOR_DIM)),
                     Span::styled(channel.rx_freq.clone(), Style::default().fg(COLOR_TEXT)),
-                    Span::raw("    "),
+                    Span::raw("  "),
                     Span::styled("TX ", Style::default().fg(COLOR_DIM)),
                     Span::styled(channel.tx_freq.clone(), Style::default().fg(COLOR_TEXT)),
                 ]),
                 Line::from(vec![
                     Span::styled("Tones ", Style::default().fg(COLOR_DIM)),
                     Span::styled(
-                        format!("{} / {}", channel.rx_tone, channel.tx_tone),
+                        truncate_line(
+                            &format!("{} / {}", channel.rx_tone, channel.tx_tone),
+                            detail_chunks[1].width.saturating_sub(6) as usize,
+                        ),
                         Style::default().fg(COLOR_TEXT),
                     ),
                 ]),
@@ -427,18 +432,18 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
             let right = Paragraph::new(vec![
                 Line::from(vec![
                     Span::styled("Power ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(
-                        format!("{}", channel.power),
-                        Style::default().fg(COLOR_TEXT),
-                    ),
+                    Span::styled(power, Style::default().fg(COLOR_TEXT)),
                 ]),
                 Line::from(vec![
                     Span::styled("Groups ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(groups, Style::default().fg(COLOR_TEXT)),
+                    Span::styled(
+                        truncate_line(&groups, detail_chunks[2].width.saturating_sub(7) as usize),
+                        Style::default().fg(COLOR_TEXT),
+                    ),
                 ]),
             ])
             .style(Style::default().bg(COLOR_SURFACE_1))
-            .alignment(ratatui::layout::Alignment::Right);
+            .alignment(ratatui::layout::Alignment::Left);
             f.render_widget(right, detail_chunks[2]);
         }
     } else {
@@ -482,5 +487,48 @@ fn compact_mode(bandwidth: &str, modulation: &str) -> String {
         ("Wide", "FM") => "WFM".to_string(),
         ("Narrow", "FM") => "NFM".to_string(),
         _ => format!("{}{}", bandwidth.chars().next().unwrap_or('-'), modulation),
+    }
+}
+
+fn display_power(power: u8) -> String {
+    match power {
+        0 => "Off".to_string(),
+        0xFF => "Unset".to_string(),
+        value => value.to_string(),
+    }
+}
+
+fn truncate_line(text: &str, max_len: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_len {
+        text.to_string()
+    } else if max_len <= 3 {
+        text.chars().take(max_len).collect()
+    } else {
+        let mut shortened = text
+            .chars()
+            .take(max_len.saturating_sub(3))
+            .collect::<String>();
+        shortened.push_str("...");
+        shortened
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_power_uses_plain_language_for_sentinel_values() {
+        assert_eq!(display_power(0), "Off");
+        assert_eq!(display_power(0xFF), "Unset");
+        assert_eq!(display_power(7), "7");
+    }
+
+    #[test]
+    fn truncate_line_keeps_cells_within_requested_width() {
+        assert_eq!(truncate_line("Memory Group Alpha", 9), "Memory...");
+        assert_eq!(truncate_line("ABC", 2), "AB");
+        assert_eq!(truncate_line("ABC", 3), "ABC");
     }
 }

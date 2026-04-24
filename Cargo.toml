@@ -1,9 +1,15 @@
 [package]
 name = "nictui"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2024"
 description = "Professional TDH3 Radio Programmer"
 license = "GPL-3.0-only"
+build = "build.rs"
+default-run = "nictui"
+exclude = [
+    "diagnostic_tool/target/**",
+    "simple_bin_flasher/target/**",
+]
 
 [lib]
 path = "src/lib.rs"
@@ -14,13 +20,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.100"
+btleplug = "0.12.0"
 byteorder = "1.5.0"
 chrono = "0.4.42"
 clap = { version = "4.4", features = ["derive"] }
 crossterm = "0.29.0"
 csv = "1.4.0"
+futures = "0.3.31"
 ratatui = "0.30.0"
 rfd = { version = "0.15.4", default-features = false, features = ["gtk3"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.142"
 serialport = "4.8.1"
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "sync", "time"] }
+uuid = "1.18.1"

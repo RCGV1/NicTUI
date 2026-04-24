@@ -1,6 +1,7 @@
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::mpsc;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,6 +21,10 @@ use crate::protocol::{
     GROUP_LABELS_BLOCK_COUNT, GROUP_LABELS_BLOCK_OFFSET, GROUP_LABELS_BLOCK_START,
     GROUP_LABELS_OFFSET, RadioProtocol, RemotePacket, SCAN_PRESET_RECORD_COUNT,
     SCAN_PRESET_RECORD_SIZE, ScanPreset, SettingsBlock, TOTAL_BLOCKS,
+};
+use crate::remote::{
+    RemoteCaptureEvent, RemoteCaptureSummary, RemoteControlCommand, RemoteControlReport,
+    RemoteSessionFailure, RemoteSessionOptions, RemoteSessionPhase, run_remote_session,
 };
 
 const CHANNEL_START_BLOCK: usize = 2;
@@ -56,15 +61,22 @@ pub enum ProgressEvent {
 pub enum RemoteMonitorEvent {
     Status(String),
     Log(String),
+    Phase(RemoteSessionPhase),
+    Control(RemoteControlReport),
     Packet(RemotePacket),
+    Delta(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct RemoteMonitorOptions {
     pub duration: Duration,
     pub include_raw_logs: bool,
-    pub scripted_keys: Vec<u8>,
+    pub suppress_idle_zero_logs: bool,
+    pub scripted_commands: Vec<RemoteControlCommand>,
+    pub command_start_delay: Duration,
     pub key_interval: Duration,
+    pub disable_radio_before_remote: bool,
+    pub recover_retries: usize,
 }
 
 impl Default for RemoteMonitorOptions {
@@ -72,9 +84,43 @@ impl Default for RemoteMonitorOptions {
         Self {
             duration: Duration::from_secs(8),
             include_raw_logs: false,
-            scripted_keys: Vec::new(),
+            suppress_idle_zero_logs: true,
+            scripted_commands: Vec::new(),
+            command_start_delay: Duration::from_millis(250),
             key_interval: Duration::from_millis(350),
+            disable_radio_before_remote: false,
+            recover_retries: 0,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteKeySendReport {
+    pub control: RemoteControlReport,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteCommandSchedule {
+    next_command_at: std::cell::Cell<Duration>,
+}
+
+impl RemoteCommandSchedule {
+    fn new(start_delay: Duration) -> Self {
+        Self {
+            next_command_at: std::cell::Cell::new(start_delay),
+        }
+    }
+
+    fn reset(&self, start_delay: Duration) {
+        self.next_command_at.set(start_delay);
+    }
+
+    fn command_due(&self, elapsed: Duration) -> bool {
+        elapsed >= self.next_command_at.get()
+    }
+
+    fn mark_sent(&self, elapsed: Duration, key_interval: Duration) {
+        self.next_command_at.set(elapsed + key_interval);
     }
 }
 
@@ -88,8 +134,15 @@ pub struct ProbeResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveModeCapability {
+    Unverified,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortKind {
     Radio,
+    Ble,
     Candidate,
     System,
     Unknown,
@@ -104,6 +157,8 @@ pub struct PortCandidate {
     pub manufacturer: Option<String>,
     pub usb_vid: Option<u16>,
     pub usb_pid: Option<u16>,
+    pub ble_device_id: Option<String>,
+    pub ble_rssi: Option<i32>,
     pub handshake_ok: bool,
     pub firmware_variant: Option<FirmwareVariant>,
 }
@@ -112,6 +167,7 @@ impl PortCandidate {
     pub fn badge(&self) -> &'static str {
         match self.kind {
             PortKind::Radio => "radio",
+            PortKind::Ble => "ble",
             PortKind::Candidate => "likely",
             PortKind::System => "system",
             PortKind::Unknown => "other",
@@ -120,6 +176,10 @@ impl PortCandidate {
 
     pub fn is_radio(&self) -> bool {
         matches!(self.kind, PortKind::Radio)
+    }
+
+    pub fn is_ble(&self) -> bool {
+        matches!(self.kind, PortKind::Ble)
     }
 }
 
@@ -135,6 +195,36 @@ impl fmt::Display for FirmwareVariant {
             FirmwareVariant::NicSure => write!(f, "NicSure"),
             FirmwareVariant::Stock => write!(f, "stock/original"),
         }
+    }
+}
+
+impl fmt::Display for LiveModeCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LiveModeCapability::Unverified => write!(f, "unverified"),
+            LiveModeCapability::Unsupported => write!(f, "unsupported"),
+        }
+    }
+}
+
+pub fn live_mode_capability(probe: &ProbeResult) -> LiveModeCapability {
+    if !probe.handshake_ok || matches!(probe.firmware_variant, Some(FirmwareVariant::Stock)) {
+        LiveModeCapability::Unsupported
+    } else {
+        LiveModeCapability::Unverified
+    }
+}
+
+pub fn live_mode_hint(probe: &ProbeResult) -> Option<String> {
+    match live_mode_capability(probe) {
+        LiveModeCapability::Unsupported => Some(
+            "Install NicSure mod firmware before using NicTUI live read/write commands."
+                .to_string(),
+        ),
+        LiveModeCapability::Unverified => Some(
+            "Run `nictui remote pvojh-sweep --gap-ms 0,50,100 --json` before relying on live-mode block access. Some NicSure builds route the public PVOJH opener into remote-mode parsing (`4A`)."
+                .to_string(),
+        ),
     }
 }
 
@@ -955,96 +1045,145 @@ where
 }
 
 pub fn send_remote_key(port_name: &str, key_code: u8) -> Result<()> {
-    let mut proto = open_handshaken_protocol(port_name)?;
-    if !proto.remote_on().context("Failed to enable remote mode")? {
-        bail!("Radio did not acknowledge remote mode");
-    }
+    send_remote_key_with_report(port_name, key_code)
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
+}
 
-    proto
-        .press_remote_key(key_code)
-        .context("Failed to send key press")?;
-    let _ = proto.remote_off();
-    Ok(())
+pub fn send_remote_key_with_report(
+    port_name: &str,
+    key_code: u8,
+) -> std::result::Result<RemoteKeySendReport, RemoteSessionFailure> {
+    let command = RemoteControlCommand::raw_key(remote_key_name(key_code), key_code);
+    let options = RemoteMonitorOptions {
+        duration: Duration::from_millis(650) + command.estimated_duration(),
+        scripted_commands: vec![command],
+        command_start_delay: Duration::from_millis(120),
+        recover_retries: 1,
+        suppress_idle_zero_logs: false,
+        ..RemoteMonitorOptions::default()
+    };
+    let mut control = None;
+
+    monitor_remote_with_summary(port_name, &options, |event| {
+        if let RemoteMonitorEvent::Control(report) = event {
+            control = Some(report);
+        }
+    })?;
+
+    let control = control.ok_or_else(|| RemoteSessionFailure {
+        kind: crate::remote::RemoteSessionFailureKind::StreamLost,
+        summary: "Remote key session finished without producing a command report.".to_string(),
+        detail: "The remote session ended before the command outcome could be reported."
+            .to_string(),
+    })?;
+    Ok(RemoteKeySendReport { control })
 }
 
 pub fn monitor_remote<F>(
     port_name: &str,
     options: &RemoteMonitorOptions,
-    mut on_event: F,
+    on_event: F,
 ) -> Result<usize>
 where
     F: FnMut(RemoteMonitorEvent),
 {
-    on_event(RemoteMonitorEvent::Status(format!(
-        "Opening {} for remote monitoring",
-        port_name
-    )));
+    monitor_remote_with_summary(port_name, options, on_event)
+        .map(|summary| summary.packet_count)
+        .map_err(anyhow::Error::from)
+}
 
-    let mut proto = open_protocol(port_name)?;
-    let log_rx = if options.include_raw_logs {
-        let (log_tx, log_rx) = mpsc::channel();
-        proto.log_callback = Some(Box::new(move |msg| {
-            let _ = log_tx.send(msg);
-        }));
-        Some(log_rx)
-    } else {
-        None
-    };
+pub fn monitor_remote_with_summary<F>(
+    port_name: &str,
+    options: &RemoteMonitorOptions,
+    mut on_event: F,
+) -> std::result::Result<RemoteCaptureSummary, RemoteSessionFailure>
+where
+    F: FnMut(RemoteMonitorEvent),
+{
+    let schedule = RemoteCommandSchedule::new(options.command_start_delay);
+    let scripted_command_index = Rc::new(Cell::new(0usize));
+    let command_in_flight = Rc::new(Cell::new(false));
+    let command_index_for_next = Rc::clone(&scripted_command_index);
+    let command_in_flight_for_next = Rc::clone(&command_in_flight);
+    let command_index_for_event = Rc::clone(&scripted_command_index);
+    let command_in_flight_for_event = Rc::clone(&command_in_flight);
 
-    if !proto.handshake().context("Handshake attempt failed")? {
-        bail!("Handshake failed for {}", port_name);
-    }
-    drain_remote_logs(&log_rx, &mut on_event);
-
-    if !proto.remote_on().context("Failed to enable remote mode")? {
-        bail!("Radio did not acknowledge remote mode");
-    }
-    on_event(RemoteMonitorEvent::Status("Remote mode ON".to_string()));
-    drain_remote_logs(&log_rx, &mut on_event);
-
-    let started_at = Instant::now();
-    let mut next_key_at = started_at + Duration::from_millis(250);
-    let mut scripted_key_index = 0usize;
-    let mut packet_count = 0usize;
-
-    let result = (|| -> Result<()> {
-        while started_at.elapsed() < options.duration {
-            drain_remote_logs(&log_rx, &mut on_event);
-
-            if scripted_key_index < options.scripted_keys.len() && Instant::now() >= next_key_at {
-                let key = options.scripted_keys[scripted_key_index];
-                proto
-                    .press_remote_key(key)
-                    .context("Failed to send key press")?;
-                on_event(RemoteMonitorEvent::Status(format!(
-                    "Sent remote key 0x{key:02X}"
-                )));
-                scripted_key_index += 1;
-                next_key_at = Instant::now() + options.key_interval;
-                drain_remote_logs(&log_rx, &mut on_event);
+    let summary = run_remote_session(
+        port_name,
+        &RemoteSessionOptions {
+            include_raw_logs: options.include_raw_logs,
+            suppress_idle_zero_logs: options.suppress_idle_zero_logs,
+            disable_radio_before_remote: options.disable_radio_before_remote,
+            recover_retries: options.recover_retries,
+            suppress_repeated_idle: true,
+            ..RemoteSessionOptions::default()
+        },
+        |elapsed| elapsed >= options.duration,
+        |elapsed| {
+            let index = command_index_for_next.get();
+            if !command_in_flight_for_next.get()
+                && index < options.scripted_commands.len()
+                && schedule.command_due(elapsed)
+            {
+                let command = options.scripted_commands[index].clone();
+                command_in_flight_for_next.set(true);
+                schedule.mark_sent(elapsed, options.key_interval);
+                Some(command)
+            } else {
+                None
+            }
+        },
+        |event| {
+            if let RemoteCaptureEvent::Phase(RemoteSessionPhase::Armed) = &event {
+                schedule.reset(options.command_start_delay);
             }
 
-            match proto.parse_remote_packet() {
-                Ok(Some(packet)) => {
-                    packet_count += 1;
-                    on_event(RemoteMonitorEvent::Packet(packet));
+            match event {
+                RemoteCaptureEvent::Status(message) => {
+                    on_event(RemoteMonitorEvent::Status(message));
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-                Err(error) => {
-                    return Err(error).context("Remote packet stream failed");
+                RemoteCaptureEvent::Log(message) => on_event(RemoteMonitorEvent::Log(message)),
+                RemoteCaptureEvent::Phase(phase) => on_event(RemoteMonitorEvent::Phase(phase)),
+                RemoteCaptureEvent::Control(report) => {
+                    command_in_flight_for_event.set(false);
+                    if report.success {
+                        command_index_for_event.set(command_index_for_event.get() + 1);
+                    }
+                    on_event(RemoteMonitorEvent::Control(report));
                 }
+                RemoteCaptureEvent::Packet(packet) => on_event(RemoteMonitorEvent::Packet(packet)),
+                RemoteCaptureEvent::Delta(delta) => on_event(RemoteMonitorEvent::Delta(delta)),
             }
-        }
+        },
+    )?;
+    Ok(summary)
+}
 
-        Ok(())
-    })();
-
-    let _ = proto.remote_off();
-    drain_remote_logs(&log_rx, &mut on_event);
-    on_event(RemoteMonitorEvent::Status("Remote mode OFF".to_string()));
-
-    result?;
-    Ok(packet_count)
+fn remote_key_name(key_code: u8) -> &'static str {
+    match key_code {
+        0x01 => "0",
+        0x02 => "1",
+        0x03 => "2",
+        0x04 => "3",
+        0x05 => "4",
+        0x06 => "5",
+        0x07 => "6",
+        0x08 => "7",
+        0x09 => "8",
+        0x0A => "9",
+        0x0B => "menu",
+        0x0C => "up",
+        0x0D => "down",
+        0x0E => "exit",
+        0x0F => "*",
+        0x10 => "#",
+        0x11 => "v/m",
+        0x12 => "flashlight",
+        0x13 => "ptt-a",
+        0x1A => "ptt-b",
+        _ => "unknown",
+    }
 }
 
 pub fn inspect_codeplug(data: &[u8]) -> Result<CodeplugInspection> {
@@ -1338,19 +1477,6 @@ fn explain_open_error(port_name: &str, error: anyhow::Error) -> anyhow::Error {
     }
 }
 
-fn drain_remote_logs<F>(log_rx: &Option<mpsc::Receiver<String>>, on_event: &mut F)
-where
-    F: FnMut(RemoteMonitorEvent),
-{
-    let Some(log_rx) = log_rx else {
-        return;
-    };
-
-    while let Ok(message) = log_rx.try_recv() {
-        on_event(RemoteMonitorEvent::Log(message));
-    }
-}
-
 fn read_block_range<F>(
     proto: &mut RadioProtocol,
     start_block: usize,
@@ -1590,6 +1716,8 @@ fn port_candidate_from_info(port: serialport::SerialPortInfo) -> PortCandidate {
         manufacturer,
         usb_vid,
         usb_pid,
+        ble_device_id: None,
+        ble_rssi: None,
         handshake_ok: false,
         firmware_variant: None,
     }
@@ -1684,6 +1812,7 @@ mod tests {
     };
     use crate::protocol::EEPROM_SIZE;
     use crate::protocol::radio::SETTINGS_MAGIC;
+    use std::time::Duration;
 
     #[test]
     fn sorts_usb_radio_ports_ahead_of_auxiliary_ports() {
@@ -1755,6 +1884,22 @@ mod tests {
 
         assert!(names.contains(&"/dev/cu.usbserial-2110"));
         assert!(!names.contains(&"/dev/tty.usbserial-2110"));
+    }
+
+    #[test]
+    fn remote_command_schedule_resets_when_session_rearms() {
+        let schedule = super::RemoteCommandSchedule::new(Duration::from_millis(250));
+
+        assert!(!schedule.command_due(Duration::from_millis(249)));
+        assert!(schedule.command_due(Duration::from_millis(250)));
+
+        schedule.mark_sent(Duration::from_millis(250), Duration::from_millis(350));
+        assert!(!schedule.command_due(Duration::from_millis(599)));
+        assert!(schedule.command_due(Duration::from_millis(600)));
+
+        schedule.reset(Duration::from_millis(250));
+        assert!(!schedule.command_due(Duration::from_millis(249)));
+        assert!(schedule.command_due(Duration::from_millis(250)));
     }
 
     #[test]
@@ -1850,6 +1995,8 @@ mod tests {
             manufacturer: None,
             usb_vid: None,
             usb_pid: None,
+            ble_device_id: None,
+            ble_rssi: None,
             handshake_ok: false,
             firmware_variant: None,
         }

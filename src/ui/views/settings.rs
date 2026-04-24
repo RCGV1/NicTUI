@@ -15,6 +15,8 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
 
+const BLUETOOTH_SETTING_INDEX: usize = 30;
+
 pub fn render_settings_table(f: &mut Frame, app: &mut App, area: Rect) {
     let settings = match &app.settings {
         Some(s) => s,
@@ -69,24 +71,31 @@ pub fn render_settings_table(f: &mut Frame, app: &mut App, area: Rect) {
         .selected()
         .map(|index| format!("M{}", SETTINGS_METADATA[index].menu_num))
         .unwrap_or_else(|| "--".to_string());
+    let bluetooth_summary = if settings.get_value(BLUETOOTH_SETTING_INDEX) == 0 {
+        "BLE disabled"
+    } else {
+        "BLE enabled"
+    };
 
     let summary_text = if area.width < 90 {
         format!(
-            "{} set | {} on | {} rng | {} opt | {}",
+            "{} fields | {} toggles on | {} numeric | {} choices | {} | {}",
             SETTINGS_METADATA.len(),
             enabled_toggles,
             numeric_count,
             enum_count,
-            selected_label
+            selected_label,
+            bluetooth_summary
         )
     } else {
         format!(
-            "{} fields | {} toggles on | {} numeric | {} choice | focus {}",
+            "{} fields | {} toggles on | {} numeric | {} choices | focus {} | {}",
             SETTINGS_METADATA.len(),
             enabled_toggles,
             numeric_count,
             enum_count,
-            selected_label
+            selected_label,
+            bluetooth_summary
         )
     };
 
@@ -101,7 +110,7 @@ pub fn render_settings_table(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(summary, chunks[0]);
 
     let rows = SETTINGS_METADATA.iter().enumerate().map(|(i, meta)| {
-        let display_val = settings.get_display_value(i);
+        let display_val = truncate_line(&settings.get_display_value(i), 24);
         let style = if Some(i) == app.settings_state.selected() {
             Style::default()
                 .fg(COLOR_SELECTION_FG)
@@ -212,19 +221,28 @@ fn selected_setting_lines(
     let meta = &SETTINGS_METADATA[index];
     let display_value = settings.get_display_value(index);
     let raw_value = settings.get_value(index);
-    let detail = match meta.setting_type {
-        SettingType::Boolean => "Options Off / On".to_string(),
-        SettingType::Enum(options) => format!("Options {}", options.join(" / ")),
+    let detail = match &meta.setting_type {
+        SettingType::Boolean => "Allowed: Off or On".to_string(),
+        SettingType::Enum(options) => format!("Allowed: {}", options.join(" / ")),
         SettingType::Numeric { min, max, unit } => {
             if unit.is_empty() {
-                format!("Range {}-{}", min, max)
+                format!("Allowed: {}-{}", min, max)
             } else {
-                format!("Range {}-{} {}", min, max, unit)
+                format!("Allowed: {}-{} {}", min, max, unit)
             }
         }
     };
+    let bluetooth_hint = if index == BLUETOOTH_SETTING_INDEX {
+        Some(if raw_value == 0 {
+            "BLE is disabled. Turn this on before using a phone app or NicTUI over BLE."
+        } else {
+            "BLE is enabled. You can scan from the connection screen."
+        })
+    } else {
+        None
+    };
 
-    vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(
                 format!(" M{} ", meta.menu_num),
@@ -236,12 +254,12 @@ fn selected_setting_lines(
             Span::raw(format!(" {} ", meta.name)),
         ]),
         Line::from(vec![
+            Span::styled("Current: ", Style::default().fg(COLOR_DIM)),
             Span::styled(
-                display_value,
+                display_value.clone(),
                 Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" | "),
-            Span::styled(format!("raw {raw_value}"), Style::default().fg(COLOR_DIM)),
+            Span::raw(setting_storage_hint(meta, raw_value, &display_value)),
         ]),
         Line::from(if compact {
             vec![
@@ -251,7 +269,10 @@ fn selected_setting_lines(
                         .fg(COLOR_PRIMARY)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!(" | {}", compact_detail(&detail))),
+                Span::raw(format!(
+                    " | {}",
+                    truncate_line(&compact_detail(&detail), 56)
+                )),
             ]
         } else {
             vec![
@@ -261,7 +282,7 @@ fn selected_setting_lines(
                         .fg(COLOR_PRIMARY)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!(" | {}", detail)),
+                Span::raw(format!(" | {}", truncate_line(&detail, 72))),
             ]
         }),
         Line::from(vec![
@@ -274,11 +295,93 @@ fn selected_setting_lines(
             render_shortcut("w"),
             Span::raw(": Write"),
         ]),
-    ]
+    ];
+
+    if let Some(bluetooth_hint) = bluetooth_hint {
+        lines.push(Line::from(vec![
+            Span::styled(
+                " BLE ",
+                Style::default()
+                    .fg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(bluetooth_hint),
+        ]));
+    }
+
+    lines
 }
 
 fn compact_detail(detail: &str) -> String {
-    detail
-        .replace("Options ", "Opts ")
-        .replace("Range ", "Rng ")
+    detail.replace("Allowed: ", "Allowed ").replace(" or ", "/")
+}
+
+fn setting_storage_hint(meta: &SettingMetadata, raw_value: u32, display_value: &str) -> String {
+    match &meta.setting_type {
+        SettingType::Enum(options) if raw_value as usize >= options.len() => {
+            format!(" | Stored code {raw_value}")
+        }
+        SettingType::Boolean if raw_value > 1 => format!(" | Stored code {raw_value}"),
+        SettingType::Numeric { unit, .. }
+            if !unit.is_empty() && display_value != raw_value.to_string() =>
+        {
+            format!(" | Stored value {raw_value}")
+        }
+        _ => String::new(),
+    }
+}
+
+fn truncate_line(text: &str, max_len: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_len {
+        text.to_string()
+    } else if max_len <= 3 {
+        text.chars().take(max_len).collect()
+    } else {
+        let mut shortened = text
+            .chars()
+            .take(max_len.saturating_sub(3))
+            .collect::<String>();
+        shortened.push_str("...");
+        shortened
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setting_storage_hint_hides_redundant_raw_values() {
+        let meta = SettingMetadata {
+            menu_num: "00",
+            name: "Squelch",
+            setting_type: SettingType::Numeric {
+                min: 0,
+                max: 9,
+                unit: "",
+            },
+        };
+
+        assert_eq!(setting_storage_hint(&meta, 4, "4"), "");
+    }
+
+    #[test]
+    fn setting_storage_hint_explains_unknown_choice_codes() {
+        let meta = SettingMetadata {
+            menu_num: "03",
+            name: "Active VFO",
+            setting_type: SettingType::Enum(&["VFO A", "VFO B"]),
+        };
+
+        assert_eq!(
+            setting_storage_hint(&meta, 4, "Unknown (4)"),
+            " | Stored code 4"
+        );
+    }
+
+    #[test]
+    fn truncate_line_adds_ascii_ellipsis() {
+        assert_eq!(truncate_line("Off / RX / TX / Both", 12), "Off / RX ...");
+    }
 }

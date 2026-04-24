@@ -50,10 +50,33 @@ jobs:
           echo "Version: ${{ steps.version.outputs.VERSION }}"
           echo "Should release: ${{ steps.check_release.outputs.result != 'true' }}"
 
+  contract-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libudev-dev
+
+      - name: Run remote/BLE contract checks
+        run: |
+          cargo test --locked remote::tests
+          cargo test --locked ble::tests
+          cargo test --locked protocol::radio::tests
+          cargo test --locked cli::tests
+
   build-macos-x86_64:
-    needs: check-version
+    needs: [check-version, contract-checks]
     if: needs.check-version.outputs.should_release == 'true'
     runs-on: macos-15-intel
+    env:
+      TARGET_TRIPLE: x86_64-apple-darwin
+      APPLE_DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_BASE64 }}
+      APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+      APPLE_DEVELOPER_ID_APPLICATION_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_IDENTITY }}
+      APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
     steps:
       - uses: actions/checkout@v4
 
@@ -63,22 +86,101 @@ jobs:
           VERSION=$(grep '^version = ' Cargo.toml | awk -F'"' '{print $2}')
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Build Release
-        run: cargo build --release --target x86_64-apple-darwin --bin nictui
+      - name: Configure Developer ID signing
+        run: |
+          set -euo pipefail
+          echo "SIGNING_CONFIGURED=false" >> "${GITHUB_ENV}"
+          echo "NOTARIZATION_CONFIGURED=false" >> "${GITHUB_ENV}"
 
-      - name: Rename binary
-        run: mv target/x86_64-apple-darwin/release/nictui nictui-${{ steps.version.outputs.VERSION }}-macos-x86_64
+          if [[ -z "${APPLE_DEVELOPER_ID_CERTIFICATE_BASE64}" || -z "${APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD}" ]]; then
+            echo "Developer ID certificate secrets are required for public macOS releases." >&2
+            exit 1
+          fi
+
+          KEYCHAIN_PATH="${RUNNER_TEMP}/nictui-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          CERTIFICATE_PATH="${RUNNER_TEMP}/developer-id-application.p12"
+
+          printf '%s' "${APPLE_DEVELOPER_ID_CERTIFICATE_BASE64}" | python3 -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))' > "${CERTIFICATE_PATH}"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${CERTIFICATE_PATH}" -P "${APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD}" -A -t cert -f pkcs12 -k "${KEYCHAIN_PATH}"
+          security list-keychains -d user -s "${KEYCHAIN_PATH}"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          SIGN_IDENTITY="${APPLE_DEVELOPER_ID_APPLICATION_IDENTITY}"
+          if [[ -z "${SIGN_IDENTITY}" ]]; then
+            SIGN_IDENTITY="$(security find-identity -v -p codesigning "${KEYCHAIN_PATH}" | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          fi
+          if [[ -z "${SIGN_IDENTITY}" ]]; then
+            echo "No Developer ID Application signing identity found in imported certificate." >&2
+            exit 1
+          fi
+
+          echo "NICTUI_MACOS_SIGN_IDENTITY=${SIGN_IDENTITY}" >> "${GITHUB_ENV}"
+          echo "SIGNING_CONFIGURED=true" >> "${GITHUB_ENV}"
+          echo "Developer ID signing configured."
+
+          if [[ -z "${APPLE_NOTARY_KEY_BASE64}" || -z "${APPLE_NOTARY_KEY_ID}" || -z "${APPLE_NOTARY_ISSUER_ID}" ]]; then
+            echo "Notary API key secrets are required for public macOS releases." >&2
+            exit 1
+          fi
+
+          NOTARY_KEY_PATH="${RUNNER_TEMP}/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          printf '%s' "${APPLE_NOTARY_KEY_BASE64}" | python3 -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))' > "${NOTARY_KEY_PATH}"
+          chmod 600 "${NOTARY_KEY_PATH}"
+          echo "NICTUI_NOTARY_KEY=${NOTARY_KEY_PATH}" >> "${GITHUB_ENV}"
+          echo "NICTUI_NOTARY_KEY_ID=${APPLE_NOTARY_KEY_ID}" >> "${GITHUB_ENV}"
+          echo "NICTUI_NOTARY_ISSUER=${APPLE_NOTARY_ISSUER_ID}" >> "${GITHUB_ENV}"
+          echo "NOTARIZATION_CONFIGURED=true" >> "${GITHUB_ENV}"
+          echo "Apple notarization configured."
+
+      - name: Build Release Binary and NicTUI.app
+        run: |
+          BUILD_ARGS=(
+            --release \
+            --target "${TARGET_TRIPLE}" \
+            --output-dir "target/macos-app-x86_64" \
+            --zip "NicTUI-${{ steps.version.outputs.VERSION }}-macos-x86_64.app.zip"
+          )
+          if [[ "${SIGNING_CONFIGURED}" == "true" ]]; then
+            BUILD_ARGS+=(--sign-identity "${NICTUI_MACOS_SIGN_IDENTITY}")
+          fi
+          if [[ "${NOTARIZATION_CONFIGURED}" == "true" ]]; then
+            BUILD_ARGS+=(--notarize)
+          fi
+          scripts/build_macos_app.sh "${BUILD_ARGS[@]}"
+
+      - name: Rename and sign CLI binary
+        run: |
+          CLI_ASSET="nictui-${{ steps.version.outputs.VERSION }}-macos-x86_64"
+          cp target/${TARGET_TRIPLE}/release/nictui "${CLI_ASSET}"
+          if [[ "${SIGNING_CONFIGURED}" == "true" ]]; then
+            codesign --force --timestamp --options runtime --sign "${NICTUI_MACOS_SIGN_IDENTITY}" "${CLI_ASSET}"
+            codesign --verify --strict --verbose=2 "${CLI_ASSET}"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: nictui-macos-x86_64
-          path: nictui-${{ steps.version.outputs.VERSION }}-macos-x86_64
+          path: |
+            nictui-${{ steps.version.outputs.VERSION }}-macos-x86_64
+            NicTUI-${{ steps.version.outputs.VERSION }}-macos-x86_64.app.zip
 
   build-macos-aarch64:
-    needs: check-version
+    needs: [check-version, contract-checks]
     if: needs.check-version.outputs.should_release == 'true'
     runs-on: macos-15
+    env:
+      TARGET_TRIPLE: aarch64-apple-darwin
+      APPLE_DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_BASE64 }}
+      APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+      APPLE_DEVELOPER_ID_APPLICATION_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_IDENTITY }}
+      APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
     steps:
       - uses: actions/checkout@v4
 
@@ -88,20 +190,91 @@ jobs:
           VERSION=$(grep '^version = ' Cargo.toml | awk -F'"' '{print $2}')
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Build Release
-        run: cargo build --release --target aarch64-apple-darwin --bin nictui
+      - name: Configure Developer ID signing
+        run: |
+          set -euo pipefail
+          echo "SIGNING_CONFIGURED=false" >> "${GITHUB_ENV}"
+          echo "NOTARIZATION_CONFIGURED=false" >> "${GITHUB_ENV}"
 
-      - name: Rename binary
-        run: mv target/aarch64-apple-darwin/release/nictui nictui-${{ steps.version.outputs.VERSION }}-macos-aarch64
+          if [[ -z "${APPLE_DEVELOPER_ID_CERTIFICATE_BASE64}" || -z "${APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD}" ]]; then
+            echo "Developer ID certificate secrets are required for public macOS releases." >&2
+            exit 1
+          fi
+
+          KEYCHAIN_PATH="${RUNNER_TEMP}/nictui-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          CERTIFICATE_PATH="${RUNNER_TEMP}/developer-id-application.p12"
+
+          printf '%s' "${APPLE_DEVELOPER_ID_CERTIFICATE_BASE64}" | python3 -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))' > "${CERTIFICATE_PATH}"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${CERTIFICATE_PATH}" -P "${APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD}" -A -t cert -f pkcs12 -k "${KEYCHAIN_PATH}"
+          security list-keychains -d user -s "${KEYCHAIN_PATH}"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          SIGN_IDENTITY="${APPLE_DEVELOPER_ID_APPLICATION_IDENTITY}"
+          if [[ -z "${SIGN_IDENTITY}" ]]; then
+            SIGN_IDENTITY="$(security find-identity -v -p codesigning "${KEYCHAIN_PATH}" | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          fi
+          if [[ -z "${SIGN_IDENTITY}" ]]; then
+            echo "No Developer ID Application signing identity found in imported certificate." >&2
+            exit 1
+          fi
+
+          echo "NICTUI_MACOS_SIGN_IDENTITY=${SIGN_IDENTITY}" >> "${GITHUB_ENV}"
+          echo "SIGNING_CONFIGURED=true" >> "${GITHUB_ENV}"
+          echo "Developer ID signing configured."
+
+          if [[ -z "${APPLE_NOTARY_KEY_BASE64}" || -z "${APPLE_NOTARY_KEY_ID}" || -z "${APPLE_NOTARY_ISSUER_ID}" ]]; then
+            echo "Notary API key secrets are required for public macOS releases." >&2
+            exit 1
+          fi
+
+          NOTARY_KEY_PATH="${RUNNER_TEMP}/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          printf '%s' "${APPLE_NOTARY_KEY_BASE64}" | python3 -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))' > "${NOTARY_KEY_PATH}"
+          chmod 600 "${NOTARY_KEY_PATH}"
+          echo "NICTUI_NOTARY_KEY=${NOTARY_KEY_PATH}" >> "${GITHUB_ENV}"
+          echo "NICTUI_NOTARY_KEY_ID=${APPLE_NOTARY_KEY_ID}" >> "${GITHUB_ENV}"
+          echo "NICTUI_NOTARY_ISSUER=${APPLE_NOTARY_ISSUER_ID}" >> "${GITHUB_ENV}"
+          echo "NOTARIZATION_CONFIGURED=true" >> "${GITHUB_ENV}"
+          echo "Apple notarization configured."
+
+      - name: Build Release Binary and NicTUI.app
+        run: |
+          BUILD_ARGS=(
+            --release \
+            --target "${TARGET_TRIPLE}" \
+            --output-dir "target/macos-app-aarch64" \
+            --zip "NicTUI-${{ steps.version.outputs.VERSION }}-macos-aarch64.app.zip"
+          )
+          if [[ "${SIGNING_CONFIGURED}" == "true" ]]; then
+            BUILD_ARGS+=(--sign-identity "${NICTUI_MACOS_SIGN_IDENTITY}")
+          fi
+          if [[ "${NOTARIZATION_CONFIGURED}" == "true" ]]; then
+            BUILD_ARGS+=(--notarize)
+          fi
+          scripts/build_macos_app.sh "${BUILD_ARGS[@]}"
+
+      - name: Rename and sign CLI binary
+        run: |
+          CLI_ASSET="nictui-${{ steps.version.outputs.VERSION }}-macos-aarch64"
+          cp target/${TARGET_TRIPLE}/release/nictui "${CLI_ASSET}"
+          if [[ "${SIGNING_CONFIGURED}" == "true" ]]; then
+            codesign --force --timestamp --options runtime --sign "${NICTUI_MACOS_SIGN_IDENTITY}" "${CLI_ASSET}"
+            codesign --verify --strict --verbose=2 "${CLI_ASSET}"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: nictui-macos-aarch64
-          path: nictui-${{ steps.version.outputs.VERSION }}-macos-aarch64
+          path: |
+            nictui-${{ steps.version.outputs.VERSION }}-macos-aarch64
+            NicTUI-${{ steps.version.outputs.VERSION }}-macos-aarch64.app.zip
 
   build-windows:
-    needs: check-version
+    needs: [check-version, contract-checks]
     if: needs.check-version.outputs.should_release == 'true'
     runs-on: windows-latest
     steps:
@@ -127,7 +300,7 @@ jobs:
           path: nictui-${{ steps.version.outputs.VERSION }}-windows-x86_64.exe
 
   build-linux-x86_64:
-    needs: check-version
+    needs: [check-version, contract-checks]
     if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -173,11 +346,28 @@ jobs:
         with:
           path: artifacts
 
-      - name: Generate checksums
+      - name: Prepare release assets and checksums
         run: |
-          cd artifacts
-          find . -type f -exec sha256sum {} \; > checksums.txt
-          cd ..
+          set -euo pipefail
+          rm -rf release-assets
+          mkdir release-assets
+
+          while IFS= read -r -d '' asset; do
+            filename="${asset##*/}"
+            if [[ -e "release-assets/${filename}" ]]; then
+              echo "Duplicate release asset filename: ${filename}" >&2
+              exit 1
+            fi
+            cp "${asset}" "release-assets/${filename}"
+          done < <(find artifacts -mindepth 2 -maxdepth 2 -type f -print0)
+
+          cd release-assets
+          find . -maxdepth 1 -type f ! -name checksums.txt -print0 \
+            | sort -z \
+            | while IFS= read -r -d '' asset; do
+                sha256sum -- "${asset#./}"
+              done > checksums.txt
+          sha256sum -c checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -185,28 +375,36 @@ jobs:
           tag_name: v${{ steps.version.outputs.VERSION }}
           name: Release v${{ steps.version.outputs.VERSION }}
           files: |
-            artifacts/nictui-linux-x86_64/*
-            artifacts/nictui-macos-x86_64/*
-            artifacts/nictui-macos-aarch64/*
-            artifacts/nictui-windows-x86_64/*
-            artifacts/checksums.txt
+            release-assets/*
           body: |
-            ## Download Binaries
+            ## What's New
 
-            | Platform | File |
-            |----------|------|
-            | Linux x86_64 | `nictui-${{ steps.version.outputs.VERSION }}-linux-x86_64` |
-            | macOS x86_64 (Intel) | `nictui-${{ steps.version.outputs.VERSION }}-macos-x86_64` |
-            | macOS aarch64 (Apple Silicon) | `nictui-${{ steps.version.outputs.VERSION }}-macos-aarch64` |
-            | Windows x86_64 | `nictui-${{ steps.version.outputs.VERSION }}-windows-x86_64.exe` |
+            - Native Bluetooth support for TD-H3/NicSure radios, including scan, connect, probe, channel read, and TUI startup selection without a Python bridge.
+            - A signed and notarized macOS `NicTUI.app` bundle for the recommended first-run Bluetooth permission experience.
+            - Cleaner TUI screens with compact headers/footers, safer channel/settings focus panels, better BLE signal/status display, and Remote tab layouts that hold up on smaller terminals.
+            - Safer write flows: BLE writes are chunked for common GATT limits, full settings writes support `--no-reboot`, and experimental remote live writes require explicit confirmation or validation-only mode.
+            - Remote support is now honest about what the radio proves: telemetry/status capture is first-class, while control attempts are labeled by observed radio response instead of implied success.
+            - The installer now prefers the macOS app bundle on macOS, keeps CLI install available with `--cli`, verifies checksums, and uses a managed PATH block instead of editing unrelated shell config.
+
+            ## Download Artifacts
+
+            | Platform | CLI binary | App bundle |
+            |----------|------------|------------|
+            | Linux x86_64 | `nictui-${{ steps.version.outputs.VERSION }}-linux-x86_64` | n/a |
+            | macOS x86_64 (Intel) | `nictui-${{ steps.version.outputs.VERSION }}-macos-x86_64` | `NicTUI-${{ steps.version.outputs.VERSION }}-macos-x86_64.app.zip` |
+            | macOS aarch64 (Apple Silicon) | `nictui-${{ steps.version.outputs.VERSION }}-macos-aarch64` | `NicTUI-${{ steps.version.outputs.VERSION }}-macos-aarch64.app.zip` |
+            | Windows x86_64 | `nictui-${{ steps.version.outputs.VERSION }}-windows-x86_64.exe` | n/a |
 
             ## Note
 
             Linux ARM builds are temporarily disabled. See GitHub Actions workflow for status.
+            On macOS, prefer the `NicTUI.app.zip` asset for the recommended app UX and Bluetooth/TCC permission attribution to NicTUI itself.
+            The macOS app bundle archives are Developer ID signed, Apple-notarized, and stapled by release CI.
+            The raw macOS `nictui-*` CLI assets are provided for shell scripting and advanced terminal workflows. They are Developer ID signed but are not the recommended first-run Bluetooth permission path.
 
             ## Verification
 
-            Verify checksums:
+            From the directory containing the downloaded assets, verify checksums:
             ```
             sha256sum -c checksums.txt
             ```

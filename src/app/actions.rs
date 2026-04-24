@@ -5,7 +5,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::state::{App, AppEvent, AppMode, MainTab};
+use super::state::{App, AppEvent, AppMode, MainTab, WriteScope};
+use crate::ble::{
+    ble_scan_supported, disconnect_ble_bridge_for_device, ensure_ble_bridge_for_device,
+};
 use crate::channel_file::{load_channels_from_path, save_channels_to_path};
 use crate::device::{
     ProgressEvent, read_band_plans as read_radio_band_plans, read_channels as read_radio_channels,
@@ -16,30 +19,121 @@ use crate::device::{
     write_settings as write_radio_settings,
 };
 use crate::protocol::{BIN_FLASH_BAUD_RATE, RadioProtocol};
+use crate::remote::{
+    RemoteCaptureEvent, RemoteControlCommand, RemoteSessionOptions, run_remote_session,
+};
 
 impl App {
-    pub fn select_port(&mut self) {
-        if self.ports.is_empty() {
-            self.mode = AppMode::Error("No serial ports found".to_string());
+    pub fn refresh_radio_targets_from_tui(&mut self) {
+        self.refresh_ports();
+        self.start_ble_scan_from_tui();
+    }
+
+    pub fn start_ble_scan_from_tui(&mut self) {
+        self.dialog_open = false;
+        self.ble_scan_ui_suspended = false;
+
+        if self.ble_scan_in_progress {
+            self.status_message = "BLE scan already running...".to_string();
             return;
         }
 
-        let port_name = self.ports[self.selected_port_index].clone();
-        let was_detected_radio = self
-            .selected_port_candidate()
-            .map(|candidate| candidate.is_radio())
-            .unwrap_or(false);
-        self.protocol_port_name = Some(port_name.clone());
+        if !ble_scan_supported() {
+            self.status_message =
+                "Wireless scan is unavailable on this system. Use USB, or check that Bluetooth is enabled."
+                    .to_string();
+            return;
+        }
+
+        self.start_ble_scan(false);
+        if self.ble_scan_in_progress {
+            self.status_message = "Scanning for TD-H3 BLE radios...".to_string();
+        }
+    }
+
+    fn active_protocol_port(&mut self) -> Option<String> {
+        if let Some(device_id) = self.selected_ble_device_id().map(str::to_string) {
+            if self.ble_reconnect_required {
+                let _ = disconnect_ble_bridge_for_device(&device_id);
+                self.log(&format!(
+                    "Refreshing BLE transport for {}",
+                    self.selected_port_label()
+                ));
+            }
+
+            match ensure_ble_bridge_for_device(&device_id) {
+                Ok(bridge) => {
+                    self.protocol_port_name = Some(bridge.tty_path.clone());
+                    self.ble_reconnect_required = false;
+                    Some(bridge.tty_path)
+                }
+                Err(error) => {
+                    self.mode = AppMode::Error(format!(
+                        "Failed to reconnect BLE radio {}: {}",
+                        self.selected_port_label(),
+                        error
+                    ));
+                    None
+                }
+            }
+        } else {
+            self.protocol_port_name.clone()
+        }
+    }
+
+    fn mark_ble_reconnect_required(&mut self) {
+        if self.ble_transport_selected() {
+            self.ble_reconnect_required = true;
+        }
+    }
+
+    pub fn select_port(&mut self) {
+        if self.ports.is_empty() {
+            self.mode = AppMode::Error("No radio targets found".to_string());
+            return;
+        }
+
+        let Some(candidate) = self.selected_port_candidate().cloned() else {
+            self.mode = AppMode::Error("No radio target selected".to_string());
+            return;
+        };
+
+        let port_name = if let Some(device_id) = candidate.ble_device_id.as_deref() {
+            match ensure_ble_bridge_for_device(device_id) {
+                Ok(bridge) => bridge.tty_path,
+                Err(error) => {
+                    self.mode = AppMode::Error(format!(
+                        "Failed to connect to BLE radio {}: {}",
+                        candidate.port_name, error
+                    ));
+                    return;
+                }
+            }
+        } else {
+            candidate.port_name.clone()
+        };
+
+        let was_detected_radio = candidate.is_radio();
         self.mode = AppMode::Main(MainTab::Channels);
+        self.ble_reconnect_required = false;
         self.status_message = if was_detected_radio {
             format!(
                 "Using detected radio port {}. Radio opens on first action.",
-                port_name
+                Self::display_port_name(&candidate.port_name)
+            )
+        } else if candidate.is_ble() {
+            format!(
+                "Using nearby radio {}. NicTUI will connect when you read, write, or start Remote.",
+                candidate.port_name
             )
         } else {
-            format!("Selected {}. Radio opens on first action.", port_name)
+            format!(
+                "Selected {}. Radio opens on first action.",
+                Self::display_port_name(&candidate.port_name)
+            )
         };
-        self.log(&format!("Selected port {}", port_name));
+        self.protocol_port_name = Some(port_name);
+        self.log(&format!("Selected port {}", candidate.port_name));
     }
 
     pub fn pick_import_file(&mut self) {
@@ -55,9 +149,8 @@ impl App {
     }
 
     pub fn start_clear_channel(&mut self, channel_num: u16) {
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
         };
         let tx = self.event_tx.clone();
         self.mode = AppMode::Writing;
@@ -82,7 +175,7 @@ impl App {
                 Ok(()) => {
                     let _ = tx.send(AppEvent::Progress(1.0));
                     let _ = tx.send(AppEvent::Status("Channel cleared successfully".to_string()));
-                    let _ = tx.send(AppEvent::WriteComplete);
+                    let _ = tx.send(AppEvent::WriteComplete(WriteScope::Channels));
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::Error(format!("Failed to clear channel: {}", e)));
@@ -92,9 +185,8 @@ impl App {
     }
 
     pub fn start_read_channels(&mut self) {
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
         };
         if let AppMode::Main(tab) = self.mode {
             self.last_main_tab = tab;
@@ -147,9 +239,8 @@ impl App {
     }
 
     pub fn start_read_presets(&mut self) {
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
         };
         let tx = self.event_tx.clone();
         self.mode = AppMode::Reading;
@@ -196,9 +287,8 @@ impl App {
     }
 
     pub fn start_write_group_labels(&mut self) {
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
         };
         let tx = self.event_tx.clone();
         let group_labels = self.group_labels.clone();
@@ -217,7 +307,7 @@ impl App {
             }) {
                 Ok(()) => {
                     let _ = tx.send(AppEvent::Status("Group names saved".to_string()));
-                    let _ = tx.send(AppEvent::WriteComplete);
+                    let _ = tx.send(AppEvent::WriteComplete(WriteScope::GroupLabels));
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::Error(format!(
@@ -230,9 +320,8 @@ impl App {
     }
 
     pub fn start_read_bandplan(&mut self) {
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
         };
         let tx = self.event_tx.clone();
         self.mode = AppMode::Reading;
@@ -258,9 +347,8 @@ impl App {
     }
 
     pub fn start_read_dtmf(&mut self) {
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
         };
         let tx = self.event_tx.clone();
         self.mode = AppMode::Reading;
@@ -286,9 +374,8 @@ impl App {
     }
 
     pub fn start_write_dtmf(&mut self) {
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
         };
         let tx = self.event_tx.clone();
         let dtmf_presets = self.dtmf_presets.clone();
@@ -306,7 +393,7 @@ impl App {
             }) {
                 Ok(()) => {
                     let _ = tx.send(AppEvent::Status("DTMF written successfully".to_string()));
-                    let _ = tx.send(AppEvent::WriteComplete);
+                    let _ = tx.send(AppEvent::WriteComplete(WriteScope::Dtmf));
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::Error(format!("Failed to write DTMF: {}", e)));
@@ -316,9 +403,8 @@ impl App {
     }
 
     pub fn start_read_settings(&mut self) {
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
         };
         let tx = self.event_tx.clone();
         self.mode = AppMode::Reading;
@@ -344,15 +430,22 @@ impl App {
     }
 
     pub fn start_write_settings_and_reboot(&mut self) {
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
-        };
-        let tx = self.event_tx.clone();
         let settings = match &self.settings {
             Some(s) => s.clone(),
-            None => return,
+            None => {
+                self.status_message = "Read settings before writing".to_string();
+                return;
+            }
         };
+        if !self.settings_dirty {
+            self.status_message = "No settings changes to write".to_string();
+            return;
+        }
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
+        };
+        self.mark_ble_reconnect_required();
+        let tx = self.event_tx.clone();
         self.mode = AppMode::Writing;
         self.progress = 0.0;
 
@@ -375,7 +468,7 @@ impl App {
                     let _ = tx.send(AppEvent::Status(
                         "Settings written successfully".to_string(),
                     ));
-                    let _ = tx.send(AppEvent::WriteComplete);
+                    let _ = tx.send(AppEvent::WriteComplete(WriteScope::Settings));
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::Error(format!("Failed to write settings: {}", e)));
@@ -386,89 +479,74 @@ impl App {
 
     pub fn remote_on(&mut self) {
         if self.remote_active {
-            self.status_message = "Remote mode already active".to_string();
+            self.status_message = if self.remote_tx.is_some() {
+                "Remote mode already active".to_string()
+            } else {
+                "Remote mode is still stopping".to_string()
+            };
             return;
         }
 
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
         };
         let tx = self.event_tx.clone();
         let (key_tx, key_rx) = mpsc::channel();
         self.remote_screen = Default::default();
+        self.remote_screen.phase = crate::remote::RemoteSessionPhase::Opening;
+        self.remote_screen.last_failure = None;
         self.remote_tx = Some(key_tx);
         self.remote_active = true;
-        self.status_message = "Starting remote mode...".to_string();
+        self.status_message = "Opening remote session...".to_string();
         self.remote_stop_signal.store(false, Ordering::SeqCst);
         let stop_signal = self.remote_stop_signal.clone();
 
         thread::spawn(move || {
-            let mut proto = match RadioProtocol::new(&port_name) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::RemoteStopped(format!(
-                        "Failed to open remote port: {}",
-                        e
-                    )));
-                    return;
-                }
-            };
-
-            let log_tx = tx.clone();
-            proto.log_callback = Some(Box::new(move |message| {
-                let _ = log_tx.send(AppEvent::Log(message));
-            }));
-
-            if !proto.handshake().unwrap_or(false) {
-                let _ = tx.send(AppEvent::RemoteStopped(
-                    "Remote handshake failed".to_string(),
-                ));
-                return;
-            }
-
-            if !proto.remote_on().unwrap_or(false) {
-                let _ = tx.send(AppEvent::RemoteStopped(
-                    "Radio rejected remote mode".to_string(),
-                ));
-                return;
-            }
-
-            let _ = tx.send(AppEvent::Status("Remote mode ON".to_string()));
-
-            loop {
-                if stop_signal.load(Ordering::SeqCst) {
-                    let _ = proto.remote_off();
-                    let _ = tx.send(AppEvent::RemoteStopped("Remote mode OFF".to_string()));
-                    break;
-                }
-
-                let mut key_failure = None;
-                while let Ok(key) = key_rx.try_recv() {
-                    if let Err(e) = proto.press_remote_key(key) {
-                        key_failure = Some(format!("Failed to send remote key: {}", e));
-                        break;
+            let result = run_remote_session(
+                &port_name,
+                &RemoteSessionOptions {
+                    include_raw_logs: false,
+                    disable_radio_before_remote: false,
+                    recover_retries: 3,
+                    suppress_repeated_idle: true,
+                    ..RemoteSessionOptions::default()
+                },
+                |_| stop_signal.load(Ordering::SeqCst),
+                |_| key_rx.try_recv().ok(),
+                |event| match event {
+                    RemoteCaptureEvent::Status(message) => {
+                        let _ = tx.send(AppEvent::Status(message));
                     }
-                }
-                if let Some(message) = key_failure {
-                    let _ = tx.send(AppEvent::RemoteStopped(message));
-                    break;
-                }
+                    RemoteCaptureEvent::Log(message) => {
+                        let _ = tx.send(AppEvent::Log(message));
+                    }
+                    RemoteCaptureEvent::Phase(phase) => {
+                        let _ = tx.send(AppEvent::RemotePhase(phase));
+                    }
+                    RemoteCaptureEvent::Control(report) => {
+                        let _ = tx.send(AppEvent::RemoteControl(report));
+                    }
+                    RemoteCaptureEvent::Packet(packet) => {
+                        let _ = tx.send(AppEvent::RemotePacket(packet));
+                    }
+                    RemoteCaptureEvent::Delta(delta) => {
+                        let _ = tx.send(AppEvent::RemoteDelta(delta));
+                    }
+                },
+            );
 
-                match proto.parse_remote_packet() {
-                    Ok(Some(pkt)) => {
-                        let _ = tx.send(AppEvent::RemotePacket(pkt));
-                    }
-                    Ok(None) => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::RemoteStopped(format!(
-                            "Remote connection lost: {}",
-                            e
-                        )));
-                        break;
-                    }
+            match result {
+                Ok(_) => {
+                    let _ = tx.send(AppEvent::RemoteStopped {
+                        message: "Remote mode OFF".to_string(),
+                        failure: None,
+                    });
+                }
+                Err(failure) => {
+                    let _ = tx.send(AppEvent::RemoteStopped {
+                        message: format!("Remote session {}: {}", failure.kind, failure.summary),
+                        failure: Some(failure),
+                    });
                 }
             }
         });
@@ -477,7 +555,6 @@ impl App {
     pub fn remote_off(&mut self) {
         if self.remote_active {
             self.remote_stop_signal.store(true, Ordering::SeqCst);
-            self.remote_active = false;
             self.remote_tx = None;
             self.status_message = "Stopping remote mode...".to_string();
         }
@@ -485,7 +562,11 @@ impl App {
 
     pub fn send_key(&mut self, key_code: u8) {
         if let Some(tx) = &self.remote_tx {
-            if tx.send(key_code).is_ok() {
+            let label = remote_key_label(key_code);
+            if tx
+                .send(RemoteControlCommand::raw_key(label, key_code))
+                .is_ok()
+            {
                 let label = remote_key_label(key_code);
                 self.status_message = format!("Sent remote key {label}");
                 self.log(&format!("Remote key {label}"));
@@ -500,9 +581,8 @@ impl App {
     }
 
     pub fn start_write_channel(&mut self, index: usize) {
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
         };
         let tx = self.event_tx.clone();
         let channel = match self.channels.get(index) {
@@ -532,7 +612,7 @@ impl App {
                 Ok(()) => {
                     let _ = tx.send(AppEvent::Progress(1.0));
                     let _ = tx.send(AppEvent::Status("Channel written successfully".to_string()));
-                    let _ = tx.send(AppEvent::WriteComplete);
+                    let _ = tx.send(AppEvent::WriteComplete(WriteScope::Channels));
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::Error(format!("Failed to write channel: {}", e)));
@@ -542,10 +622,12 @@ impl App {
     }
 
     pub fn start_write_multiple_channels(&mut self, _start_index: usize, reboot: bool) {
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
         };
+        if reboot {
+            self.mark_ble_reconnect_required();
+        }
         let tx = self.event_tx.clone();
         let channels = self.channels.clone();
         let deleted_channels = self.deleted_channels.clone();
@@ -573,7 +655,7 @@ impl App {
                     let _ = tx.send(AppEvent::Status(
                         "Channels updated successfully".to_string(),
                     ));
-                    let _ = tx.send(AppEvent::WriteComplete);
+                    let _ = tx.send(AppEvent::WriteComplete(WriteScope::Channels));
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::Error(format!("Failed to update channels: {}", e)));
@@ -583,9 +665,8 @@ impl App {
     }
 
     pub fn start_write_csv_channels(&mut self, path: PathBuf) {
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
         };
         let tx = self.event_tx.clone();
         let endian = self.endian;
@@ -615,7 +696,7 @@ impl App {
                     let _ = tx.send(AppEvent::Status(
                         "CSV Channels written successfully".to_string(),
                     ));
-                    let _ = tx.send(AppEvent::WriteComplete);
+                    let _ = tx.send(AppEvent::WriteComplete(WriteScope::None));
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::Error(format!(
@@ -867,15 +948,13 @@ impl App {
             return;
         }
 
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => {
-                let _ = self
-                    .event_tx
-                    .send(AppEvent::Error("Not connected to radio".to_string()));
-                return;
-            }
+        let Some(port_name) = self.active_protocol_port() else {
+            let _ = self
+                .event_tx
+                .send(AppEvent::Error("Not connected to radio".to_string()));
+            return;
         };
+        self.mark_ble_reconnect_required();
 
         let codeplug_data = self.codeplug_data.clone().unwrap();
         let tx = self.event_tx.clone();
@@ -892,7 +971,7 @@ impl App {
                 }
             }) {
                 Ok(()) => {
-                    let _ = tx.send(AppEvent::WriteComplete);
+                    let _ = tx.send(AppEvent::WriteComplete(WriteScope::Codeplug));
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::Error(format!("Failed to write codeplug: {}", e)));
@@ -947,14 +1026,10 @@ impl App {
             }
         };
 
-        let port_name = match &self.protocol_port_name {
-            Some(p) => p.clone(),
-            None => {
-                self.mode = AppMode::Error(
-                    "Not connected to a port. Please select a port first.".to_string(),
-                );
-                return;
-            }
+        let Some(port_name) = self.active_protocol_port() else {
+            self.mode =
+                AppMode::Error("Not connected to a port. Please select a port first.".to_string());
+            return;
         };
 
         let tx = self.event_tx.clone();
@@ -1142,26 +1217,45 @@ impl App {
 
 fn remote_key_label(key_code: u8) -> &'static str {
     match key_code {
-        0x80 => "0",
-        0x81 => "1",
-        0x82 => "2",
-        0x83 => "3",
-        0x84 => "4",
-        0x85 => "5",
-        0x86 => "6",
-        0x87 => "7",
-        0x88 => "8",
-        0x89 => "9",
-        0x8A => "menu",
-        0x8B => "up",
-        0x8C => "down",
-        0x8D => "exit",
-        0x8E => "*",
-        0x8F => "#",
-        0x90 => "A/PTT",
-        0x91 => "B/PTT",
-        0x92 => "light",
-        0x94 => "V/M",
+        0x01 => "0",
+        0x02 => "1",
+        0x03 => "2",
+        0x04 => "3",
+        0x05 => "4",
+        0x06 => "5",
+        0x07 => "6",
+        0x08 => "7",
+        0x09 => "8",
+        0x0A => "9",
+        0x0B => "menu",
+        0x0C => "up",
+        0x0D => "down",
+        0x0E => "exit",
+        0x0F => "*",
+        0x10 => "#",
+        0x11 => "V/M",
+        0x12 => "light",
+        0x13 => "A/PTT",
+        0x1A => "B/PTT",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_ble_scan_action_does_not_leave_scan_modal_state_when_scan_is_running() {
+        let mut app = App::new();
+        app.ble_scan_in_progress = true;
+        app.dialog_open = true;
+        app.ble_scan_ui_suspended = true;
+
+        app.start_ble_scan_from_tui();
+
+        assert!(!app.dialog_open);
+        assert!(!app.ble_scan_ui_suspended);
+        assert_eq!(app.status_message, "BLE scan already running...");
     }
 }

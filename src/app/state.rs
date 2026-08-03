@@ -178,4 +178,5 @@ pub struct App {
     pub dialog_open: bool,
     pub pending_channel_edit: Option<Channel>,
     pub dtmf_edit_preset_idx: Option<usize>,
+    pub demo_mode: bool,
 }

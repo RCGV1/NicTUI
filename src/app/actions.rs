@@ -478,6 +478,12 @@ impl App {
     }
 
     pub fn remote_on(&mut self) {
+        if self.demo_mode {
+            self.remote_active = true;
+            self.remote_screen.phase = crate::remote::RemoteSessionPhase::Live;
+            self.status_message = "Demo remote session active · no hardware I/O".to_string();
+            return;
+        }
         if self.remote_active {
             self.status_message = if self.remote_tx.is_some() {
                 "Remote mode already active".to_string()

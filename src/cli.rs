@@ -174,6 +174,19 @@ pub enum Commands {
 pub struct TuiArgs {
     #[command(flatten)]
     pub port: PortArgs,
+    /// Launch a populated simulated radio without connecting to hardware
+    #[arg(long)]
+    pub demo: bool,
+    /// Initial view for demo mode: channels, settings, or remote
+    #[arg(long, value_enum, default_value = "channels")]
+    pub demo_view: DemoView,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DemoView {
+    Channels,
+    Settings,
+    Remote,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1034,15 +1047,25 @@ pub enum PvojhSweepStage {
 }
 
 pub enum Dispatch {
-    LaunchTui { port: Option<String> },
+    LaunchTui {
+        port: Option<String>,
+        demo: bool,
+        demo_view: DemoView,
+    },
     Exit,
 }
 
 pub fn dispatch(cli: Cli) -> Result<Dispatch> {
     match cli.command {
-        None => Ok(Dispatch::LaunchTui { port: None }),
+        None => Ok(Dispatch::LaunchTui {
+            port: None,
+            demo: false,
+            demo_view: DemoView::Channels,
+        }),
         Some(Commands::Tui(args)) => Ok(Dispatch::LaunchTui {
             port: resolve_optional_port_for_args(&args.port)?,
+            demo: args.demo,
+            demo_view: args.demo_view,
         }),
         Some(Commands::Version) => {
             println!("NicTUI {}", env!("CARGO_PKG_VERSION"));

@@ -22,7 +22,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use nictui::app::{App, AppMode, MainTab};
-use nictui::cli::{Cli, Dispatch, dispatch};
+use nictui::cli::{Cli, DemoView, Dispatch, dispatch};
 use nictui::skill::print_post_exit_skill_hint;
 use nictui::ui;
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -33,20 +33,38 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match dispatch(cli)? {
-        Dispatch::LaunchTui { port } => launch_tui(port),
+        Dispatch::LaunchTui {
+            port,
+            demo,
+            demo_view,
+        } => launch_tui(port, demo, demo_view),
         Dispatch::Exit => Ok(()),
     }
 }
 
-fn launch_tui(port: Option<String>) -> Result<()> {
+fn launch_tui(port: Option<String>, demo: bool, demo_view: DemoView) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
-    if let Some(port_name) = port {
+    let mut app = if demo { App::demo() } else { App::new() };
+    if demo {
+        // Demo mode is intentionally hardware-free so it is safe for screenshots and UI review.
+        app.mode = AppMode::Main(match demo_view {
+            DemoView::Channels => MainTab::Channels,
+            DemoView::Settings => MainTab::Settings,
+            DemoView::Remote => {
+                app.remote_active = true;
+                MainTab::Remote
+            }
+        });
+        app.last_main_tab = match app.mode {
+            AppMode::Main(tab) => tab,
+            _ => MainTab::Channels,
+        };
+    } else if let Some(port_name) = port {
         app.connect_to_port_by_name(&port_name);
     } else if should_auto_start_ble_scan() {
         app.start_ble_scan(should_prepare_ui_for_startup_ble_scan());

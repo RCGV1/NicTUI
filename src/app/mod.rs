@@ -11,7 +11,14 @@ use crate::ble::{
     scan_td_h3_ble_devices,
 };
 use crate::device::{PortCandidate, PortKind, list_port_candidates};
-use crate::protocol::{Endianness, GROUP_LABEL_COUNT};
+use crate::protocol::{
+    BandPlan, Channel, DTMFPreset, Endianness, GROUP_LABEL_COUNT, RemotePacket, ScanPreset,
+    SettingsBlock, VfoState,
+};
+use crate::remote::{
+    RemoteCommandReaction, RemoteControlReport, RemoteControlStrategy, RemoteEvidenceKind,
+    RemoteSessionPhase,
+};
 
 const BLUETOOTH_SETTING_INDEX: usize = 30;
 
@@ -92,7 +99,289 @@ impl App {
             dialog_open: false,
             pending_channel_edit: None,
             dtmf_edit_preset_idx: None,
+            demo_mode: false,
         }
+    }
+
+    /// Build a populated, hardware-free workspace for screenshots and UI review.
+    pub fn demo() -> Self {
+        let mut app = Self::new();
+        let candidate = PortCandidate {
+            port_name: "TD-H3 #6CAF".to_string(),
+            kind: PortKind::Ble,
+            score: 900,
+            product: Some("TD-H3".to_string()),
+            manufacturer: Some("NicSure".to_string()),
+            usb_vid: None,
+            usb_pid: None,
+            ble_device_id: Some("demo-td-h3".to_string()),
+            ble_rssi: Some(-58),
+            handshake_ok: true,
+            firmware_variant: Some(crate::device::FirmwareVariant::NicSure),
+        };
+
+        app.serial_port_candidates.clear();
+        app.ble_port_candidates = vec![candidate.clone()];
+        app.port_candidates = vec![candidate.clone()];
+        app.ports = vec![candidate.port_name.clone()];
+        app.selected_port_index = 0;
+        app.protocol_port_name = Some("demo://TD-H3".to_string());
+        app.status_message = "Demo radio connected · simulated data".to_string();
+        app.mode = AppMode::Main(MainTab::Channels);
+        app.last_main_tab = MainTab::Channels;
+        app.last_non_remote_tab = MainTab::Channels;
+        app.demo_mode = true;
+
+        app.channels = (1..=48)
+            .map(|channel_num| {
+                let base = 145.310 + (channel_num as f64 * 0.025);
+                let tx = if channel_num % 4 == 0 {
+                    base - 0.600
+                } else {
+                    base
+                };
+                Channel {
+                    channel_num,
+                    name: [
+                        "North Ridge",
+                        "Harbor Ops",
+                        "Valley Link",
+                        "Event Team",
+                        "Civic Net",
+                        "Summit 2m",
+                        "Metro Wide",
+                        "Field Coord",
+                    ][(channel_num as usize - 1) % 8]
+                        .to_string(),
+                    rx_freq: format!("{base:.5}"),
+                    tx_freq: format!("{tx:.5}"),
+                    rx_tone: if channel_num % 5 == 0 { "100.0" } else { "Off" }.to_string(),
+                    tx_tone: if channel_num % 5 == 0 {
+                        "100.0"
+                    } else {
+                        "94.8"
+                    }
+                    .to_string(),
+                    power: if channel_num % 6 == 0 { 64 } else { 128 },
+                    bandwidth: if channel_num % 6 == 0 {
+                        "Narrow"
+                    } else {
+                        "Wide"
+                    }
+                    .to_string(),
+                    modulation: "FM".to_string(),
+                    reverse: channel_num % 7 == 0,
+                    busy_lock: channel_num % 11 == 0,
+                    groups: [1, if channel_num % 3 == 0 { 2 } else { 0 }, 0, 0],
+                    ptt_id: 0,
+                    position: 1,
+                }
+            })
+            .collect();
+        app.channel_state.select(Some(11));
+        app.deleted_channels.clear();
+        app.group_labels = [
+            "Local", "Repeat", "Public", "Events", "Simplex", "Search", "Weather", "Travel",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .chain(std::iter::repeat(String::new()))
+        .take(GROUP_LABEL_COUNT)
+        .collect();
+        app.scan_presets = (0..8)
+            .map(|index| ScanPreset {
+                index,
+                start_freq: 144_000 + (index as u32 * 1_000),
+                range: 20_000,
+                step: 500,
+                resume: 2,
+                persist: 1,
+                modulation: 0,
+                ultrascan: 0,
+                label: format!("Preset {}", index + 1),
+                raw_mode: 0,
+                raw_tail: 0,
+            })
+            .collect();
+        app.band_plans = (0..20)
+            .map(|index| BandPlan {
+                index,
+                start_freq: 136_000 + (index as u32 * 10_000),
+                end_freq: 174_000 + (index as u32 * 10_000),
+                max_power: 255,
+                tx_allowed: index % 5 != 4,
+                wrap: false,
+                modulation: 0,
+                bandwidth: 0,
+                raw_flags: 0,
+            })
+            .collect();
+        app.dtmf_presets = (0..8)
+            .map(|index| DTMFPreset {
+                index,
+                digits: vec![1, 2, 3, 4, index + 1],
+                label: format!("Dispatch {}", index + 1),
+            })
+            .collect();
+
+        let mut settings = SettingsBlock {
+            magic: 0xD82F,
+            squelch: 4,
+            dual_watch: 1,
+            auto_floor: 0,
+            active_vfo: 0,
+            step: 500,
+            rx_split: 2800,
+            tx_split: 2800,
+            ptt_mode: 1,
+            tx_mod_meter: 1,
+            mic_gain: 25,
+            tx_deviation: 64,
+            batt_style: 0,
+            scan_range: 1900,
+            scan_persist: 200,
+            scan_resume: 0,
+            ultra_scan: 6,
+            tone_monitor: 1,
+            lcd_brightness: 35,
+            lcd_timeout: 40,
+            breathe: 0,
+            dtmf_dev: 32,
+            gamma: 0,
+            repeater_tone: 1750,
+            key_lock: 0,
+            bluetooth: 1,
+            power_save: 0,
+            key_tones: 0,
+            ste: 0,
+            rf_gain: 0,
+            s_bar_style: 0,
+            sq_noise_lev: 54,
+            last_fmt_freq: 0,
+            vox: 0,
+            vox_tail: 200,
+            tx_timeout: 120,
+            dimmer: 0,
+            dtmf_speed: 20,
+            noise_gate: 0,
+            scan_update: 10,
+            asl: 0,
+            disable_fmt: 0,
+            pin: 1234,
+            pin_action: 0,
+            lcd_inverted: 0,
+            af_filters: 0,
+            if_freq: 8,
+            s_bar_always_on: 0,
+            locked_vfo: 1,
+            vfo_lock_active: 0,
+            dual_watch_delay: 5,
+            sub_tone_deviation: 0,
+            vfo_state: [VfoState::default(), VfoState::default()],
+            ..SettingsBlock::default()
+        };
+        settings.vfo_state[0] = VfoState {
+            group: 1,
+            last_group: 1,
+            mode: 0,
+            ..VfoState::default()
+        };
+        settings.vfo_state[1] = VfoState {
+            group: 2,
+            last_group: 2,
+            mode: 0,
+            ..VfoState::default()
+        };
+        app.settings = Some(settings);
+        app.settings_state.select(Some(0));
+
+        let now = std::time::Instant::now();
+        app.remote_screen.phase = RemoteSessionPhase::Live;
+        app.remote_screen.signal_strength = 82;
+        app.remote_screen.noise_level = 14;
+        app.remote_screen.leds = 4;
+        app.remote_screen.battery_level = Some(68);
+        app.remote_screen.battery_text = Some("6.8V".to_string());
+        app.remote_screen.last_signal_update = Some(now);
+        app.remote_screen.last_noise_update = Some(now);
+        app.remote_screen.last_battery_update = Some(now);
+        app.remote_screen.last_text_update = Some(now);
+        app.remote_screen.last_status_update = Some(now);
+        app.remote_screen.last_led_update = Some(now);
+        app.remote_screen.last_small_status = Some((0x70, 0, 0));
+        app.remote_screen.elements = VecDeque::from(vec![
+            RemotePacket::DisplayText {
+                font_size: 1,
+                x: 1,
+                y: 8,
+                fg_color: 0xFFFF,
+                bg_color: 0,
+                text: "W6SLG".to_string(),
+            },
+            RemotePacket::DisplayText {
+                font_size: 1,
+                x: 1,
+                y: 22,
+                fg_color: 0xFFFF,
+                bg_color: 0,
+                text: "145.33500".to_string(),
+            },
+            RemotePacket::SignalStrength {
+                strength: 82,
+                mode: 1,
+                battery: 68,
+            },
+            RemotePacket::NoiseLevel { level: 14, mode: 1 },
+            RemotePacket::SmallStatus {
+                id: 0x70,
+                value1: 0,
+                value2: 0,
+            },
+            RemotePacket::DisplayText {
+                font_size: 1,
+                x: 1,
+                y: 70,
+                fg_color: 0xFFFF,
+                bg_color: 0,
+                text: "6.8V".to_string(),
+            },
+            RemotePacket::UnknownFrame {
+                opcode: 0x7A,
+                payload: vec![0x01, 0x04],
+            },
+        ]);
+        app.remote_screen.unknown_packet_count = 1;
+        app.remote_screen.last_delta = Some("No decoded state delta observed".to_string());
+        app.remote_screen.last_control_report = Some(RemoteControlReport {
+            label: "menu".to_string(),
+            strategy: RemoteControlStrategy::RawKey,
+            bytes_hex: "8A FF".to_string(),
+            success: true,
+            evidence: RemoteEvidenceKind::NoControlEvidence,
+            reaction: Some(RemoteCommandReaction {
+                window_ms: 250,
+                rx_first_ms: Some(31),
+                surfaced_packets: 2,
+                unknown_packets: 1,
+                deltas: 0,
+            }),
+            detail: "Telemetry observed; control not confirmed".to_string(),
+        });
+
+        if let Some(settings) = app.settings.as_ref() {
+            app.codeplug_data = Some(crate::protocol::codeplug::create_codeplug(
+                &app.channels,
+                settings,
+                &app.scan_presets,
+                &app.band_plans,
+                &app.dtmf_presets,
+                &app.group_labels,
+                Endianness::Big,
+            ));
+            app.codeplug_path = Some(std::path::PathBuf::from("demo-codeplug.nfw"));
+        }
+
+        app
     }
 
     pub fn log(&mut self, message: &str) {

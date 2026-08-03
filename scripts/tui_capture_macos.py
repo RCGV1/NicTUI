@@ -200,6 +200,17 @@ def parse_args() -> argparse.Namespace:
         help="Optional serial port to pass to 'nictui tui --port ...'",
     )
     parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Launch the hardware-free populated demo radio",
+    )
+    parser.add_argument(
+        "--demo-view",
+        choices=("channels", "settings", "remote"),
+        default="channels",
+        help="Initial view when --demo is enabled",
+    )
+    parser.add_argument(
         "--bounds",
         default="100,80,1100,760",
         help="Terminal window bounds as x,y,width,height",
@@ -251,6 +262,9 @@ def main() -> int:
     ]
     if args.port:
         command_parts.extend(["--port", shell_quote(args.port)])
+    if args.demo:
+        command_parts.append("--demo")
+        command_parts.extend(["--demo-view", args.demo_view])
     command = " ".join(command_parts)
 
     launch_terminal(command, bounds, f"NicTUI Capture {timestamp}")
@@ -269,6 +283,8 @@ def main() -> int:
         "binary": str(binary),
         "command": command,
         "port": args.port,
+        "demo": args.demo,
+        "demo_view": args.demo_view,
         "keys": tokens,
         "window_bounds": {
             "x": actual_bounds[0],

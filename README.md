@@ -16,8 +16,6 @@ A terminal-based user interface for programming the TIDRADIO TD-H3 HAM radio.
 
 ## Screenshots
 
-These screenshots are captured from the built-in hardware-free demo workspace, so they show the real TUI layout without requiring a connected radio:
-
 <p align="center">
   <img src="assets/screenshots/channels.png" alt="NicTUI Channels view" width="100%">
 </p>
@@ -29,14 +27,6 @@ These screenshots are captured from the built-in hardware-free demo workspace, s
 <p align="center">
   <img src="assets/screenshots/remote.png" alt="NicTUI Remote telemetry dashboard" width="100%">
 </p>
-
-Preview the same views locally with:
-
-```bash
-nictui tui --demo
-nictui tui --demo --demo-view settings
-nictui tui --demo --demo-view remote
-```
 
 ## Installation
 
@@ -505,10 +495,6 @@ nictui codeplug inspect --help
 **BIN Flash Tab:**
 - `i` - Import firmware file
 - `f` - Start flash
-
-## UI Capture
-
-Maintainers working on TUI polish can use the local macOS capture helper in `scripts/tui_capture_macos.py`. Run `python3 scripts/tui_capture_macos.py --help` from a checkout for current options. Use `--demo` and `--demo-view` to capture deterministic screenshots without hardware.
 
 ## Building from Source
 

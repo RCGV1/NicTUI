@@ -4334,6 +4334,9 @@ fn validate_settings_payload(settings: &SettingsBlock) -> Result<()> {
 }
 
 fn validate_firmware_image(path: &Path, firmware: &[u8]) -> Result<()> {
+    if firmware.is_empty() {
+        bail!("Firmware {} is empty", path.display());
+    }
     let rounded_len = firmware.len().div_ceil(32) * 32;
     if rounded_len > 0xF800 {
         bail!(

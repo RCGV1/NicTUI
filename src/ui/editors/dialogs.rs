@@ -61,7 +61,7 @@ pub(crate) fn render_progress_overlay(
             .label(format!("{}%", progress_percent));
         f.render_widget(gauge, chunks[2]);
 
-        let help = Paragraph::new("Press Esc to abort")
+        let help = Paragraph::new("Wait for completion. Keep the radio connected.")
             .alignment(ratatui::layout::Alignment::Center)
             .style(Style::default().fg(COLOR_DIM));
         f.render_widget(help, chunks[3]);
@@ -91,9 +91,13 @@ pub(crate) fn render_progress_overlay(
             .label(format!("{}%", progress_percent));
         f.render_widget(gauge, chunks[1]);
 
-        let help = Paragraph::new("Press Esc to cancel")
-            .alignment(ratatui::layout::Alignment::Center)
-            .style(Style::default().fg(COLOR_DIM));
+        let help = Paragraph::new(if matches!(app.mode, AppMode::Writing) {
+            "Wait for completion. Keep the radio connected."
+        } else {
+            "Press Esc to exit"
+        })
+        .alignment(ratatui::layout::Alignment::Center)
+        .style(Style::default().fg(COLOR_DIM));
         f.render_widget(help, chunks[2]);
     }
 }

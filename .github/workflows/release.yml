@@ -64,6 +64,9 @@ jobs:
           cargo test --locked ble::tests
           cargo test --locked protocol::radio::tests
           cargo test --locked cli::tests
+          cargo test --locked --bin nictui
+          cargo build --locked --bin nictui
+          python3 scripts/test_terminal_and_flash.py target/debug/nictui
 
   build-macos-x86_64:
     needs: [check-version, contract-checks]

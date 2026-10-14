@@ -17,7 +17,7 @@
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, DisableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -42,10 +42,26 @@ fn main() -> Result<()> {
     }
 }
 
+struct TerminalSession;
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show,
+            crossterm::style::ResetColor
+        );
+    }
+}
+
 fn launch_tui(port: Option<String>, demo: bool, demo_view: DemoView) -> Result<()> {
+    let session = TerminalSession;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, DisableMouseCapture, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -67,33 +83,20 @@ fn launch_tui(port: Option<String>, demo: bool, demo_view: DemoView) -> Result<(
     } else if let Some(port_name) = port {
         app.connect_to_port_by_name(&port_name);
     } else if should_auto_start_ble_scan() {
-        app.start_ble_scan(should_prepare_ui_for_startup_ble_scan());
+        app.start_ble_scan(false);
     }
     let res = run_app(&mut terminal, &mut app);
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    if let Err(err) = res {
-        println!("{:?}", err);
-    }
-
+    drop(terminal);
+    drop(session);
+    res?;
     print_post_exit_skill_hint();
 
     Ok(())
 }
 
 fn should_auto_start_ble_scan() -> bool {
-    true
-}
-
-fn should_prepare_ui_for_startup_ble_scan() -> bool {
-    cfg!(target_os = "macos")
+    !cfg!(target_os = "macos")
 }
 
 fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
@@ -123,14 +126,23 @@ where
             Duration::from_millis(250)
         };
 
-        if event::poll(timeout)?
-            && let Event::Key(key) = event::read()?
-        {
+        if event::poll(timeout)? {
+            let key = match event::read()? {
+                Event::Key(key) => key,
+                Event::Resize(_, _) => {
+                    needs_redraw = true;
+                    continue;
+                }
+                _ => continue,
+            };
             if key.kind == KeyEventKind::Release {
                 continue;
             }
 
             needs_redraw = true;
+            if handle_write_in_progress_key(app, key.code) {
+                continue;
+            }
 
             match &mut app.mode {
                 AppMode::PortSelection => match key.code {
@@ -268,16 +280,12 @@ where
                     }
                     _ => {}
                 },
-                AppMode::Reading | AppMode::Writing => {
+                AppMode::Reading => {
                     if key.code == KeyCode::Esc {
                         return Ok(());
                     }
                 }
-                AppMode::BinFlashing => {
-                    if key.code == KeyCode::Esc {
-                        app.mode = AppMode::Main(MainTab::BinFlash);
-                    }
-                }
+                AppMode::Writing | AppMode::BinFlashing => {}
 
                 AppMode::Error(_) => match key.code {
                     KeyCode::Esc | KeyCode::Enter => app.mode = AppMode::PortSelection,
@@ -286,6 +294,16 @@ where
             }
         }
     }
+}
+
+fn handle_write_in_progress_key(app: &mut App, code: KeyCode) -> bool {
+    if !matches!(app.mode, AppMode::Writing | AppMode::BinFlashing) {
+        return false;
+    }
+    if code == KeyCode::Esc {
+        app.status_message = "Write in progress. Wait for completion before leaving.".to_string();
+    }
+    true
 }
 
 fn tab_shortcut_target(
@@ -355,15 +373,22 @@ mod tests {
 
     #[test]
     fn startup_ble_auto_scan_matches_platform_policy() {
-        assert!(should_auto_start_ble_scan());
+        assert_eq!(should_auto_start_ble_scan(), !cfg!(target_os = "macos"));
     }
 
     #[test]
-    fn startup_ble_scan_prepares_ui_only_when_platform_needs_it() {
-        assert_eq!(
-            should_prepare_ui_for_startup_ble_scan(),
-            cfg!(target_os = "macos")
-        );
+    fn writes_and_flashes_keep_the_ui_locked_until_completion() {
+        let mut app = App::demo();
+        for mode in [AppMode::Writing, AppMode::BinFlashing] {
+            app.mode = mode;
+            for code in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('f')] {
+                assert!(handle_write_in_progress_key(&mut app, code));
+                assert!(matches!(app.mode, AppMode::Writing | AppMode::BinFlashing));
+            }
+            assert!(app.status_message.contains("Wait for completion"));
+        }
+        app.mode = AppMode::Main(MainTab::BinFlash);
+        assert!(!handle_write_in_progress_key(&mut app, KeyCode::Char('f')));
     }
 
     #[test]

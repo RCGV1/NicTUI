@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 use super::state::{App, AppEvent, AppMode, MainTab, WriteScope};
 use crate::ble::{
@@ -11,14 +10,13 @@ use crate::ble::{
 };
 use crate::channel_file::{load_channels_from_path, save_channels_to_path};
 use crate::device::{
-    ProgressEvent, read_band_plans as read_radio_band_plans, read_channels as read_radio_channels,
-    read_dtmf_presets as read_radio_dtmf_presets, read_group_labels as read_radio_group_labels,
-    read_scan_presets as read_radio_scan_presets, read_settings as read_radio_settings,
-    write_channels as write_radio_channels, write_codeplug as write_radio_codeplug,
-    write_dtmf_presets as write_radio_dtmf_presets, write_group_labels as write_radio_group_labels,
-    write_settings as write_radio_settings,
+    ProgressEvent, flash_firmware, read_band_plans as read_radio_band_plans,
+    read_channels as read_radio_channels, read_dtmf_presets as read_radio_dtmf_presets,
+    read_group_labels as read_radio_group_labels, read_scan_presets as read_radio_scan_presets,
+    read_settings as read_radio_settings, write_channels as write_radio_channels,
+    write_codeplug as write_radio_codeplug, write_dtmf_presets as write_radio_dtmf_presets,
+    write_group_labels as write_radio_group_labels, write_settings as write_radio_settings,
 };
-use crate::protocol::{BIN_FLASH_BAUD_RATE, RadioProtocol};
 use crate::remote::{
     RemoteCaptureEvent, RemoteControlCommand, RemoteSessionOptions, run_remote_session,
 };
@@ -1020,201 +1018,35 @@ impl App {
         });
     }
 
-    #[allow(unused_assignments)]
     pub fn start_bin_flash(&mut self) {
-        let firmware_data = match &self.bin_firmware_data {
-            Some(data) => data.clone(),
-            None => {
-                self.mode = AppMode::Error(
-                    "No firmware loaded. Press 'i' to import a firmware file.".to_string(),
-                );
-                return;
-            }
+        let Some(firmware_data) = self.bin_firmware_data.clone() else {
+            self.mode = AppMode::Error(
+                "No firmware loaded. Press 'i' to import a firmware file.".to_string(),
+            );
+            return;
         };
-
         let Some(port_name) = self.active_protocol_port() else {
             self.mode =
                 AppMode::Error("Not connected to a port. Please select a port first.".to_string());
             return;
         };
-
         let tx = self.event_tx.clone();
         self.progress = 0.0;
-        let _ = tx.send(AppEvent::Status(
-            "Waiting for radio handshake (0xA5)...".to_string(),
-        ));
         self.mode = AppMode::BinFlashing;
-
         thread::spawn(move || {
-            const INIT_SEQUENCE: [u8; 36] = [
-                0xA0, 0xEE, 0x74, 0x71, 0x07, 0x74, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
-                0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
-                0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
-            ];
-
-            let rounded_len = firmware_data.len().div_ceil(32) * 32;
-            if rounded_len > 0xf800 {
-                let _ = tx.send(AppEvent::BinFlashFailed(
-                    "Firmware file too large".to_string(),
-                ));
-                return;
-            }
-            let last_block = (rounded_len / 32) as u16;
-
-            let _ = tx.send(AppEvent::Status("Opening serial port...".to_string()));
-
-            let mut proto = match RadioProtocol::new_with_baud(&port_name, BIN_FLASH_BAUD_RATE) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::BinFlashFailed(format!(
-                        "Failed to open port: {}",
-                        e
-                    )));
-                    return;
+            match flash_firmware(&port_name, &firmware_data, |event| match event {
+                ProgressEvent::Status(status) => {
+                    let _ = tx.send(AppEvent::Status(status));
                 }
-            };
-
-            let _ = tx.send(AppEvent::Status(
-                "Turn OFF radio, hold PTT(H3) or Flashlight(H8), turn ON radio with button held"
-                    .to_string(),
-            ));
-
-            let mut detected = false;
-            let mut flashing = false;
-            let mut block: u16 = 0;
-            let mut need_to_send_block = true;
-            let mut last_block_sent = false;
-            let mut a5_count = 0;
-            let init_sent_time = std::time::Instant::now();
-            let mut block_send_time = std::time::Instant::now();
-
-            let start_time = std::time::Instant::now();
-            let timeout_secs = 60;
-
-            loop {
-                if start_time.elapsed().as_secs() > timeout_secs {
-                    let _ = tx.send(AppEvent::BinFlashFailed(
-                        "Timeout waiting for radio".to_string(),
-                    ));
-                    return;
-                }
-
-                if flashing && need_to_send_block && block <= last_block {
-                    let is_last = block == last_block;
-                    let _ = tx.send(AppEvent::Status(format!(
-                        "Flashing block: {} / {}",
-                        block, last_block
-                    )));
-
-                    let mut packet = [0u8; 36];
-                    packet[0] = if is_last { 0xA2 } else { 0xA1 };
-                    packet[1] = ((block >> 8) & 0xFF) as u8;
-                    packet[2] = (block & 0xFF) as u8;
-                    let start_idx = (block as usize) * 32;
-                    if start_idx + 32 <= firmware_data.len() {
-                        packet[4..36].copy_from_slice(&firmware_data[start_idx..start_idx + 32]);
-                    } else {
-                        packet[4..4 + (firmware_data.len() - start_idx)]
-                            .copy_from_slice(&firmware_data[start_idx..]);
-                    }
-                    let checksum = packet[4..36]
-                        .iter()
-                        .fold(0u8, |sum, &byte| sum.wrapping_add(byte));
-                    packet[3] = checksum;
-
-                    if let Err(e) = proto.send_bytes(&packet) {
-                        let _ = tx.send(AppEvent::BinFlashFailed(format!("Send failed: {}", e)));
-                        return;
-                    }
-
-                    let progress = (block + 1) as f64 / (last_block as f64 + 1.0);
+                ProgressEvent::Progress(progress) => {
                     let _ = tx.send(AppEvent::Progress(progress));
-
-                    block += 1;
-                    need_to_send_block = false;
-                    block_send_time = std::time::Instant::now();
-
-                    if is_last {
-                        last_block_sent = true;
-                    }
                 }
-
-                if last_block_sent
-                    && !need_to_send_block
-                    && block_send_time.elapsed() > Duration::from_millis(500)
-                {
-                    let _ = tx.send(AppEvent::Status(
-                        "Flashing complete! Closing port...".to_string(),
-                    ));
-                    let _ = tx.send(AppEvent::Progress(1.0));
-
-                    drop(proto);
-
-                    std::thread::sleep(Duration::from_millis(200));
-
-                    let _ = tx.send(AppEvent::Status("SUCCESS! Firmware flashed.\n\nTurn radio OFF then ON to boot new firmware.".to_string()));
-
+            }) {
+                Ok(()) => {
                     let _ = tx.send(AppEvent::BinFlashComplete);
-                    return;
                 }
-
-                if flashing
-                    && !need_to_send_block
-                    && !last_block_sent
-                    && block_send_time.elapsed() > Duration::from_millis(500)
-                {
-                    block -= 1;
-                    need_to_send_block = true;
-                }
-
-                match proto.read_byte() {
-                    Ok(Some(byte)) => {
-                        if byte == 0xA5 {
-                            a5_count += 1;
-                            if !detected && a5_count >= 3 {
-                                detected = true;
-                                let _ = tx.send(AppEvent::Status(
-                                    "Handshake detected, sending init sequence...".to_string(),
-                                ));
-                                if let Err(e) = proto.send_bytes(&INIT_SEQUENCE) {
-                                    let _ = tx.send(AppEvent::BinFlashFailed(format!(
-                                        "Send failed: {}",
-                                        e
-                                    )));
-                                    return;
-                                }
-                                a5_count = 0;
-                            }
-                        } else if byte == 0xA3 {
-                            if detected
-                                && !flashing
-                                && init_sent_time.elapsed() > Duration::from_millis(100)
-                            {
-                                flashing = true;
-                                let _ = tx.send(AppEvent::Status(
-                                    "Radio ready, starting flash...".to_string(),
-                                ));
-                            } else if flashing && !need_to_send_block && !last_block_sent {
-                                need_to_send_block = true;
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        if detected
-                            && !flashing
-                            && init_sent_time.elapsed() > Duration::from_millis(400)
-                        {
-                            flashing = true;
-                            let _ = tx.send(AppEvent::Status(
-                                "Radio ready (timeout), starting flash...".to_string(),
-                            ));
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::BinFlashFailed(format!("Read error: {}", e)));
-                        return;
-                    }
+                Err(error) => {
+                    let _ = tx.send(AppEvent::BinFlashFailed(error.to_string()));
                 }
             }
         });

@@ -929,6 +929,12 @@ pub fn flash_firmware<F>(port_name: &str, firmware_data: &[u8], mut report: F) -
 where
     F: FnMut(ProgressEvent),
 {
+    if firmware_data.is_empty() {
+        bail!("Firmware file is empty");
+    }
+    if port_name.starts_with("ble://") {
+        bail!("Firmware flashing requires a USB serial connection");
+    }
     const INIT_SEQUENCE: [u8; 36] = [
         0xA0, 0xEE, 0x74, 0x71, 0x07, 0x74, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
@@ -961,11 +967,20 @@ where
     let mut need_to_send_block = true;
     let mut last_block_sent = false;
     let mut a5_count = 0usize;
+    let mut init_sent_at = None;
     let mut block_sent_at = Instant::now();
 
     loop {
         if start_time.elapsed() > timeout {
             bail!("Timeout waiting for radio bootloader");
+        }
+
+        // Some bootloaders stop their A5 stream after init without returning A3.
+        if detected
+            && !flashing
+            && init_sent_at.is_some_and(|sent: Instant| sent.elapsed() > Duration::from_millis(400))
+        {
+            flashing = true;
         }
 
         if flashing && need_to_send_block && block <= last_block {
@@ -975,7 +990,7 @@ where
             packet[1] = ((block >> 8) & 0xFF) as u8;
             packet[2] = (block & 0xFF) as u8;
 
-            let start = block as usize * 32;
+            let start = (block as usize * 32).min(firmware_data.len());
             let end = (start + 32).min(firmware_data.len());
             packet[4..4 + (end - start)].copy_from_slice(&firmware_data[start..end]);
             packet[3] = packet[4..36]
@@ -990,13 +1005,10 @@ where
 
             if is_last {
                 last_block_sent = true;
-            } else {
-                block += 1;
             }
 
             report(ProgressEvent::Progress(
-                (block as f64 + if last_block_sent { 1.0 } else { 0.0 })
-                    / (last_block as f64 + 1.0),
+                (block as f64 + 1.0) / (last_block as f64 + 1.0),
             ));
         }
 
@@ -1031,11 +1043,20 @@ where
                     proto
                         .send_bytes(&INIT_SEQUENCE)
                         .context("Failed to send bootloader init sequence")?;
+                    init_sent_at = Some(Instant::now());
                     report(ProgressEvent::Status(
                         "Bootloader handshake detected. Starting transfer.".to_string(),
                     ));
                 } else if detected {
                     flashing = true;
+                }
+            }
+            Some(0xA3) if detected => {
+                if !flashing {
+                    flashing = true;
+                } else if !need_to_send_block && !last_block_sent {
+                    block += 1;
+                    need_to_send_block = true;
                 }
             }
             Some(_) => {}

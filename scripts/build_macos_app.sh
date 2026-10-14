@@ -218,56 +218,7 @@ mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 cp "${BINARY_PATH}" "${APP_BINARY_PATH}"
 chmod +x "${APP_BINARY_PATH}"
 
-cat > "${WRAPPER_PATH}" <<'EOF'
-#!/bin/bash
-set -euo pipefail
-
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_BINARY="${SELF_DIR}/nictui-bin"
-LOG_FILE="${NICTUI_APP_LOG_FILE:-$HOME/Library/Logs/NicTUI/nictui-app.log}"
-ARGS=()
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --app-log-file)
-            if [[ $# -lt 2 ]]; then
-                echo "Missing value for --app-log-file" >&2
-                exit 1
-            fi
-            LOG_FILE="$2"
-            shift 2
-            ;;
-        --app-log-file=*)
-            LOG_FILE="${1#--app-log-file=}"
-            shift
-            ;;
-        *)
-            ARGS+=("$1")
-            shift
-            ;;
-    esac
-done
-
-mkdir -p "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE"
-
-{
-    echo "===== $(date '+%Y-%m-%d %H:%M:%S') NicTUI.app launch ====="
-    echo "Log file: $LOG_FILE"
-    if [[ ${#ARGS[@]} -gt 0 ]]; then
-        echo "Args: ${ARGS[*]}"
-    else
-        echo "Args: <none>"
-    fi
-} >> "$LOG_FILE"
-
-exec >>"$LOG_FILE" 2>&1
-if [[ ${#ARGS[@]} -gt 0 ]]; then
-    exec "$APP_BINARY" "${ARGS[@]}"
-else
-    exec "$APP_BINARY"
-fi
-EOF
+cp "${ROOT_DIR}/macos/launcher.sh" "${WRAPPER_PATH}"
 chmod +x "${WRAPPER_PATH}"
 
 sed "s/@VERSION@/${VERSION}/g" "${PLIST_TEMPLATE}" > "${PLIST_PATH}"

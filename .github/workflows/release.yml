@@ -382,12 +382,15 @@ jobs:
           body: |
             ## What's New
 
-            - Native Bluetooth support for TD-H3/NicSure radios, including scan, connect, probe, channel read, and TUI startup selection without a Python bridge.
-            - A signed and notarized macOS `NicTUI.app` bundle for the recommended first-run Bluetooth permission experience.
-            - Cleaner TUI screens with compact headers/footers, safer channel/settings focus panels, better BLE signal/status display, and Remote tab layouts that hold up on smaller terminals.
-            - Safer write flows: BLE writes are chunked for common GATT limits, full settings writes support `--no-reboot`, and experimental remote live writes require explicit confirmation or validation-only mode.
-            - Remote support is now honest about what the radio proves: telemetry/status capture is first-class, while control attempts are labeled by observed radio response instead of implied success.
-            - The installer now prefers the macOS app bundle on macOS, keeps CLI install available with `--cli`, verifies checksums, and uses a managed PATH block instead of editing unrelated shell config.
+            - The macOS TUI draws immediately at startup. Press `b` to scan Bluetooth when needed.
+            - Opening `NicTUI.app` from Finder now opens the interactive UI in Terminal instead of redirecting it to a log file.
+            - Removed unused mouse reporting, restored terminal state on errors, and added redraws when the terminal is resized.
+            - EEPROM writes and firmware flashes keep their progress screens open until completion, preventing Esc from interrupting a write or starting a second flash.
+            - The CLI and TUI share the firmware transfer code. Lost acknowledgements resend the same block, partial images are padded safely, and empty images or BLE firmware transfers are rejected.
+            - Added hardware-free terminal and simulated bootloader regression checks to CI.
+            - Includes the current compact TUI layouts and native Bluetooth support for TD-H3/NicSure radios.
+
+            Validation: 173 Rust tests and terminal/bootloader regression checks passed on macOS; the Linux contract checks passed in CI. Firmware transfer tests use a simulated bootloader; physical firmware flashing was not performed.
 
             ## Download Artifacts
 

@@ -4,11 +4,13 @@
 Run after cargo build: python3 scripts/test_terminal_and_flash.py target/debug/nictui
 """
 import fcntl
+import json
 import os
 from pathlib import Path
 import pty
 import select
 import signal
+import shutil
 import struct
 import subprocess
 import sys
@@ -112,9 +114,40 @@ def flash_checks(binary, size, ack_init=True):
             os.close(slave)
 
 
+def launcher_checks():
+    # Mock only the native window opener; execute the generated command for real.
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        app = root / "App with spaces.app" / "Contents" / "MacOS"
+        app.mkdir(parents=True)
+        launcher = app / "nictui"
+        shutil.copyfile(Path(__file__).resolve().parents[1] / "macos/launcher.sh", launcher)
+        launcher.chmod(0o755)
+        binary = app / "nictui-bin"
+        binary.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+                          "open(os.environ['NICTUI_TEST_ARGS'], 'w').write(json.dumps(sys.argv[1:]))\n")
+        binary.chmod(0o755)
+        mock_bin = root / "bin"
+        mock_bin.mkdir()
+        opener = mock_bin / "open"
+        opener.write_text('#!/bin/sh\nprintf "%s" "$3" > "$NICTUI_TEST_COMMAND"\n')
+        opener.chmod(0o755)
+        env = dict(os.environ, PATH=str(mock_bin) + ":" + os.environ["PATH"],
+                   TMPDIR=str(root), NICTUI_TEST_COMMAND=str(root / "command-path"),
+                   NICTUI_TEST_ARGS=str(root / "args"))
+        for args in ([], ["tui", "--ble-name", "TD-H3; $(echo wrong) ' quoted"]):
+            subprocess.run([str(launcher), *args], env=env, check=True,
+                           stdin=subprocess.DEVNULL, capture_output=True)
+            command = Path((root / "command-path").read_text())
+            subprocess.run([str(command)], env=env, check=True, capture_output=True)
+            assert json.loads((root / "args").read_text()) == args
+            assert not command.exists(), "Launch command was not cleaned up"
+
+
 if __name__ == "__main__":
     binary = str(Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/nictui").resolve())
     terminal_checks(binary)
+    launcher_checks()
     for size in (32, 33):
         flash_checks(binary, size)
     flash_checks(binary, 33, ack_init=False)
@@ -122,4 +155,4 @@ if __name__ == "__main__":
         result = subprocess.run([binary, "firmware", "flash", "--input", image.name,
                                  "--validate-only"], capture_output=True)
         assert result.returncode != 0, "Empty firmware passed validation"
-    print("PASS: startup, resize, terminal restore, flash ACK retry, padding, empty image")
+    print("PASS: startup, resize, terminal restore, app launcher, flash ACK retry, padding, empty image")

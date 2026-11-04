@@ -3,12 +3,9 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Duration;
 
 use nictui::activity::{ActivityEvent, ActivityLog, write_activity_csv};
-use nictui::activity_session::{
-    ActivityMonitorEvent, ActivityMonitorOptions, ActivityMonitorSummary, monitor_activity,
-};
+use nictui::activity_session::{ActivityMonitorOptions, ActivityMonitorSummary, monitor_activity};
 
 struct TestDirectory(PathBuf);
 
@@ -116,9 +113,10 @@ mod native {
     use std::io::{Read, Write};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use nictui::activity::{ACTIVITY_PING, DEFAULT_PARTIAL_TIMEOUT};
+    use nictui::activity_session::ActivityMonitorEvent;
     use serialport::{SerialPort, TTYPort};
 
     struct Session {

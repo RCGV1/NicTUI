@@ -20,7 +20,7 @@ impl App {
     }
 
     pub fn update(&mut self) -> bool {
-        let mut updated = false;
+        let mut updated = self.poll_activity();
         while let Ok(event) = self.event_rx.try_recv() {
             updated = true;
             match event {
@@ -442,12 +442,20 @@ impl App {
     }
 
     pub fn next_port(&mut self) {
+        if self.activity_active() {
+            self.hardware_action_allowed();
+            return;
+        }
         if !self.ports.is_empty() {
             self.selected_port_index = (self.selected_port_index + 1) % self.ports.len();
         }
     }
 
     pub fn previous_port(&mut self) {
+        if self.activity_active() {
+            self.hardware_action_allowed();
+            return;
+        }
         if !self.ports.is_empty() {
             self.selected_port_index = if self.selected_port_index == 0 {
                 self.ports.len() - 1
@@ -475,7 +483,8 @@ impl App {
                 MainTab::Remote => MainTab::Codeplug,
                 MainTab::Codeplug => MainTab::BinFlash,
                 MainTab::BinFlash => MainTab::Debug,
-                MainTab::Debug => MainTab::Channels,
+                MainTab::Debug => MainTab::Activity,
+                MainTab::Activity => MainTab::Channels,
             };
             self.mode = AppMode::Main(next);
             self.last_main_tab = next;
@@ -494,7 +503,7 @@ impl App {
                 self.remote_off();
             }
             let prev = match tab {
-                MainTab::Channels => MainTab::Debug,
+                MainTab::Channels => MainTab::Activity,
                 MainTab::Settings => MainTab::Channels,
                 MainTab::Scanning => MainTab::Settings,
                 MainTab::MemoryGroups => MainTab::Scanning,
@@ -504,6 +513,7 @@ impl App {
                 MainTab::Codeplug => MainTab::Remote,
                 MainTab::BinFlash => MainTab::Codeplug,
                 MainTab::Debug => MainTab::BinFlash,
+                MainTab::Activity => MainTab::Debug,
             };
             self.mode = AppMode::Main(prev);
             self.last_main_tab = prev;

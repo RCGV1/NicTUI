@@ -23,6 +23,7 @@ use crate::remote::{
 const BLUETOOTH_SETTING_INDEX: usize = 30;
 
 pub mod actions;
+pub mod activity;
 pub mod bandplan;
 pub mod channels;
 pub mod dtmf;
@@ -71,6 +72,9 @@ impl App {
             settings: None,
             settings_state: TableState::default(),
             remote_screen: RemoteScreen::default(),
+            activity: Default::default(),
+            activity_state: TableState::default(),
+            activity_worker: None,
             protocol_port_name: None,
             active_port_candidate: None,
             ble_scan_in_progress: false,
@@ -424,6 +428,7 @@ impl App {
         }
 
         app.codeplug_workspace_baseline = app.workspace_snapshot();
+        app.populate_demo_activity();
         app
     }
 
@@ -622,48 +627,32 @@ impl App {
         if !self.hardware_action_allowed() {
             return;
         }
-        match self
-            .ports
-            .iter()
-            .position(|candidate| candidate == port_name)
-        {
-            Some(index) => self.selected_port_index = index,
-            None => {
-                self.ports.push(port_name.to_string());
-                self.selected_port_index = self.ports.len().saturating_sub(1);
-            }
-        }
-        if !self
+        self.selected_port_index = match self
             .port_candidates
             .iter()
-            .any(|candidate| candidate.port_name == port_name)
+            .position(|candidate| candidate.port_name == port_name)
         {
-            self.refresh_ports();
-            match self
-                .ports
-                .iter()
-                .position(|candidate| candidate == port_name)
-            {
-                Some(index) => self.selected_port_index = index,
-                None => {
-                    self.port_candidates.push(PortCandidate {
-                        port_name: port_name.to_string(),
-                        kind: PortKind::Candidate,
-                        score: 0,
-                        product: None,
-                        manufacturer: None,
-                        usb_vid: None,
-                        usb_pid: None,
-                        ble_device_id: None,
-                        ble_rssi: None,
-                        handshake_ok: false,
-                        firmware_variant: None,
-                    });
-                    self.ports.push(port_name.to_string());
-                    self.selected_port_index = self.ports.len().saturating_sub(1);
-                }
+            Some(index) => index,
+            None => {
+                // Explicit targets are unverified until the first radio action.
+                self.port_candidates.push(PortCandidate {
+                    port_name: port_name.to_string(),
+                    kind: PortKind::Candidate,
+                    score: 0,
+                    product: None,
+                    manufacturer: None,
+                    usb_vid: None,
+                    usb_pid: None,
+                    ble_device_id: None,
+                    ble_rssi: None,
+                    handshake_ok: false,
+                    firmware_variant: None,
+                });
+                self.port_candidates.len() - 1
             }
-        }
+        };
+        self.ports = Self::candidate_names(&self.port_candidates);
+        self.active_port_candidate = None;
         self.select_port();
     }
 
@@ -912,6 +901,106 @@ fn ble_alias(device_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_port_selection_is_passive_even_for_nonexistent_targets() {
+        for port in [
+            "/dev/nictui-nonexistent-TEST",
+            "ble://nictui-nonexistent-TEST",
+        ] {
+            let mut app = App::new();
+            app.connect_to_port_by_name(port);
+
+            assert_eq!(app.mode, AppMode::Main(MainTab::Channels));
+            assert_eq!(app.protocol_port_name.as_deref(), Some(port));
+            assert_eq!(app.ports, [port]);
+            assert_eq!(app.selected_port_index, 0);
+            assert_eq!(app.port_candidates.len(), 1);
+            assert!(app.serial_port_candidates.is_empty());
+            assert!(app.ble_port_candidates.is_empty());
+            assert!(!app.ble_scan_in_progress);
+            assert!(!app.remote_active);
+            assert!(app.remote_tx.is_none());
+            assert!(!app.activity_active());
+            assert!(app.event_rx.try_recv().is_err());
+            assert!(app.settings.is_none());
+            assert!(app.channels.is_empty());
+            let candidate = app.selected_port_candidate().unwrap();
+            assert_eq!(candidate.port_name, port);
+            assert_eq!(candidate.kind, PortKind::Candidate);
+            assert_eq!(candidate.score, 0);
+            assert!(!candidate.handshake_ok);
+            assert!(candidate.firmware_variant.is_none());
+            assert!(candidate.ble_device_id.is_none());
+            assert!(app.status_message.contains("Radio opens on first action."));
+
+            app.connect_to_port_by_name(port);
+            assert_eq!(app.ports, [port]);
+            assert_eq!(app.port_candidates.len(), 1);
+        }
+    }
+
+    #[test]
+    fn explicit_port_selection_does_not_reuse_or_connect_a_different_active_target() {
+        let mut app = App::new();
+        let cached = ble_candidate("TD-H3 #TEST", "nictui-nonexistent-TEST");
+        app.ble_port_candidates = vec![cached.clone()];
+        app.port_candidates = vec![cached.clone()];
+        app.ports = vec![cached.port_name.clone()];
+        app.active_port_candidate = Some(cached);
+        app.mode = AppMode::Main(MainTab::Channels);
+        app.protocol_port_name = Some("/dev/nictui-old-TEST".into());
+
+        let port = "/dev/nictui-nonexistent-TEST";
+        app.connect_to_port_by_name(port);
+        assert_eq!(app.protocol_port_name.as_deref(), Some(port));
+        assert_eq!(app.selected_port_candidate().unwrap().port_name, port);
+        assert_eq!(app.selected_port_index, 1);
+        assert_eq!(app.ports, ["TD-H3 #TEST", port]);
+        assert_eq!(app.port_candidates.len(), 2);
+        assert_eq!(app.ble_port_candidates.len(), 1);
+        assert!(app.serial_port_candidates.is_empty());
+        assert!(!app.ble_scan_in_progress);
+
+        app.connect_to_port_by_name(port);
+        assert_eq!(app.selected_port_index, 1);
+        assert_eq!(app.port_candidates.len(), 2);
+    }
+
+    #[test]
+    fn explicit_port_selection_keeps_cached_serial_metadata_without_discovery() {
+        let mut app = App::new();
+        let port = "/dev/nictui-cached-TEST";
+        let candidate = PortCandidate {
+            port_name: port.into(),
+            kind: PortKind::Radio,
+            score: 1000,
+            product: Some("TD-H3".into()),
+            manufacturer: None,
+            usb_vid: None,
+            usb_pid: None,
+            ble_device_id: None,
+            ble_rssi: None,
+            handshake_ok: true,
+            firmware_variant: Some(crate::device::FirmwareVariant::NicSure),
+        };
+        app.serial_port_candidates = vec![candidate.clone()];
+        app.port_candidates = vec![candidate];
+        app.ports = vec![port.into()];
+
+        app.connect_to_port_by_name(port);
+        assert_eq!(app.mode, AppMode::Main(MainTab::Channels));
+        assert_eq!(app.protocol_port_name.as_deref(), Some(port));
+        assert_eq!(app.port_candidates.len(), 1);
+        let selected = app.selected_port_candidate().unwrap();
+        assert_eq!(selected.kind, PortKind::Radio);
+        assert!(selected.handshake_ok);
+        assert_eq!(
+            selected.firmware_variant,
+            Some(crate::device::FirmwareVariant::NicSure)
+        );
+        assert!(app.status_message.contains("Radio opens on first action."));
+    }
 
     fn ble_candidate(name: &str, device_id: &str) -> PortCandidate {
         PortCandidate {

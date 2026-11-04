@@ -84,6 +84,7 @@ pub enum MainTab {
     Codeplug,
     BinFlash,
     Debug,
+    Activity,
 }
 
 pub enum AppEvent {
@@ -173,6 +174,9 @@ pub struct App {
     pub settings: Option<SettingsBlock>,
     pub settings_state: TableState,
     pub remote_screen: RemoteScreen,
+    pub activity: Arc<Mutex<super::activity::ActivitySnapshot>>,
+    pub activity_state: TableState,
+    pub(crate) activity_worker: Option<super::activity::ActivityWorker>,
     pub protocol_port_name: Option<String>,
     pub active_port_candidate: Option<PortCandidate>,
     pub ble_scan_in_progress: bool,

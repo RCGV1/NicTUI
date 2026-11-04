@@ -41,31 +41,101 @@ def read_exact(fd, size, seconds=3):
     return result
 
 
-def terminal_checks(binary):
+def read_until(fd, marker, seconds=2):
+    result = b""
+    deadline = time.monotonic() + seconds
+    while marker not in result and time.monotonic() < deadline:
+        if select.select([fd], [], [], max(0, deadline - time.monotonic()))[0]:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            result += chunk
+    assert marker in result, f"Timed out waiting for {marker!r}: {result!r}"
+    return result
+
+
+def wait_for_exit(pid, seconds=2, fd=None):
+    assert pid > 0, "Refusing to wait for a process group"
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        exited, status = os.waitpid(pid, os.WNOHANG)
+        if exited:
+            return status
+        if fd is None:
+            time.sleep(0.01)
+        else:
+            # macOS can delay PTY child exit until its final output is drained.
+            read_for(fd, min(0.05, max(0, deadline - time.monotonic())))
+    raise AssertionError("TUI did not exit before the deadline")
+
+
+def cleanup_terminal_child(pid, fd):
+    original_error = sys.exc_info()[1]
+    errors = []
+    # Release the PTY before reaping: macOS may hold a child in kernel exit
+    # while its master remains open, even after SIGKILL.
+    try:
+        os.close(fd)
+    except OSError as error:
+        errors.append(str(error))
+    if pid is not None:
+        if pid <= 0:
+            errors.append("Refusing to signal a non-positive child PID")
+        else:
+            try:
+                exited, _ = os.waitpid(pid, os.WNOHANG)
+                if not exited:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    wait_for_exit(pid)
+            except ChildProcessError:
+                pass
+            except (OSError, AssertionError) as error:
+                errors.append(str(error))
+    if errors:
+        message = "Terminal cleanup: " + "; ".join(errors)
+        if original_error is None:
+            raise AssertionError(message)
+        if hasattr(original_error, "add_note"):
+            original_error.add_note(message)
+        else:
+            print(message, file=sys.stderr)
+
+
+def terminal_checks(binary, view="channels"):
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["TERM"] = "xterm-ghostty"
         fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 120, 0, 0))
-        os.execv(binary, [binary])
+        os.execv(binary, [binary, "tui", "--demo", "--demo-view", view])
     try:
-        output = read_for(fd, 2)
-        assert b"NicTUI" in output, "Startup did not draw the port picker"
+        label = b"Activity [A]" if view == "activity" else b"Channels"
+        output = read_until(fd, label)
+        assert b"NicTUI" in output, "Startup did not draw the demo UI"
         assert b"\x1b[?1003h" not in output, "Mouse reporting was enabled"
+        if view == "activity":
+            os.write(fd, b"s")
+            output = read_until(fd, b"Listening")
+            assert b"\x1b[?1003h" not in output, "Activity enabled mouse reporting"
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         os.kill(pid, signal.SIGWINCH)
         assert read_for(fd, 1), "Resize did not redraw without a keypress"
         os.write(fd, b"q")
-        output = read_for(fd, 1)
+        output = read_until(fd, b"\x1b[?1049l")
         assert b"\x1b[?1049l" in output, "Alternate screen was not restored"
         assert b"\x1b[?1006l" in output, "Mouse reporting was not reset"
         assert termios.tcgetattr(fd)[3] & termios.ICANON, "Raw mode was not restored"
-        assert os.waitpid(pid, 0)[1] == 0, "TUI exit failed"
+        assert termios.tcgetattr(fd)[3] & termios.ECHO, "Terminal echo was not restored"
+        status = wait_for_exit(pid, fd=fd)
         pid = None
+        assert status == 0, "TUI exit failed"
     finally:
-        if pid is not None:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-        os.close(fd)
+        cleanup_terminal_child(pid, fd)
 
 
 def flash_checks(binary, size, ack_init=True):
@@ -155,6 +225,7 @@ def launcher_checks():
 if __name__ == "__main__":
     binary = str(Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/nictui").resolve())
     terminal_checks(binary)
+    terminal_checks(binary, view="activity")
     launcher_checks()
     for size in (32, 33):
         flash_checks(binary, size)
@@ -163,4 +234,4 @@ if __name__ == "__main__":
         result = subprocess.run([binary, "firmware", "flash", "--input", image.name,
                                  "--validate-only"], capture_output=True)
         assert result.returncode != 0, "Empty firmware passed validation"
-    print("PASS: startup, resize, terminal restore, app launcher, flash ACK retry, final ACK, padding, empty image")
+    print("PASS: demo startup, Activity start/quit, resize, terminal restore, app launcher, flash ACK retry, final ACK, padding, empty image")

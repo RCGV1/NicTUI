@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 pub mod activity;
+pub mod activity_session;
 pub mod app;
 pub mod ble;
 pub mod cancellation;

@@ -1,3 +1,4 @@
+use crate::app::activity::ActivityStatus;
 use crate::app::{App, AppMode, MainTab};
 use crate::ui::theme::{
     COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_ERROR, COLOR_HEADER, COLOR_PRIMARY,
@@ -74,19 +75,24 @@ pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
 
     let selected_port = app.selected_port_short_label();
     let state_summary = dirty_summary(app);
+    let status_message = header_message(app, active_tab);
     let detail_text = if compact {
         format!(" {tab_label} | {tab_summary} | {state_summary}")
     } else if has_unsaved_state(app) {
-        format!(
-            " {tab_label}  |  {tab_summary}  |  {state_summary}  |  {selected_port}  |  {}",
-            app.status_message
-        )
-    } else if app.status_message.trim().is_empty() {
+        if status_message.trim().is_empty() {
+            format!(" {tab_label}  |  {tab_summary}  |  {state_summary}  |  {selected_port}")
+        } else {
+            format!(
+                " {tab_label}  |  {tab_summary}  |  {state_summary}  |  {selected_port}  |  {}",
+                status_message
+            )
+        }
+    } else if status_message.trim().is_empty() {
         format!(" {tab_label}  |  {tab_summary}  |  {selected_port}  |  {state_summary}")
     } else {
         format!(
             " {tab_label}  |  {tab_summary}  |  {selected_port}  |  {}  |  {state_summary}",
-            app.status_message
+            status_message
         )
     };
 
@@ -105,6 +111,24 @@ pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn header_message(app: &App, tab: MainTab) -> &str {
+    // Activity's state summary and panel already cover these lifecycle notices.
+    if tab == MainTab::Activity
+        && matches!(
+            app.status_message.as_str(),
+            "Activity capture owns the radio. Stop capture before other radio actions."
+                | "Activity capture owns the radio; stop capture and wait for cleanup first"
+                | "Stopping Activity; waiting for radio cleanup."
+                | "Activity stopped; radio released."
+                | "Activity capture failed; radio released."
+        )
+    {
+        ""
+    } else {
+        &app.status_message
+    }
+}
+
 fn tab_label(tab: MainTab, compact: bool) -> &'static str {
     match (tab, compact) {
         (MainTab::Channels, _) => "Channels",
@@ -121,6 +145,7 @@ fn tab_label(tab: MainTab, compact: bool) -> &'static str {
         (MainTab::BinFlash, true) => "Flash",
         (MainTab::BinFlash, false) => "BIN Flash",
         (MainTab::Debug, _) => "Logs",
+        (MainTab::Activity, _) => "Activity [A]",
     }
 }
 
@@ -137,6 +162,7 @@ fn header_status(app: &App) -> (&'static str, ratatui::style::Color) {
         | AppMode::EditBandPlan(_) => ("EDITING", COLOR_ACCENT),
         AppMode::DeleteChannelConfirm(_) => ("CONFIRM", COLOR_WARNING),
         AppMode::Error(_) => ("ERROR", COLOR_ERROR),
+        _ if app.activity_active() => ("ACTIVITY", COLOR_WARNING),
         _ if app.remote_active => ("SESSION", COLOR_WARNING),
         _ if has_unsaved_state(app) => ("DIRTY", COLOR_WARNING),
         _ if app.selected_port_candidate().is_some() => ("TARGET", COLOR_PRIMARY),
@@ -250,6 +276,21 @@ fn tab_summary(app: &App, tab: MainTab, compact: bool) -> String {
             }
         }
         MainTab::Debug => format!("{} logs", app.logs.len()),
+        MainTab::Activity => {
+            let state = app.activity.lock().unwrap();
+            if state.stopping {
+                "Stopping capture"
+            } else {
+                match state.status {
+                    ActivityStatus::Ready => "Ready to capture",
+                    ActivityStatus::Listening => "Receiving activity",
+                    ActivityStatus::Waiting => "Waiting for activity",
+                    ActivityStatus::Stopped => "Capture stopped",
+                    ActivityStatus::Error => "Capture error; see panel",
+                }
+            }
+            .to_string()
+        }
     }
 }
 
@@ -294,6 +335,106 @@ fn dirty_summary(app: &App) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn header_detail(app: &App, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 38)).unwrap();
+        terminal
+            .draw(|frame| render_header(frame, app, Rect::new(0, 0, width, 3)))
+            .unwrap();
+        (0..width)
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn activity_waiting_header_fits_without_repeating_ownership() {
+        let mut app = App::new();
+        app.mode = AppMode::Main(MainTab::Activity);
+        app.protocol_port_name = Some("/dev/cu.usbserial-TEST".into());
+        app.status_message =
+            "Activity capture owns the radio. Stop capture before other radio actions.".into();
+        app.activity.lock().unwrap().status = ActivityStatus::Waiting;
+
+        for width in [80, 100, 140] {
+            let detail = header_detail(&app, width);
+            assert!(detail.contains("Activity [A]"), "{width}: {detail}");
+            assert!(detail.contains("Waiting for activity"), "{width}: {detail}");
+            assert!(detail.contains("workspace clean"), "{width}: {detail}");
+            assert!(!detail.contains("owns the radio"), "{width}: {detail}");
+            if width >= 90 {
+                assert!(detail.contains("usbserial-TEST"), "{width}: {detail}");
+            }
+        }
+        assert!(
+            app.status_message
+                .contains("Stop capture before other radio actions.")
+        );
+        let state = app.activity.lock().unwrap();
+        assert_eq!(state.hit_count, 0);
+        assert_eq!(state.heartbeat_count, 0);
+    }
+
+    #[test]
+    fn activity_header_reports_each_state_and_stopping() {
+        let app = App::new();
+        for (status, expected) in [
+            (ActivityStatus::Ready, "Ready to capture"),
+            (ActivityStatus::Listening, "Receiving activity"),
+            (ActivityStatus::Waiting, "Waiting for activity"),
+            (ActivityStatus::Stopped, "Capture stopped"),
+            (ActivityStatus::Error, "Capture error; see panel"),
+        ] {
+            app.activity.lock().unwrap().status = status;
+            assert_eq!(tab_summary(&app, MainTab::Activity, false), expected);
+            assert_eq!(tab_summary(&app, MainTab::Activity, true), expected);
+        }
+        app.activity.lock().unwrap().stopping = true;
+        assert_eq!(
+            tab_summary(&app, MainTab::Activity, false),
+            "Stopping capture"
+        );
+    }
+
+    #[test]
+    fn activity_header_preserves_dirty_state_and_action_feedback() {
+        let mut app = App::new();
+        app.mode = AppMode::Main(MainTab::Activity);
+        app.scan_presets_dirty = true;
+        app.status_message =
+            "Activity capture owns the radio; stop capture and wait for cleanup first".into();
+        let detail = header_detail(&app, 140);
+        assert!(detail.contains("pending scan*"));
+        assert!(!detail.contains("owns the radio"));
+        assert!(!detail.trim_end().ends_with('|'));
+
+        for message in [
+            "Activity CSV saved.",
+            "Could not save Activity CSV. Check the destination and try again.",
+            "Select a radio target before starting Activity.",
+        ] {
+            app.status_message = message.into();
+            assert_eq!(header_message(&app, MainTab::Activity), message);
+            assert!(header_detail(&app, 180).contains(message));
+        }
+    }
+
+    #[test]
+    fn activity_lifecycle_notice_filter_does_not_change_other_tabs() {
+        let mut app = App::new();
+        for message in [
+            "Activity capture owns the radio. Stop capture before other radio actions.",
+            "Activity capture owns the radio; stop capture and wait for cleanup first",
+            "Stopping Activity; waiting for radio cleanup.",
+            "Activity stopped; radio released.",
+            "Activity capture failed; radio released.",
+        ] {
+            app.status_message = message.into();
+            assert_eq!(header_message(&app, MainTab::Activity), "");
+            assert_eq!(header_message(&app, MainTab::Channels), message);
+            assert_eq!(header_message(&app, MainTab::Remote), message);
+        }
+    }
 
     #[test]
     fn open_remote_session_is_not_a_green_control_verdict() {

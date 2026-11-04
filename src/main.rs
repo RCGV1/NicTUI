@@ -77,15 +77,37 @@ fn launch_tui(port: Option<String>, demo: bool, demo_view: DemoView) -> Result<(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    let mut app = initialize_tui_app(
+        port.as_deref(),
+        demo,
+        demo_view,
+        App::refresh_ports,
+        |app| app.start_ble_scan(false),
+    );
+    let res = run_app(&mut terminal, &mut app);
+
+    drop(terminal);
+    drop(session);
+    res?;
+    print_post_exit_skill_hint();
+
+    Ok(())
+}
+
+fn initialize_tui_app(
+    port: Option<&str>,
+    demo: bool,
+    demo_view: DemoView,
+    discover_serial: impl FnOnce(&mut App),
+    discover_ble: impl FnOnce(&mut App),
+) -> App {
     let mut app = if demo { App::demo() } else { App::new() };
-    if !demo {
-        app.refresh_ports();
-    }
     if demo {
         // Demo mode is intentionally hardware-free so it is safe for screenshots and UI review.
         app.mode = AppMode::Main(match demo_view {
             DemoView::Channels => MainTab::Channels,
             DemoView::Settings => MainTab::Settings,
+            DemoView::Activity => MainTab::Activity,
             DemoView::Remote => {
                 app.remote_active = true;
                 MainTab::Remote
@@ -96,18 +118,15 @@ fn launch_tui(port: Option<String>, demo: bool, demo_view: DemoView) -> Result<(
             _ => MainTab::Channels,
         };
     } else if let Some(port_name) = port {
-        app.connect_to_port_by_name(&port_name);
-    } else if should_auto_start_ble_scan() {
-        app.start_ble_scan(false);
+        // An explicit target may already be scanning; discovery would interrupt it.
+        app.connect_to_port_by_name(port_name);
+    } else {
+        discover_serial(&mut app);
+        if should_auto_start_ble_scan() {
+            discover_ble(&mut app);
+        }
     }
-    let res = run_app(&mut terminal, &mut app);
-
-    drop(terminal);
-    drop(session);
-    res?;
-    print_post_exit_skill_hint();
-
-    Ok(())
+    app
 }
 
 fn should_auto_start_ble_scan() -> bool {
@@ -295,7 +314,7 @@ where
                         // Tab specific actions
                         _ => {
                             if let Some(target) =
-                                tab_shortcut_target(current_tab, app.remote_active, key.code)
+                                tab_shortcut_for_key(current_tab, app.remote_active, key)
                             {
                                 if target == MainTab::Remote {
                                     if current_tab != MainTab::Remote {
@@ -310,6 +329,11 @@ where
                             }
 
                             match current_tab {
+                                MainTab::Activity => {
+                                    if activity_key_event_allowed(key) {
+                                        app.handle_activity_key(key.code);
+                                    }
+                                }
                                 MainTab::Channels => match key.code {
                                     KeyCode::Up => app.prev_channel(),
                                     KeyCode::Down => app.next_channel(),
@@ -449,7 +473,7 @@ struct TuiShutdown {
 
 impl TuiShutdown {
     fn terminal_failed(&mut self, app: &mut App, error: anyhow::Error) -> Result<()> {
-        if !operation_in_progress(app) && !app.remote_active {
+        if !operation_in_progress(app) && !app.remote_active && !app.activity_active() {
             return Err(error);
         }
         self.terminal_error = Some(error);
@@ -489,6 +513,7 @@ impl TuiShutdown {
             return;
         }
         self.requested = true;
+        app.stop_activity();
         if app.remote_active {
             app.remote_off();
             self.quit_after_remote_stop = true;
@@ -500,22 +525,27 @@ impl TuiShutdown {
         // Busy modes are released by completion/error events, after device cleanup.
         self.requested
             && !operation_in_progress(app)
+            && !app.activity_active()
             && (!self.quit_after_remote_stop || !app.remote_active)
     }
 
     fn refresh_status(&self, app: &mut App) -> bool {
-        if !self.requested || !operation_in_progress(app) {
+        if !self.requested || (!operation_in_progress(app) && !app.activity_active()) {
             return false;
         }
-        let status = match app.mode {
-            AppMode::BinFlashing => {
-                "Quit queued; flashing cannot be safely aborted. Keep the radio connected until it finishes."
-            }
-            AppMode::Writing => {
-                "Quit queued; writing cannot be safely cancelled. Keep the radio connected until it finishes."
-            }
-            _ => {
-                "Quit queued; waiting for read cleanup. Keep the radio connected until it finishes."
+        let status = if app.activity_active() {
+            "Quit queued; waiting for Activity capture cleanup."
+        } else {
+            match app.mode {
+                AppMode::BinFlashing => {
+                    "Quit queued; flashing cannot be safely aborted. Keep the radio connected until it finishes."
+                }
+                AppMode::Writing => {
+                    "Quit queued; writing cannot be safely cancelled. Keep the radio connected until it finishes."
+                }
+                _ => {
+                    "Quit queued; waiting for read cleanup. Keep the radio connected until it finishes."
+                }
             }
         };
         if app.status_message == status {
@@ -546,8 +576,22 @@ fn tab_shortcut_target(
         KeyCode::Char('8') => Some(MainTab::Codeplug),
         KeyCode::Char('9') => Some(MainTab::BinFlash),
         KeyCode::Char('0') => Some(MainTab::Debug),
+        KeyCode::Char('A') => Some(MainTab::Activity),
         _ => None,
     }
+}
+
+fn tab_shortcut_for_key(current: MainTab, remote_active: bool, key: KeyEvent) -> Option<MainTab> {
+    if !(key.modifiers & !KeyModifiers::SHIFT).is_empty() {
+        return None;
+    }
+    tab_shortcut_target(current, remote_active, key.code)
+}
+
+fn activity_key_event_allowed(key: KeyEvent) -> bool {
+    (key.kind == KeyEventKind::Press
+        || (key.kind == KeyEventKind::Repeat && matches!(key.code, KeyCode::Up | KeyCode::Down)))
+        && (key.modifiers & !KeyModifiers::SHIFT).is_empty()
 }
 
 fn remote_modifiers_allowed(modifiers: KeyModifiers) -> bool {
@@ -605,6 +649,217 @@ mod tests {
     use super::*;
     use nictui::app::{AppEvent, WriteScope};
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn startup_explicit_port_selects_passively_without_discovery() {
+        let port = "/dev/nictui-nonexistent-TEST";
+        let app = initialize_tui_app(
+            Some(port),
+            false,
+            DemoView::Channels,
+            |_| panic!("explicit startup must not enumerate or probe serial ports"),
+            |_| panic!("explicit startup must not discover BLE radios"),
+        );
+        assert_eq!(app.mode, AppMode::Main(MainTab::Channels));
+        assert_eq!(app.protocol_port_name.as_deref(), Some(port));
+        assert_eq!(app.ports, [port]);
+        assert_eq!(app.port_candidates.len(), 1);
+        assert!(app.serial_port_candidates.is_empty());
+        assert!(app.ble_port_candidates.is_empty());
+        assert!(!app.ble_scan_in_progress);
+        assert!(!app.activity_active());
+        assert!(!app.remote_active);
+        let candidate = app.selected_port_candidate().unwrap();
+        assert_eq!(candidate.kind, nictui::device::PortKind::Candidate);
+        assert!(!candidate.handshake_ok);
+        assert!(candidate.firmware_variant.is_none());
+        assert!(app.status_message.contains("Radio opens on first action."));
+    }
+
+    #[test]
+    fn startup_bare_selection_keeps_discovery_order_and_platform_policy() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let app = initialize_tui_app(
+            None,
+            false,
+            DemoView::Channels,
+            |app| {
+                assert_eq!(app.mode, AppMode::PortSelection);
+                calls.borrow_mut().push("serial");
+            },
+            |app| {
+                assert_eq!(app.mode, AppMode::PortSelection);
+                calls.borrow_mut().push("ble");
+            },
+        );
+        let expected = if should_auto_start_ble_scan() {
+            vec!["serial", "ble"]
+        } else {
+            vec!["serial"]
+        };
+        assert_eq!(*calls.borrow(), expected);
+        assert_eq!(app.mode, AppMode::PortSelection);
+        assert!(app.protocol_port_name.is_none());
+    }
+
+    #[test]
+    fn startup_demo_ignores_explicit_port_and_never_discovers_hardware() {
+        for view in [DemoView::Channels, DemoView::Activity, DemoView::Remote] {
+            let app = initialize_tui_app(
+                Some("/dev/nictui-nonexistent-TEST"),
+                true,
+                view,
+                |_| panic!("demo must not enumerate or probe serial ports"),
+                |_| panic!("demo must not discover BLE radios"),
+            );
+            assert!(app.demo_mode);
+            let expected = match view {
+                DemoView::Activity => MainTab::Activity,
+                DemoView::Remote => MainTab::Remote,
+                _ => MainTab::Channels,
+            };
+            assert_eq!(app.mode, AppMode::Main(expected));
+            assert_eq!(app.last_main_tab, expected);
+            assert_eq!(app.remote_active, expected == MainTab::Remote);
+            assert_ne!(
+                app.protocol_port_name.as_deref(),
+                Some("/dev/nictui-nonexistent-TEST")
+            );
+        }
+    }
+
+    #[test]
+    fn activity_shortcut_preserves_digits_and_live_remote_ptt() {
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            let key = KeyEvent::new(KeyCode::Char('A'), modifiers);
+            assert_eq!(
+                tab_shortcut_for_key(MainTab::Channels, false, key),
+                Some(MainTab::Activity)
+            );
+            assert_eq!(tab_shortcut_for_key(MainTab::Remote, true, key), None);
+        }
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(
+                tab_shortcut_for_key(
+                    MainTab::Channels,
+                    false,
+                    KeyEvent::new(KeyCode::Char('A'), modifiers)
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            tab_shortcut_for_key(
+                MainTab::Remote,
+                true,
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
+            ),
+            None
+        );
+        assert_eq!(
+            remote_key_code(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(0x13)
+        );
+        for (key, tab) in [
+            ('1', MainTab::Channels),
+            ('2', MainTab::Settings),
+            ('3', MainTab::Scanning),
+            ('4', MainTab::MemoryGroups),
+            ('5', MainTab::BandPlan),
+            ('6', MainTab::DTMF),
+            ('7', MainTab::Remote),
+            ('8', MainTab::Codeplug),
+            ('9', MainTab::BinFlash),
+            ('0', MainTab::Debug),
+        ] {
+            assert_eq!(
+                tab_shortcut_target(MainTab::Activity, false, KeyCode::Char(key)),
+                Some(tab)
+            );
+        }
+    }
+
+    #[test]
+    fn activity_start_stop_actions_are_press_only_but_rows_repeat() {
+        for code in [
+            KeyCode::Char('s'),
+            KeyCode::Char('c'),
+            KeyCode::Char('e'),
+            KeyCode::Enter,
+        ] {
+            let mut key = KeyEvent::new(code, KeyModifiers::NONE);
+            assert!(activity_key_event_allowed(key));
+            key.kind = KeyEventKind::Repeat;
+            assert!(!activity_key_event_allowed(key));
+            key.kind = KeyEventKind::Release;
+            assert!(!activity_key_event_allowed(key));
+        }
+        let mut key = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        key.kind = KeyEventKind::Repeat;
+        assert!(activity_key_event_allowed(key));
+        key.modifiers = KeyModifiers::ALT;
+        assert!(!activity_key_event_allowed(key));
+    }
+
+    #[test]
+    fn quit_and_terminal_failure_wait_for_activity_worker_completion() {
+        for terminal_failed in [false, true] {
+            let mut app = App::demo();
+            app.mode = AppMode::Main(MainTab::Activity);
+            app.start_activity();
+            let mut shutdown = TuiShutdown::default();
+            if terminal_failed {
+                shutdown
+                    .terminal_failed(&mut app, anyhow::anyhow!("closed terminal"))
+                    .unwrap();
+            } else {
+                assert!(shutdown.handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+                ));
+            }
+            assert!(!shutdown.ready(&app));
+            assert!(app.activity_active());
+            assert!(shutdown.handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE)
+            ));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !shutdown.ready(&app) && Instant::now() < deadline {
+                app.update();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(shutdown.ready(&app));
+            assert!(!app.activity_active());
+        }
+    }
+
+    #[test]
+    fn activity_keys_navigate_and_capture_in_hardware_free_event_loop() {
+        let mut app = App::demo();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut events = [
+            KeyCode::Char('A'),
+            KeyCode::Char('s'),
+            KeyCode::Down,
+            KeyCode::Char('s'),
+            KeyCode::Char('q'),
+        ]
+        .into_iter();
+        run_app_with_events(&mut terminal, &mut app, |_| {
+            Ok(events
+                .next()
+                .map(|code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE))))
+        })
+        .unwrap();
+        assert_eq!(app.mode, AppMode::Main(MainTab::Activity));
+        assert!(!app.activity_active());
+        assert_eq!(app.activity_state.selected(), Some(0));
+    }
 
     fn quit_keys() -> [KeyEvent; 3] {
         [

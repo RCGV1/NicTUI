@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod bandplan;
 pub mod bin_flash;
 pub mod channels;

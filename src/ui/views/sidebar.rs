@@ -155,12 +155,18 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
             "Logs",
             sidebar_badge(app, MainTab::Debug),
         ),
+        (
+            10,
+            MainTab::Activity,
+            "Activity",
+            sidebar_badge(app, MainTab::Activity),
+        ),
     ];
 
-    let body_chunks = if sections[1].height >= 17 {
+    let body_chunks = if sections[1].height >= 18 {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(12), Constraint::Length(5)])
+            .constraints([Constraint::Min(13), Constraint::Length(5)])
             .split(sections[1])
             .to_vec()
     } else {
@@ -195,6 +201,8 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
                 fit_sidebar_row(index, label, &badge, content_width);
             let row_label = if app.remote_active {
                 label_display
+            } else if tab == MainTab::Activity {
+                format!("A. {label_display}")
             } else {
                 format!("{index}. {label_display}")
             };
@@ -488,11 +496,21 @@ fn sidebar_badge(app: &App, tab: MainTab) -> String {
             }
         }
         MainTab::Debug => String::new(),
+        MainTab::Activity => if app.activity_active() { "live" } else { "" }.into(),
     }
 }
 
 fn sidebar_context_lines(app: &App, active_tab: MainTab, width: usize) -> Vec<Line<'static>> {
     match active_tab {
+        MainTab::Activity => vec![
+            Line::from("Activity capture"),
+            Line::from(if app.activity_active() {
+                "s stop / e CSV"
+            } else {
+                "s start / e CSV"
+            }),
+            Line::from("Up/Down selects row"),
+        ],
         MainTab::Channels => vec![
             Line::from(Span::styled(
                 "Channels",

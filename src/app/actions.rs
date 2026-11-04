@@ -113,7 +113,9 @@ impl App {
     }
 
     pub(crate) fn hardware_action_allowed(&mut self) -> bool {
-        let reason = if self.demo_mode {
+        let reason = if self.activity_active() {
+            Some("Activity capture owns the radio; stop capture and wait for cleanup first")
+        } else if self.demo_mode {
             Some("Demo mode: hardware I/O disabled")
         } else if self.remote_active || self.remote_tx.is_some() {
             Some(
@@ -167,7 +169,7 @@ impl App {
         }
     }
 
-    fn active_protocol_port(&mut self) -> Option<String> {
+    pub(crate) fn active_protocol_port(&mut self) -> Option<String> {
         if !self.hardware_action_allowed() {
             return None;
         }
@@ -639,6 +641,10 @@ impl App {
     }
 
     pub fn remote_on(&mut self) {
+        if self.activity_active() {
+            self.hardware_action_allowed();
+            return;
+        }
         if self.demo_mode {
             self.remote_active = true;
             self.remote_screen.phase = crate::remote::RemoteSessionPhase::Live;
@@ -748,6 +754,9 @@ impl App {
     }
 
     pub fn remote_controls_ready(&self) -> bool {
+        if self.activity_active() {
+            return false;
+        }
         if self.mode != AppMode::Main(MainTab::Remote)
             || self.dialog_open
             || !self.remote_active
@@ -767,6 +776,9 @@ impl App {
     }
 
     pub fn send_key(&mut self, key_code: u8) {
+        if self.activity_active() {
+            return;
+        }
         if self.mode != AppMode::Main(MainTab::Remote) || self.dialog_open {
             return;
         }
@@ -1058,7 +1070,7 @@ impl App {
         on_select(res);
     }
 
-    fn show_save_dialog<F>(
+    pub(crate) fn show_save_dialog<F>(
         &mut self,
         _title: &str,
         default_name: &str,

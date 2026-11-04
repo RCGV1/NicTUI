@@ -1,13 +1,22 @@
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, SyncSender, TrySendError},
+};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::activity::{
+    ActivityDecoder, ActivityEvent, ActivityLog, format_frequency_mhz, write_activity_csv,
+};
+use crate::activity_session::{ActivityMonitorEvent, ActivityMonitorOptions, monitor_activity};
 use crate::ble::{
     BleReadinessReport, BleTarget, assess_ble_readiness, default_scan_timeout,
     disconnect_ble_bridge_for_device, ensure_ble_bridge, parse_ble_device_uri,
@@ -82,6 +91,24 @@ Remote evidence notes:
   - They are not proof of remote control by themselves.
   - Passive state changes do not confirm control; use:
     nictui remote diagnose --port <serial> --json";
+
+const ACTIVITY_AFTER_HELP: &str = "\
+Start a VFO preset scan, then enable Activity Mode on the radio.
+Monitor requires an explicit --port, --ble-device, or --ble-name target;
+automatic radio discovery is not used for activity capture.
+Capture is receive-only apart from the 0x02 connection ping: NicTUI does not
+enable Activity Mode, start scanning, or change radio settings.
+Signal values are raw radio readings, NOT dBm.
+
+Examples:
+  nictui activity monitor --port <serial> --duration 30 --output activity.csv
+  nictui activity monitor --ble-name TD-H3 --json
+  nictui activity replay --input raw.bin --output activity.csv --json
+
+Replay timestamps are host processing times, not original capture times.";
+
+const LEGACY_REMOTE_VM_ERROR: &str =
+    "Legacy vm is disabled: use exit for orange V/M button; use explicit ptt-b for transmission";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -164,6 +191,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Capture scan activity or replay a raw activity recording
+    #[command(after_help = ACTIVITY_AFTER_HELP)]
+    Activity {
+        #[command(subcommand)]
+        command: ActivityCommand,
+    },
     /// Inspect or install the bundled AI radio-control skill
     Skill {
         #[command(subcommand)]
@@ -178,7 +211,7 @@ pub struct TuiArgs {
     /// Launch a populated simulated radio without connecting to hardware
     #[arg(long)]
     pub demo: bool,
-    /// Initial view for demo mode: channels, settings, or remote
+    /// Initial view for demo mode: channels, settings, remote, or activity
     #[arg(long, value_enum, default_value = "channels")]
     pub demo_view: DemoView,
 }
@@ -188,6 +221,7 @@ pub enum DemoView {
     Channels,
     Settings,
     Remote,
+    Activity,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -397,6 +431,48 @@ pub enum RemoteCommand {
     LiveRead(RemoteLiveReadArgs),
     /// Experimentally write one live-mode 32-byte block via the documented PVOJH transaction
     LiveWrite(RemoteLiveWriteArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ActivityCommand {
+    /// Receive activity: start a VFO preset scan, then enable Activity Mode on the radio
+    #[command(
+        after_help = ACTIVITY_AFTER_HELP,
+        group(clap::ArgGroup::new("activity_target").args(["port", "ble_device", "ble_name"]).required(true)),
+        mut_arg("port", |arg| arg.help("Explicit serial port (or BLE URI) to receive activity from; no automatic probing"))
+    )]
+    Monitor(ActivityMonitorArgs),
+    /// Decode a raw recording offline; incomplete records are errors
+    #[command(after_help = ACTIVITY_AFTER_HELP)]
+    Replay(ActivityReplayArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ActivityMonitorArgs {
+    #[command(flatten)]
+    pub port: PortArgs,
+    /// Capture duration in seconds (at least 1)
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    pub duration: u64,
+    /// Save frequency summaries as CSV (raw signal, not dBm)
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    /// Emit one final JSON object instead of text hits
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ActivityReplayArgs {
+    /// Raw activity bytes to decode without connecting to a radio
+    #[arg(long)]
+    pub input: PathBuf,
+    /// Save frequency summaries as CSV only after a complete, valid replay
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    /// Emit one final JSON object instead of text hits
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1176,6 +1252,13 @@ pub fn dispatch(cli: Cli) -> Result<Dispatch> {
                 RemoteCommand::PvojhSweep(args) => run_remote_pvojh_sweep(args)?,
                 RemoteCommand::LiveRead(args) => run_remote_live_read(args)?,
                 RemoteCommand::LiveWrite(args) => run_remote_live_write(args)?,
+            }
+            Ok(Dispatch::Exit)
+        }
+        Some(Commands::Activity { command }) => {
+            match command {
+                ActivityCommand::Monitor(args) => run_activity_monitor(args)?,
+                ActivityCommand::Replay(args) => run_activity_replay(args)?,
             }
             Ok(Dispatch::Exit)
         }
@@ -2098,8 +2181,9 @@ fn run_flash_firmware(args: FlashFirmwareArgs) -> Result<()> {
 }
 
 fn run_remote_key(args: RemoteKeyArgs) -> Result<()> {
+    let key_code = args.key.as_key_code()?;
     let port = resolve_port_for_args(&args.port)?;
-    let report = send_remote_key_with_report(&port, args.key.as_key_code()).map_err(|failure| {
+    let report = send_remote_key_with_report(&port, key_code).map_err(|failure| {
         anyhow!(
             "Remote session failed [{}]: {}",
             failure.kind,
@@ -2171,7 +2255,398 @@ fn control_transport_outcome(sent: bool) -> &'static str {
     if sent { "SENT" } else { "FAILED" }
 }
 
+#[derive(Default)]
+struct ActivityCapture {
+    log: ActivityLog,
+    hit_count: u64,
+    heartbeat_count: u64,
+    truncated_frames: u64,
+}
+
+impl ActivityCapture {
+    fn record(&mut self, event: &ActivityEvent) -> Result<()> {
+        let count = match event {
+            ActivityEvent::Hit { .. } => &mut self.hit_count,
+            ActivityEvent::Heartbeat { .. } => &mut self.heartbeat_count,
+        };
+        let next = count
+            .checked_add(1)
+            .context("Activity event count overflow")?;
+        self.log.record(event)?;
+        *count = next;
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct ActivityRowView {
+    frequency_10hz: u32,
+    frequency_mhz: String,
+    count: u64,
+    mean_signal_raw: f64,
+    first_seen: String,
+    last_seen: String,
+}
+
+#[derive(Serialize)]
+struct ActivityCaptureView {
+    complete: bool,
+    hit_count: u64,
+    heartbeat_count: u64,
+    truncated_frames: u64,
+    frequencies: Vec<ActivityRowView>,
+}
+
+const ACTIVITY_OUTPUT_CAPACITY: usize = 64;
+const ACTIVITY_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const ACTIVITY_OUTPUT_CANCEL_GRACE: Duration = Duration::from_millis(100);
+
+struct ActivityOutput {
+    sender: Option<SyncSender<Vec<u8>>>,
+    completed: Receiver<io::Result<()>>,
+    abort: Arc<AtomicBool>,
+}
+
+impl ActivityOutput {
+    fn new(stop_capture: Option<Arc<AtomicBool>>) -> Result<Self> {
+        #[cfg(unix)]
+        let stdout = {
+            use std::os::fd::AsFd;
+            File::from(io::stdout().as_fd().try_clone_to_owned()?)
+        };
+        #[cfg(windows)]
+        let stdout = {
+            use std::os::windows::io::AsHandle;
+            File::from(io::stdout().as_handle().try_clone_to_owned()?)
+        };
+        Self::with_writer(stdout, stop_capture).context("Could not start activity output writer")
+    }
+
+    fn with_writer(
+        mut writer: impl Write + Send + 'static,
+        stop_capture: Option<Arc<AtomicBool>>,
+    ) -> io::Result<Self> {
+        let (sender, messages) = mpsc::sync_channel::<Vec<u8>>(ACTIVITY_OUTPUT_CAPACITY);
+        let (finished, completed) = mpsc::sync_channel(1);
+        let abort = Arc::new(AtomicBool::new(false));
+        let worker_abort = Arc::clone(&abort);
+        // Never use StdoutLock here: a stalled pipe must not block process-exit
+        // stdout cleanup. The owned OS handle can safely outlive the caller.
+        std::thread::Builder::new()
+            .name("activity-output".into())
+            .spawn(move || {
+                let result = (|| {
+                    while let Ok(bytes) = messages.recv() {
+                        if worker_abort.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
+                        writer.write_all(&bytes)?;
+                    }
+                    writer.flush()
+                })();
+                if result.is_err()
+                    && let Some(stop) = stop_capture
+                {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                let _ = finished.send(result);
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            completed,
+            abort,
+        })
+    }
+
+    fn enqueue(&self, bytes: Vec<u8>) -> Result<()> {
+        match self
+            .sender
+            .as_ref()
+            .context("Activity output is closed")?
+            .try_send(bytes)
+        {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => bail!(
+                "Activity output backpressure: stdout is not keeping up; output is incomplete"
+            ),
+            Err(TrySendError::Disconnected(_)) => {
+                if let Ok(Err(error)) = self.completed.try_recv() {
+                    return Err(error).context("Activity output failed; output is incomplete");
+                }
+                bail!("Activity output writer stopped; output is incomplete")
+            }
+        }
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.sender.take();
+        let deadline = Instant::now() + ACTIVITY_OUTPUT_DRAIN_TIMEOUT;
+        let mut cancel_deadline = None;
+        loop {
+            if crate::cancellation::is_requested() {
+                cancel_deadline
+                    .get_or_insert_with(|| Instant::now() + ACTIVITY_OUTPUT_CANCEL_GRACE);
+            }
+            let now = Instant::now();
+            if now >= deadline || cancel_deadline.is_some_and(|limit| now >= limit) {
+                if crate::cancellation::is_requested() {
+                    bail!(
+                        "Interrupted: activity output backpressure; stdout did not drain; output is incomplete"
+                    );
+                }
+                bail!("Activity output backpressure: stdout did not drain; output is incomplete");
+            }
+            match self.completed.recv_timeout(Duration::from_millis(10)) {
+                Ok(result) => {
+                    return result.context("Activity output failed; output is incomplete");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => (),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("Activity output writer stopped; output is incomplete")
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ActivityOutput {
+    fn drop(&mut self) {
+        // A blocking OS write cannot be joined safely. Detach it on failure;
+        // the bounded queue is discarded when the write returns or the CLI exits.
+        self.abort.store(true, Ordering::Relaxed);
+    }
+}
+
+fn activity_capture_bytes(
+    capture: &ActivityCapture,
+    json: bool,
+    complete: bool,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if json {
+        let report = ActivityCaptureView {
+            complete,
+            hit_count: capture.hit_count,
+            heartbeat_count: capture.heartbeat_count,
+            truncated_frames: capture.truncated_frames,
+            frequencies: capture
+                .log
+                .rows()
+                .map(|row| ActivityRowView {
+                    frequency_10hz: row.frequency_10hz,
+                    frequency_mhz: format_frequency_mhz(row.frequency_10hz),
+                    count: row.count,
+                    mean_signal_raw: row.mean_signal_raw(),
+                    first_seen: row.first_seen.to_rfc3339(),
+                    last_seen: row.last_seen.to_rfc3339(),
+                })
+                .collect(),
+        };
+        serde_json::to_writer(&mut bytes, &report)?;
+        writeln!(bytes)?;
+    } else {
+        for row in capture.log.rows() {
+            writeln!(
+                bytes,
+                "{} MHz | count {} | mean signal (raw, not dBm) {:.2} | first {} | last {}",
+                format_frequency_mhz(row.frequency_10hz),
+                row.count,
+                row.mean_signal_raw(),
+                row.first_seen.to_rfc3339(),
+                row.last_seen.to_rfc3339()
+            )?;
+        }
+    }
+    Ok(bytes)
+}
+
+fn print_activity_capture(capture: &ActivityCapture, json: bool, complete: bool) -> Result<()> {
+    let result = (|| {
+        let output = ActivityOutput::new(None)?;
+        output.enqueue(activity_capture_bytes(capture, json, complete)?)?;
+        if !json {
+            print_activity_counts(capture, complete);
+        }
+        output.finish()
+    })();
+    if crate::cancellation::is_requested() {
+        if let Err(error) = &result {
+            eprintln!("Warning: {error:#}");
+        }
+        check_cli_interruption()?;
+    }
+    result
+}
+
+fn print_activity_counts(capture: &ActivityCapture, complete: bool) {
+    eprintln!(
+        "Activity: {} hits, {} heartbeats, {} truncated frames{}.",
+        capture.hit_count,
+        capture.heartbeat_count,
+        capture.truncated_frames,
+        if complete { "" } else { " (partial capture)" }
+    );
+}
+
+fn enqueue_activity_hit(output: &ActivityOutput, event: &ActivityEvent) -> Result<()> {
+    if let ActivityEvent::Hit {
+        timestamp,
+        frequency_10hz,
+        signal_raw,
+    } = event
+    {
+        output.enqueue(
+            format!(
+                "{} | {} MHz | signal (raw, not dBm) {}\n",
+                timestamp.to_rfc3339(),
+                format_frequency_mhz(*frequency_10hz),
+                signal_raw
+            )
+            .into_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+fn run_activity_monitor(args: ActivityMonitorArgs) -> Result<()> {
+    if args.port.port.is_none() && args.port.ble_device.is_none() && args.port.ble_name.is_none() {
+        bail!(
+            "Activity monitor requires --port, --ble-device, or --ble-name; automatic probing is disabled for receive-only capture"
+        );
+    }
+    eprintln!(
+        "Start a VFO preset scan, then enable Activity Mode on the radio. Capture is receive-only apart from the 0x02 connection ping; signal is raw, not dBm."
+    );
+    let port = resolve_port_for_args(&args.port)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let options = ActivityMonitorOptions {
+        duration: Some(Duration::from_secs(args.duration)),
+        stop_signal: Some(Arc::clone(&stop)),
+    };
+    let mut capture = ActivityCapture::default();
+    let output = ActivityOutput::new(Some(Arc::clone(&stop)))?;
+    let mut ready = false;
+    let mut aggregation_error = None;
+    let mut output_error = None;
+    let result = monitor_activity(&port, &options, |event| match event {
+        ActivityMonitorEvent::Ready => {
+            ready = true;
+            eprintln!("Receiving activity for {} seconds...", args.duration);
+        }
+        ActivityMonitorEvent::Event(event) => {
+            if aggregation_error.is_some() {
+                return;
+            }
+            if let Err(error) = capture.record(&event) {
+                aggregation_error = Some(error);
+                stop.store(true, Ordering::Relaxed);
+                return;
+            }
+            if !args.json
+                && output_error.is_none()
+                && let Err(error) = enqueue_activity_hit(&output, &event)
+            {
+                output_error = Some(error);
+                stop.store(true, Ordering::Relaxed);
+            }
+        }
+        ActivityMonitorEvent::Warning(message) => {
+            // The session also emits this warning on failure, when no summary is returned.
+            if message.starts_with("Discarded incomplete activity frame:") {
+                capture.truncated_frames = capture.truncated_frames.saturating_add(1);
+            }
+            eprintln!("Warning: {message}");
+        }
+    });
+    // A failed connection must not replace an existing recording with an empty CSV.
+    if !ready {
+        check_cli_interruption()?;
+        result?;
+        if let Some(error) = output_error.or(aggregation_error) {
+            return Err(error);
+        }
+        output.finish()?;
+        bail!("Activity capture did not become ready");
+    }
+    if let Ok(summary) = &result {
+        capture.truncated_frames = summary.truncated_frames;
+    }
+    let complete = result.is_ok()
+        && aggregation_error.is_none()
+        && output_error.is_none()
+        && !stop.load(Ordering::Relaxed)
+        && !crate::cancellation::is_requested();
+    let save_result = args
+        .output
+        .as_deref()
+        .map(|path| write_activity_csv(path, &capture.log))
+        .transpose();
+    let print_result = if let Some(error) = output_error {
+        Err(error)
+    } else {
+        activity_capture_bytes(&capture, args.json, complete)
+            .and_then(|bytes| output.enqueue(bytes))
+            .and_then(|()| output.finish())
+    };
+    if !args.json {
+        print_activity_counts(&capture, complete);
+    }
+    if let Err(error) = &result {
+        eprintln!("Activity capture stopped: {error:#}");
+    }
+    save_result.context("Failed to save captured activity CSV")?;
+    if crate::cancellation::is_requested() {
+        if let Err(error) = print_result {
+            eprintln!("Warning: {error:#}");
+        }
+        bail!("Interrupted: signal requested; activity cleanup finished");
+    }
+    print_result?;
+    if let Some(error) = aggregation_error {
+        return Err(error.context("Activity capture stopped; bounded partial data retained"));
+    }
+    result?;
+    Ok(())
+}
+
+fn run_activity_replay(args: ActivityReplayArgs) -> Result<()> {
+    let mut input =
+        BufReader::new(File::open(&args.input).with_context(|| {
+            format!("Failed to open activity recording {}", args.input.display())
+        })?);
+    // File processing delays must not expire a frame split across read chunks.
+    let mut decoder = ActivityDecoder::new(Duration::MAX);
+    let mut capture = ActivityCapture::default();
+    let mut bytes = [0; 8192];
+    loop {
+        check_cli_interruption()?;
+        let length = input
+            .read(&mut bytes)
+            .context("Failed to read activity recording")?;
+        if length == 0 {
+            break;
+        }
+        for event in decoder.push(&bytes[..length]) {
+            capture.record(&event)?;
+        }
+    }
+    decoder
+        .finish()
+        .context("Incomplete activity recording; output was not replaced")?;
+    check_cli_interruption()?;
+    if let Some(path) = args.output.as_deref() {
+        write_activity_csv(path, &capture.log)?;
+    }
+    print_activity_capture(&capture, args.json, true)
+}
+
 fn run_remote_capture(args: RemoteMonitorArgs) -> Result<()> {
+    let scripted_commands = args
+        .send
+        .iter()
+        .copied()
+        .map(RemoteKey::as_command)
+        .collect::<Result<Vec<_>>>()?;
     if !args.send.is_empty() {
         eprintln!(
             "Warning: --send can change saved radio state; PTT keys may transmit. This is not a read-only capture."
@@ -2182,12 +2657,7 @@ fn run_remote_capture(args: RemoteMonitorArgs) -> Result<()> {
         duration: std::time::Duration::from_secs(args.duration),
         include_raw_logs: args.raw,
         suppress_idle_zero_logs: !args.raw_all,
-        scripted_commands: args
-            .send
-            .iter()
-            .copied()
-            .map(RemoteKey::as_command)
-            .collect(),
+        scripted_commands,
         command_start_delay: std::time::Duration::from_millis(250),
         key_interval: std::time::Duration::from_millis(args.send_interval_ms),
         disable_radio_before_remote: args.disable_radio,
@@ -2287,10 +2757,10 @@ fn run_remote_probe(args: RemoteProbeArgs) -> Result<()> {
 }
 
 fn run_remote_matrix(args: RemoteMatrixArgs) -> Result<()> {
-    let port = resolve_port_for_args(&args.port)?;
     let base = args
         .preset
-        .as_command(args.repeat, args.gap_ms, args.hold_ms);
+        .as_command(args.repeat, args.gap_ms, args.hold_ms)?;
+    let port = resolve_port_for_args(&args.port)?;
     let scenarios = remote_matrix_scenarios(&base, args.gap_ms);
 
     for (index, scenario) in scenarios.iter().enumerate() {
@@ -2434,10 +2904,10 @@ fn run_remote_diagnose(args: RemoteDiagnoseArgs) -> Result<()> {
             "menu",
             RemoteMonitorOptions {
                 duration: Duration::from_millis(1800)
-                    + RemoteKey::Menu.as_command().estimated_duration(),
+                    + RemoteKey::Menu.as_command()?.estimated_duration(),
                 include_raw_logs: args.raw,
                 suppress_idle_zero_logs: !args.raw_all,
-                scripted_commands: vec![RemoteKey::Menu.as_command()],
+                scripted_commands: vec![RemoteKey::Menu.as_command()?],
                 recover_retries: args.recover_retries,
                 ..RemoteMonitorOptions::default()
             },
@@ -3115,7 +3585,7 @@ fn build_remote_probe_command(
     hold_ms: u64,
 ) -> Result<RemoteControlCommand> {
     if let Some(preset) = preset {
-        Ok(preset.as_command(repeat, gap_ms, hold_ms))
+        preset.as_command(repeat, gap_ms, hold_ms)
     } else {
         Ok(RemoteControlCommand::sequence(
             "raw-sequence",
@@ -3960,8 +4430,8 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
 }
 
 impl RemoteKey {
-    fn as_key_code(self) -> u8 {
-        match self {
+    fn as_key_code(self) -> Result<u8> {
+        Ok(match self {
             RemoteKey::Digit0 => 0x01,
             RemoteKey::Digit1 => 0x02,
             RemoteKey::Digit2 => 0x03,
@@ -3981,18 +4451,21 @@ impl RemoteKey {
             RemoteKey::PttA => 0x13,
             RemoteKey::PttB => 0x1A,
             RemoteKey::Flashlight => 0x12,
-            RemoteKey::Vm => 0x11,
-        }
+            RemoteKey::Vm => bail!(LEGACY_REMOTE_VM_ERROR),
+        })
     }
 
-    fn as_command(self) -> RemoteControlCommand {
-        RemoteControlCommand::raw_key(format!("{self:?}").to_lowercase(), self.as_key_code())
+    fn as_command(self) -> Result<RemoteControlCommand> {
+        Ok(RemoteControlCommand::raw_key(
+            format!("{self:?}").to_lowercase(),
+            self.as_key_code()?,
+        ))
     }
 }
 
 impl RemoteProbePreset {
-    fn as_command(self, repeat: u32, gap_ms: u64, hold_ms: u64) -> RemoteControlCommand {
-        match self {
+    fn as_command(self, repeat: u32, gap_ms: u64, hold_ms: u64) -> Result<RemoteControlCommand> {
+        Ok(match self {
             RemoteProbePreset::Menu => RemoteControlCommand::raw_key("menu", 0x0B),
             RemoteProbePreset::Up => RemoteControlCommand::raw_key("up", 0x0C),
             RemoteProbePreset::Down => RemoteControlCommand::raw_key("down", 0x0D),
@@ -4000,7 +4473,7 @@ impl RemoteProbePreset {
             RemoteProbePreset::PttA => RemoteControlCommand::raw_key("ptt-a", 0x13),
             RemoteProbePreset::PttB => RemoteControlCommand::raw_key("ptt-b", 0x1A),
             RemoteProbePreset::Flashlight => RemoteControlCommand::raw_key("flashlight", 0x12),
-            RemoteProbePreset::Vm => RemoteControlCommand::raw_key("v/m", 0x11),
+            RemoteProbePreset::Vm => bail!(LEGACY_REMOTE_VM_ERROR),
             RemoteProbePreset::HoldMenu => RemoteControlCommand::held_key(
                 "hold-menu",
                 0x0B,
@@ -4018,7 +4491,7 @@ impl RemoteProbePreset {
                 std::time::Duration::from_millis(hold_ms.max(250)),
             ),
             RemoteProbePreset::TelemetryPrime => telemetry_prime_command(),
-        }
+        })
     }
 }
 
@@ -4723,6 +5196,93 @@ fn format_region_size(length: usize) -> String {
 }
 
 #[cfg(test)]
+mod activity_output_tests {
+    use super::*;
+
+    struct GatedWriter {
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    }
+
+    impl Write for GatedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let _ = self.entered.try_send(());
+            self.release.recv().map_err(io::Error::other)?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn blocked_output() -> (ActivityOutput, Receiver<()>, SyncSender<()>) {
+        let (entered, received) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let output = ActivityOutput::with_writer(
+            GatedWriter {
+                entered,
+                release: released,
+            },
+            None,
+        )
+        .unwrap();
+        (output, received, release)
+    }
+
+    #[test]
+    fn activity_output_queue_is_bounded_without_blocking_capture() {
+        let (output, entered, release) = blocked_output();
+        output.enqueue(vec![1]).unwrap();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..ACTIVITY_OUTPUT_CAPACITY {
+            output.enqueue(vec![1]).unwrap();
+        }
+        let error = output.enqueue(vec![1]).unwrap_err();
+        assert!(error.to_string().contains("output backpressure"));
+        drop(output);
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn activity_output_final_json_drain_has_a_deadline() {
+        let (output, entered, release) = blocked_output();
+        output
+            .enqueue(activity_capture_bytes(&ActivityCapture::default(), true, true).unwrap())
+            .unwrap();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let start = Instant::now();
+        let error = output.finish().unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(error.to_string().contains("output backpressure"));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn activity_output_propagates_writer_failure() {
+        struct BrokenWriter;
+        impl Write for BrokenWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let output = ActivityOutput::with_writer(BrokenWriter, Some(Arc::clone(&stop))).unwrap();
+        output.enqueue(vec![1]).unwrap();
+        let error = output.finish().unwrap_err();
+        assert!(error.to_string().contains("Activity output failed"));
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(stop.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         BluetoothCommand, ChannelsCommand, Cli, Commands, PvojhSweepResult, PvojhSweepStage,
@@ -5159,18 +5719,67 @@ mod tests {
     }
 
     #[test]
+    fn remote_vm_is_rejected_and_explicit_exit_and_ptt_b_keep_wire_codes() {
+        use super::{LEGACY_REMOTE_VM_ERROR, RemoteKey};
+
+        assert_eq!(
+            RemoteKey::Vm.as_key_code().unwrap_err().to_string(),
+            LEGACY_REMOTE_VM_ERROR
+        );
+        assert_eq!(
+            RemoteKey::Vm.as_command().unwrap_err().to_string(),
+            LEGACY_REMOTE_VM_ERROR
+        );
+        assert_eq!(
+            RemoteProbePreset::Vm
+                .as_command(1, 80, 0)
+                .unwrap_err()
+                .to_string(),
+            LEGACY_REMOTE_VM_ERROR
+        );
+        assert!(
+            super::build_remote_probe_command(Some(RemoteProbePreset::Vm), None, 1, 80, 0).is_err()
+        );
+
+        for (name, key, preset, key_code, wire) in [
+            (
+                "exit",
+                RemoteKey::Exit,
+                RemoteProbePreset::Exit,
+                0x0E,
+                "8D FF",
+            ),
+            (
+                "ptt-b",
+                RemoteKey::PttB,
+                RemoteProbePreset::PttB,
+                0x1A,
+                "91 FF",
+            ),
+        ] {
+            assert_eq!(RemoteKey::from_str(name, false).unwrap(), key);
+            assert_eq!(RemoteProbePreset::from_str(name, false).unwrap(), preset);
+            assert_eq!(key.as_key_code().unwrap(), key_code);
+            assert_eq!(key.as_command().unwrap().bytes_hex(), wire);
+            assert_eq!(preset.as_command(1, 80, 0).unwrap().bytes_hex(), wire);
+        }
+    }
+
+    #[test]
     fn remote_probe_presets_expand_to_commands() {
-        let hold_menu = RemoteProbePreset::HoldMenu.as_command(2, 80, 500);
+        let hold_menu = RemoteProbePreset::HoldMenu.as_command(2, 80, 500).unwrap();
         assert_eq!(hold_menu.bytes_hex(), "8A FF 8A FF");
         assert_eq!(
             hold_menu.steps[0].pause_after,
             std::time::Duration::from_millis(500)
         );
 
-        let ptt_a = RemoteProbePreset::PttA.as_command(1, 80, 0);
+        let ptt_a = RemoteProbePreset::PttA.as_command(1, 80, 0).unwrap();
         assert_eq!(ptt_a.bytes_hex(), "90 FF");
 
-        let telemetry_prime = RemoteProbePreset::TelemetryPrime.as_command(1, 80, 0);
+        let telemetry_prime = RemoteProbePreset::TelemetryPrime
+            .as_command(1, 80, 0)
+            .unwrap();
         assert_eq!(
             telemetry_prime.bytes_hex(),
             "64 00 67 46 9A FE 00 00 20 36 31 25"
@@ -5180,7 +5789,7 @@ mod tests {
 
     #[test]
     fn remote_matrix_wraps_probe_with_sync_steps() {
-        let base = RemoteProbePreset::Menu.as_command(1, 80, 0);
+        let base = RemoteProbePreset::Menu.as_command(1, 80, 0).unwrap();
         let matrix = super::remote_matrix_scenarios(&base, 80);
 
         assert_eq!(matrix.len(), 6);

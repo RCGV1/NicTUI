@@ -1,18 +1,23 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use nictui::activity::{
-    ACTIVITY_BAUD, ACTIVITY_PING, ActivityDecoder, ActivityEvent, ActivityLog, format_frequency_mhz,
+    ActivityDecoder, ActivityEvent, ActivityLog, format_frequency_mhz, write_activity_csv,
 };
+use nictui::activity_session::{ActivityMonitorEvent, ActivityMonitorOptions, monitor_activity};
 use nictui::ble::parse_ble_device_uri;
 use nictui::cancellation;
 use nictui::device::{ProgressEvent, inspect_codeplug, read_codeplug_with_timing};
-use nictui::protocol::radio::{RadioProtocol, ReadTiming};
+use nictui::protocol::radio::ReadTiming;
 use nictui::protocol::{TOTAL_BLOCKS, save_codeplug};
 
 #[derive(Debug, Parser)]
@@ -206,15 +211,7 @@ impl ActivityCapture {
     }
 
     fn save(&self, path: &std::path::Path) -> Result<()> {
-        let file = File::create(path)
-            .with_context(|| format!("Could not create activity CSV {}", path.display()))?;
-        let mut writer = BufWriter::new(file);
-        self.log
-            .write_csv(&mut writer)
-            .with_context(|| format!("Could not write activity CSV {}", path.display()))?;
-        writer
-            .flush()
-            .with_context(|| format!("Could not flush activity CSV {}", path.display()))?;
+        write_activity_csv(path, &self.log)?;
         println!(
             "Captured {} hits across {} frequencies and {} heartbeats; saved {}",
             self.hits,
@@ -235,44 +232,34 @@ fn run_activity(args: ActivityArgs) -> Result<()> {
 fn run_activity_for(args: ActivityArgs, duration: Duration) -> Result<()> {
     check_interruption()?;
     eprintln!("Start VFO preset scan and enable Activity Mode on radio");
-    let mut radio = RadioProtocol::new_with_baud(&args.port, ACTIVITY_BAUD)
-        .with_context(|| format!("Could not open {}", args.port))?;
-    radio
-        .send_bytes(&[ACTIVITY_PING])
-        .context("Could not send activity ping")?;
-    let mut capture = expect_activity_echo(|| radio.read_byte(), Duration::from_millis(500))?;
-
-    eprintln!(
-        "Receiving activity for {:.3} seconds",
-        duration.as_secs_f64()
-    );
-    let started = Instant::now();
-    let mut decoder = ActivityDecoder::default();
-    let capture_result = (|| -> Result<()> {
-        while started.elapsed() < duration {
-            check_interruption()?;
-            match radio
-                .read_byte()
-                .context("Could not receive radio activity")?
-            {
-                Some(byte) => {
-                    for event in decoder.push(&[byte]) {
-                        capture.record_live(event)?;
-                    }
-                }
-                None => {
-                    if let Some(error) = decoder.expire_partial() {
-                        eprintln!("warning: discarded incomplete activity frame: {error}");
-                    }
-                    // A closed link can return immediately instead of timing out.
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+    let mut capture = ActivityCapture::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let options = ActivityMonitorOptions {
+        duration: Some(duration),
+        stop_signal: Some(stop.clone()),
+    };
+    let mut ready = false;
+    let mut record_error = None;
+    let capture_result = monitor_activity(&args.port, &options, |event| match event {
+        ActivityMonitorEvent::Ready => {
+            ready = true;
+            eprintln!(
+                "Receiving activity for {:.3} seconds",
+                duration.as_secs_f64()
+            );
+        }
+        ActivityMonitorEvent::Event(event) => {
+            if let Err(error) = capture.record_live(event) {
+                record_error = Some(error);
+                stop.store(true, Ordering::SeqCst);
             }
         }
-        Ok(())
-    })();
-    if let Err(error) = decoder.finish() {
-        eprintln!("warning: incomplete activity frame at capture end: {error}");
+        ActivityMonitorEvent::Warning(message) => eprintln!("warning: {message}"),
+    })
+    .map(|_| ())
+    .and_then(|_| record_error.map_or(Ok(()), Err));
+    if !ready {
+        return capture_result;
     }
     check_interruption()?;
     let save_result = capture.save(&args.output);
@@ -283,41 +270,6 @@ fn run_activity_for(args: ActivityArgs, duration: Duration) -> Result<()> {
             Err(error.context(format!("Could not save collected activity: {save_error:#}")))
         }
     }
-}
-
-fn expect_activity_echo(
-    mut read_byte: impl FnMut() -> Result<Option<u8>>,
-    timeout: Duration,
-) -> Result<ActivityCapture> {
-    let started = Instant::now();
-    let mut decoder = ActivityDecoder::default();
-    let mut capture = ActivityCapture::default();
-    // Only a frame-boundary 02 is an echo; hit payload bytes are unescaped.
-    let mut in_hit = false;
-    while started.elapsed() < timeout {
-        check_interruption()?;
-        match read_byte().context("Could not read activity ping response")? {
-            Some(ACTIVITY_PING) if !in_hit => return Ok(capture),
-            Some(byte) => {
-                if !in_hit && byte == 0x2A {
-                    in_hit = true;
-                }
-                for event in decoder.push(&[byte]) {
-                    if matches!(event, ActivityEvent::Hit { .. }) {
-                        in_hit = false;
-                    }
-                    capture.record_live(event)?;
-                }
-            }
-            None => {
-                if decoder.expire_partial().is_some() {
-                    in_hit = false;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-    }
-    bail!("Timed out waiting for activity ping response 02")
 }
 
 fn decode_recording(mut reader: impl Read) -> Result<ActivityCapture> {
@@ -354,6 +306,8 @@ fn run_replay(args: ReplayArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nictui::activity::ACTIVITY_PING;
+    use std::io::Write;
 
     struct TestDirectory(PathBuf);
 
@@ -459,41 +413,6 @@ mod tests {
             ])
             .is_err()
         );
-    }
-
-    #[test]
-    fn activity_ping_requires_exact_echo() {
-        expect_activity_echo(|| Ok(Some(0x02)), Duration::from_millis(100)).unwrap();
-        for byte in [0x01, 0x2A, 0x2B, 0x45, 0x46] {
-            let mut bytes = [byte].into_iter();
-            let error = expect_activity_echo(|| Ok(bytes.next()), Duration::from_millis(2))
-                .expect_err("only 02 acknowledges the ping");
-            assert!(error.to_string().contains("response 02"));
-        }
-    }
-
-    #[test]
-    fn activity_ping_ignores_payload_echo_and_preserves_pre_echo_events() {
-        let mut bytes = hit(0x002B_2A02, ACTIVITY_PING).into_iter();
-        assert!(expect_activity_echo(|| Ok(bytes.next()), Duration::from_millis(2)).is_err());
-        let mut bytes = hit(0x002B_2A02, ACTIVITY_PING);
-        bytes.extend([0x2B, ACTIVITY_PING]);
-        let mut bytes = bytes.into_iter();
-        let capture =
-            expect_activity_echo(|| Ok(bytes.next()), Duration::from_millis(100)).unwrap();
-        assert_eq!(capture.hits, 1);
-        assert_eq!(capture.heartbeats, 1);
-    }
-
-    #[test]
-    fn activity_ping_propagates_link_errors_and_times_out() {
-        let error = expect_activity_echo(
-            || Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into()),
-            Duration::from_millis(100),
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("broken pipe"));
-        assert!(expect_activity_echo(|| Ok(None), Duration::ZERO).is_err());
     }
 
     #[test]

@@ -41,6 +41,7 @@ pub fn render_main_layout(f: &mut Frame, app: &mut App, area: Rect, tab: MainTab
         main_chunks[1]
     };
     match tab {
+        MainTab::Activity => crate::ui::views::activity::render_activity(f, app, content_area),
         MainTab::Channels => render_channels_table(f, app, content_area),
         MainTab::Settings => render_settings_table(f, app, content_area),
         MainTab::Scanning => render_scanning_page(f, app, content_area),

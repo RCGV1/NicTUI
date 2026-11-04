@@ -31,24 +31,26 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let nav = if matches!(app.mode, AppMode::Main(MainTab::Remote)) && app.remote_active {
         Line::from(vec![render_shortcut("Tab"), Span::raw(" leave")])
     } else if compact {
-        Line::from(Span::styled(" Views ", Style::default().fg(COLOR_PRIMARY)))
+        Line::from(Span::styled(
+            " Tab / A views ",
+            Style::default().fg(COLOR_PRIMARY),
+        ))
     } else {
         let mut spans = vec![
             render_shortcut("Tab"),
             Span::styled(
                 if area.width < 90 {
-                    " views"
+                    " / A activity"
                 } else {
-                    " / 0-9 views"
+                    " / 0-9 / A views"
                 },
                 Style::default().fg(COLOR_DIM),
             ),
         ];
-        if area.width >= 90 {
-            spans.push(Span::styled(
-                format!(" {VERSION}"),
-                Style::default().fg(COLOR_DIM),
-            ));
+        let version = format!(" {VERSION}");
+        let nav_width: usize = spans.iter().map(Span::width).sum();
+        if nav_width + version.len() <= chunks[0].width as usize {
+            spans.push(Span::styled(version, Style::default().fg(COLOR_DIM)));
         }
         Line::from(spans)
     };
@@ -80,6 +82,24 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
     let mut hints = Vec::new();
 
     match app.mode {
+        AppMode::Main(MainTab::Activity) => {
+            push_hint(
+                &mut hints,
+                "s",
+                if app.activity_active() {
+                    "stop"
+                } else {
+                    "start"
+                },
+            );
+            push_hint(&mut hints, "e", "CSV");
+            if !app.activity_active() {
+                push_hint(&mut hints, "c", "clear");
+            }
+            if !tight {
+                push_hint(&mut hints, "Up/Down", "select");
+            }
+        }
         AppMode::Main(MainTab::Channels) => {
             let has_changes = app.channels_dirty || !app.deleted_channels.is_empty();
             let channels_empty = app.channels.is_empty() && app.deleted_channels.is_empty();

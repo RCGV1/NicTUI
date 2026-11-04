@@ -1,6 +1,6 @@
 ---
 name: "nictui-radio-cli"
-description: "Use when a user wants an AI to inspect or modify a TD-H3 radio through the installed `nictui` command-line interface. This skill must use the NicTUI CLI only, requires NicSure mod firmware on the radio, prefers focused single-record updates over bulk writes, creates backups before changes, runs `--validate-only` before real writes, and verifies the result after changes."
+description: "Use when a user wants an AI to inspect or modify a TD-H3 radio through the installed `nictui` command-line interface, monitor scan activity, or replay raw activity recordings offline. This skill must use the NicTUI CLI only, requires NicSure mod firmware for live radio work (not offline replay), prefers focused single-record updates over bulk writes, creates backups before changes, runs `--validate-only` before real writes, and verifies the result after changes."
 ---
 
 # NicTUI Radio CLI
@@ -29,7 +29,32 @@ Use this skill when the user wants radio work done through `nictui` rather than 
 - Bulk writes are allowed only when the user explicitly asks for a bulk operation.
 - Firmware flashing is never a casual step. Only do it when the user explicitly asks for firmware work.
 
+## Passive scan activity
+
+Activity monitoring and offline replay are available since v1.0.8. Check `nictui activity monitor --help` or `nictui activity replay --help` before use. If unavailable, update NicTUI to v1.0.8 or later; do not substitute remote-control commands.
+
+For Activity requests, skip the programming startup sequence below: do not run `ports`, `probe`, `doctor`, configuration commands, remote navigation, or PTT to prepare a capture. Port discovery can actively probe radios. Use an already-known explicit target; if none is supplied, ask the user for it. Offline replay needs no radio or target discovery.
+
+For live monitoring, ask the user: "Start a VFO preset scan, then enable Activity Mode on the radio." Use an existing preset. Section 23 of the [nicFW V2 user manual](https://github.com/nicsure/nicfw2docs/blob/main/TIDRADIO%20TD-H3%20User%20Manual%20for%20nicFW%20V2.pdf) describes this setup; do not guess physical-button shortcuts. Do not change presets or enable Activity Mode on the user's behalf.
+
+```bash
+nictui activity monitor --port "<known-serial-port>" --duration 30 --output activity.csv
+nictui activity replay --input raw.bin --output activity.csv --json
+```
+
+For user-operated viewing, suggest `nictui tui --port "<known-serial-port>"`, then uppercase `A` for Activity and `s` to start or stop local capture. Explicit-port startup selects the target passively without discovery or probing. Let the user operate the TUI; keep automated captures on the CLI above.
+
+Plain monitoring prints timestamped hits live. Use `--json` for one final JSON object instead; `--output` optionally saves CSV with either output mode. Replay uses host processing timestamps, not original capture times; incomplete recordings fail without replacing the CSV. Monitor also accepts `--ble-device` or `--ble-name` instead of `--port`, but live Activity capture over BLE is unverified.
+
+Once monitoring is connected, interruption or connection failure still saves collected results to the requested CSV. A failure before capture is ready leaves any existing CSV untouched. Output buffering and shutdown waits are bounded; a slow or closed output pipe stops capture rather than hanging indefinitely. Report partial results as partial, not as a successful complete capture.
+
+Capture only listens apart from a connection ping; it must not configure, navigate, transmit, or disable the radio. Stopping capture does not stop the radio's scan. **Ask the user to stop the scan on the radio before programming reads or writes**; otherwise, the radio can keep sending Activity packets. Heartbeats without hits are not a failure or proof of an empty band.
+
+Signal is raw, not dBm. CSV uses the original Programmer-compatible `Frequency,Count,Signal` columns: MHz to five decimal places, hit count, and mean raw signal to two decimal places. Report capture/replay results and output artifacts, not write validation or configuration changes.
+
 ## If `nictui` is missing
+
+For Activity requests, install v1.0.8 or later, then follow the passive scan activity guidance above rather than the programming startup sequence.
 
 1. Check for the binary:
    ```bash
@@ -46,7 +71,9 @@ Use this skill when the user wants radio work done through `nictui` rather than 
    ```
 4. If installation fails, report the exact blocker and stop.
 
-## Required startup sequence
+## Required programming startup sequence
+
+Use this sequence for programming workflows, not Activity monitoring or offline replay.
 
 1. Detect likely ports:
    ```bash
@@ -220,6 +247,8 @@ Remote guidance:
 
 ## What to report back
 
+For programming changes:
+
 - The exact command path used.
 - The exact record, index, or setting that changed.
 - The artifact files written under `nictui-radio-session/`.
@@ -228,7 +257,7 @@ Remote guidance:
 
 ## When to stop instead of guessing
 
-- `probe` cannot complete a handshake.
-- The detected firmware is `stock/original`.
-- More than one plausible port exists and the correct one is still unclear after `ports --json` and targeted probes.
+- A programming `probe` cannot complete a handshake.
+- The detected firmware is `stock/original` for a requested live operation.
+- The target is ambiguous; for programming, use `ports --json` and targeted probes, but for Activity ask the user without probing.
 - The requested change would require a bulk write when the user asked for a narrow change.

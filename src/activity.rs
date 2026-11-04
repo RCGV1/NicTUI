@@ -2,10 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
@@ -82,7 +85,7 @@ impl ActivityDecoder {
         self.push_timed(bytes, timestamp, Instant::now())
     }
 
-    fn push_timed(
+    pub(crate) fn push_timed(
         &mut self,
         bytes: &[u8],
         timestamp: DateTime<Utc>,
@@ -145,6 +148,11 @@ impl ActivityDecoder {
             .map(|received| TruncatedActivityFrame { received })
     }
 
+    /// Marker-like payload bytes must not be interpreted as protocol replies.
+    pub(crate) fn is_at_frame_boundary(&self) -> bool {
+        self.received.is_none()
+    }
+
     /// Report an incomplete record at end of input, and clear it for reuse.
     pub fn finish(&mut self) -> std::result::Result<(), TruncatedActivityFrame> {
         match self.reset() {
@@ -183,7 +191,7 @@ impl ActivitySummary {
 }
 
 /// Bounded summaries only; individual events are delivered to the caller.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ActivityLog {
     summaries: BTreeMap<u32, ActivitySummary>,
     max_frequencies: usize,
@@ -266,6 +274,72 @@ impl ActivityLog {
         }
         writer.flush()
     }
+}
+
+/// Atomically replace a CSV only after the complete new file has been flushed.
+/// Temporary files are created exclusively in the destination's parent directory.
+pub fn write_activity_csv(path: &Path, log: &ActivityLog) -> Result<()> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    struct TemporaryCsv(Option<PathBuf>);
+    impl Drop for TemporaryCsv {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    let name = path.file_name().context("Activity CSV needs a file name")?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let (mut temporary, file) = (0..128)
+        .find_map(|_| {
+            let mut temporary_name = std::ffi::OsString::from(".");
+            temporary_name.push(name);
+            temporary_name.push(format!(
+                ".activity-{}-{}.tmp",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            let temporary = parent.join(temporary_name);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => Some(Ok((TemporaryCsv(Some(temporary)), file))),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .unwrap_or_else(|| {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "activity CSV temporary names exhausted",
+            ))
+        })
+        .with_context(|| {
+            format!(
+                "Could not create temporary activity CSV for {}",
+                path.display()
+            )
+        })?;
+    let mut writer = io::BufWriter::new(file);
+    log.write_csv(&mut writer)
+        .with_context(|| format!("Could not write activity CSV {}", path.display()))?;
+    writer.flush().context("Could not flush activity CSV")?;
+    writer
+        .get_ref()
+        .sync_all()
+        .context("Could not sync activity CSV")?;
+    drop(writer);
+    fs::rename(temporary.0.as_ref().expect("temporary CSV is armed"), path)
+        .with_context(|| format!("Could not replace activity CSV {}", path.display()))?;
+    temporary.0.take();
+    Ok(())
 }
 
 pub fn format_frequency_mhz(frequency_10hz: u32) -> String {

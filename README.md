@@ -12,6 +12,7 @@ A terminal-based user interface for programming the TIDRADIO TD-H3 HAM radio.
 - **Codeplug Operations** - Import/export full codeplugs
 - **Firmware Flashing** - Flash firmware updates
 - **Remote Control** - Send remote-control keys or inspect packets over USB serial or native BLE transport
+- **Activity Scanner** - Monitor scan hits and export CSV, or replay raw recordings offline (since v1.0.8)
 - **AI Skill Installer** - Install a bundled Codex or Claude Code skill that mirrors the NicTUI CLI workflows
 
 ## Screenshots
@@ -189,7 +190,7 @@ Claude Code users can validate and install the local plugin package from this re
 ## CLI
 
 NicTUI includes a non-interactive CLI for scripting, inspection, and batch workflows. It works over USB serial or native BLE. Use `ports --verbose` or `ports --json` to discover USB serial targets, `bluetooth scan` to discover BLE UUIDs, then reuse the resolved value in commands. Use `--ble-device` for an explicit UUID, `--ble-name` for a name lookup, or a `ble://<uuid>` port value when a command accepts `--port`.
-The safest non-interactive workflow is: `ports` -> `probe` -> `read` -> `--validate-only` -> actual write. If `probe` or `doctor` reports `stock/original` firmware, install NicSure mod firmware before using live read/write commands.
+The safest non-interactive programming workflow is: `ports` -> `probe` -> `read` -> `--validate-only` -> actual write. If `probe` or `doctor` reports `stock/original` firmware, install NicSure mod firmware before using live read/write commands.
 Some NicSure builds still reject live-mode handshakes. If live-mode block access repeatedly fails after recovery, treat it as unsupported on that firmware and use the normal read/write commands instead.
 For focused edits, prefer the single-record commands like `channels get`, `channels update`, `settings get`, and `settings set`.
 Use `ports --verbose` or `ports --json` when you need precise port metadata, `probe --json` when a script needs structured radio facts, and `remote` commands when you want key injection or packet capture instead of codeplug editing.
@@ -413,6 +414,37 @@ nictui firmware flash --port "$NICTUI_PORT" --input firmware.bin
 - If a command says the port is busy, close other NicTUI sessions, serial monitors, or flashing tools first.
 - For repeatable scripting on macOS, prefer the callout device shown by `nictui ports --verbose`.
 
+### Scan Activity
+
+The Activity tab, CLI monitoring, and offline replay are available since v1.0.8. Check `nictui activity --help` on your installed build.
+
+For live monitoring on a radio running nicFW, use an existing scan preset. Start a VFO preset scan, then enable Activity Mode on the radio. See section 23 of the [nicFW V2 user manual](https://github.com/nicsure/nicfw2docs/blob/main/TIDRADIO%20TD-H3%20User%20Manual%20for%20nicFW%20V2.pdf). Activity Mode records detected signals instead of opening squelch to listen to them.
+
+Use an already-known explicit target. Unlike programming workflows, do not run `ports`, `probe`, or `doctor` to prepare Activity capture: discovery can actively probe radios.
+
+```bash
+# Open the TUI with a known target, without startup discovery or probing
+nictui tui --port "<known-serial-port>"
+
+# Listen for 30 seconds and save a CSV summary
+nictui activity monitor --port "<known-serial-port>" --duration 30 --output activity.csv
+
+# Decode an existing raw recording offline; no radio is needed
+nictui activity replay --input raw.bin --output activity.csv --json
+```
+
+Plain monitoring prints timestamped hits as they arrive. Add `--json` for one final JSON object instead of live hit lines; `--output` optionally saves CSV with either mode. Replay timestamps reflect host processing time, not original capture time; incomplete recordings fail without replacing the output CSV.
+
+Once monitoring is connected, interruption or connection failure still saves collected results to the requested CSV. A failure before capture is ready leaves any existing CSV untouched. Output buffering and shutdown waits are bounded, so a slow or closed output pipe stops capture rather than hanging indefinitely.
+
+Monitoring also accepts `--ble-device` or `--ble-name` instead of `--port`, but live Activity capture over BLE is unverified.
+
+NicTUI only listens apart from a connection ping. It does not configure the radio, navigate menus, start scanning, transmit, or disable the radio. Stopping capture does not stop the radio's scan. **Stop the scan on the radio before programming reads or writes**; otherwise, the radio can keep sending Activity packets. A session with heartbeats but no hits is not a failure; no signals may have been detected.
+
+Signal readings are **raw radio values, not dBm**. CSV export is compatible with the original nicFW Programmer: `Frequency,Count,Signal`, with frequency in MHz to five decimal places and mean raw signal to two decimal places.
+
+The TUI has a separate **Activity** tab, not the Remote control view. With the explicit-port command above, the target is selected passively until you start an action. Press uppercase `A` outside Remote or cycle tabs with `Tab`, then `s` to start or stop local capture. It shows frequency in MHz, hit count, mean raw signal, last-seen time on wider terminals, plus connection status and heartbeat count. Stop capture and wait for cleanup before other radio operations. Starting a new capture begins a fresh log; export previous results first if needed.
+
 ### Remote CLI
 
 ```bash
@@ -437,6 +469,8 @@ nictui --help
 nictui channels --help
 nictui settings write --help
 nictui codeplug inspect --help
+nictui activity monitor --help
+nictui activity replay --help
 ```
 
 ### Key Bindings
@@ -447,6 +481,7 @@ nictui codeplug inspect --help
 | `Shift+Tab` | Previous tab |
 | `1-9` | Jump to tabs 1 through 9 |
 | `0` | Jump to Debug |
+| `A` | Jump to Activity outside Remote |
 | `q` | Quit application |
 | `r` | Read from radio |
 | `w` | Write to radio |
@@ -478,6 +513,12 @@ nictui codeplug inspect --help
 
 **DTMF Tab:**
 - `Enter` - Edit DTMF preset
+
+**Activity Tab:**
+- `s` - Start or stop local capture; does not start or stop the radio's scan
+- `c` - Clear the local log after capture has stopped
+- `e` - Export activity summaries as CSV
+- `Up` / `Down` - Select a row
 
 **Remote Tab:**
 - `o` - Connect to radio

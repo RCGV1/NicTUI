@@ -306,8 +306,6 @@ fn run_replay(args: ReplayArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nictui::activity::ACTIVITY_PING;
-    use std::io::Write;
 
     struct TestDirectory(PathBuf);
 
@@ -528,7 +526,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn live_activity_pty_uses_only_ping_and_exports_fragmented_hits() {
+        use nictui::activity::ACTIVITY_PING;
         use serialport::SerialPort;
+        use std::io::Write;
         use std::sync::mpsc;
 
         for echo in [true, false] {

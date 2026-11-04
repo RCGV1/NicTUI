@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::ffi::c_int;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
@@ -49,6 +50,10 @@ fn temporary_directories_are_unique_under_parallel_creation() {
 
 struct Process(Option<Child>);
 
+unsafe extern "C" {
+    fn kill(pid: c_int, signal: c_int) -> c_int;
+}
+
 impl Process {
     fn spawn(mut command: Command) -> Self {
         Self(Some(
@@ -66,12 +71,21 @@ impl Process {
     }
 
     fn signal(&mut self, signal: &str) {
-        assert!(
-            Command::new("/bin/kill")
-                .args(["-s", signal, &self.child().id().to_string()])
-                .status()
-                .unwrap()
-                .success()
+        let signal_number = match signal {
+            "INT" => 2,
+            "TERM" => 15,
+            _ => panic!("unsupported test signal: {signal}"),
+        };
+        let pid = c_int::try_from(self.child().id()).unwrap();
+        assert!(pid > 0, "signals must target only this test's child");
+        // Avoid subprocess startup inside the radio's bounded ACK wait.
+        // SAFETY: kill takes integer arguments; the positive PID identifies our unreaped child.
+        let result = unsafe { kill(pid, signal_number) };
+        assert_eq!(
+            result,
+            0,
+            "failed to send {signal} to child {pid}: {}",
+            io::Error::last_os_error()
         );
     }
 
@@ -131,6 +145,10 @@ enum InterruptAt {
 
 fn memory() -> Vec<u8> {
     let mut data = vec![0; EEPROM_SIZE];
+    // Keep CLI preflight on the populated-channel path, not the full empty-radio scan.
+    let channel = 2 * BLOCK_SIZE;
+    data[channel..channel + 4].copy_from_slice(&14_535_000u32.to_be_bytes());
+    data[channel + 4..channel + 8].copy_from_slice(&14_535_000u32.to_be_bytes());
     data[0x1900..0x1902].copy_from_slice(&0xD82Fu16.to_be_bytes());
     data[0x1A00..0x1A02].copy_from_slice(&0xA46Du16.to_be_bytes());
     data
@@ -171,6 +189,7 @@ fn drive_memory(
             Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
             Err(error) => panic!("PTY receive failed: {error}"),
         }
+        let request_received = Instant::now();
         let mut response = byte.to_vec();
         let request = match byte[0] {
             0x01 => Request::Ping,
@@ -259,7 +278,10 @@ fn drive_memory(
         }
         if request == Request::Resume {
             thread::sleep(Duration::from_millis(50));
-            process.assert_running(&format!("exit preceded resume ACK; trace: {trace:?}"));
+            process.assert_running(&format!(
+                "exit preceded resume ACK (fixture held reply for {:?}); trace: {trace:?}",
+                request_received.elapsed()
+            ));
         }
         master.write_all(&response).unwrap();
     }
@@ -325,6 +347,11 @@ fn signal_during_resume_does_not_overwrite_existing_backup() {
         let (output, trace, after) = drive_memory(command, signal, InterruptAt::Resume, false);
         assert_interrupted(&output);
         assert_eq!(trace.last(), Some(&Request::Resume));
+        assert_eq!(
+            trace.iter().filter(|&&r| r == Request::Resume).count(),
+            1,
+            "normal resume unexpectedly needed a cleanup retry: {trace:?}"
+        );
         assert_eq!(std::fs::read(path).unwrap(), b"existing backup");
         assert_eq!(after, memory());
     }
@@ -366,6 +393,16 @@ fn signals_do_not_interrupt_write_preservation_reads_or_writes() {
             command.arg(path);
             let (output, trace, _) = drive_memory(command, signal, at, false);
             assert_interrupted(&output);
+            let preflight: Vec<_> = [Request::Ping, Request::Read(240)]
+                .into_iter()
+                .chain((2..10).map(Request::Read))
+                .chain((200..204).map(Request::Read))
+                .chain([Request::Ping])
+                .collect();
+            assert!(
+                trace.starts_with(&preflight),
+                "CLI preflight did not use the populated-channel path: {trace:?}"
+            );
             let written: Vec<_> = trace
                 .iter()
                 .filter_map(|r| match r {

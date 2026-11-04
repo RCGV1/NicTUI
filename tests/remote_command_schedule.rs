@@ -134,13 +134,18 @@ fn post_command_armed_without_telemetry_preserves_scripted_interval() {
 fn recovery_restarts_delay_without_replaying_successful_commands() {
     let mut radio = SilentRemote::new();
     let options = RemoteMonitorOptions {
-        duration: Duration::from_millis(1500),
+        // Start delay + key hold/release + reaction + injected timeout take
+        // about 1.37s before recovery. Leave CI headroom, but stay below the
+        // 5s command interval so a stale pre-recovery schedule still fails.
+        duration: Duration::from_secs(3),
         key_interval: Duration::from_secs(5),
         recover_retries: 1,
         ..menu_exit_options()
     };
+    assert!(options.duration < options.key_interval);
     let mut phases = Vec::new();
     let mut reports = Vec::new();
+    let started = Instant::now();
     let summary = monitor_remote_with_summary(&radio.port(), &options, |event| match event {
         RemoteMonitorEvent::Phase(phase) => phases.push((phase, Instant::now())),
         RemoteMonitorEvent::Control(report) => {
@@ -154,7 +159,12 @@ fn recovery_restarts_delay_without_replaying_successful_commands() {
         }
         _ => {}
     })
-    .unwrap();
+    .unwrap_or_else(|error| {
+        panic!(
+            "remote recovery failed after {:?}: {error:?}; phases: {phases:?}; reports: {reports:?}",
+            started.elapsed()
+        )
+    });
     let keys = radio.finish();
 
     assert_eq!(summary.recovery_count, 1);

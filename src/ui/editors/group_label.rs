@@ -38,7 +38,7 @@ pub(crate) fn render_group_label_editor(f: &mut Frame, app: &App) {
             "This name appears anywhere the app shows this memory group.",
             Style::default().fg(COLOR_ACCENT),
         )),
-        Line::from("Use up to 6 characters. Enter saves, Esc cancels."),
+        Line::from("Use up to 5 printable ASCII characters. Enter saves, Esc cancels."),
     ])
     .wrap(ratatui::widgets::Wrap { trim: true })
     .block(Block::default().borders(Borders::ALL).title(" Details "));

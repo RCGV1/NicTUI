@@ -2,13 +2,16 @@ use super::common::{
     BANDPLAN_EDITOR_HEIGHT, BANDPLAN_EDITOR_WIDTH, begin_editor, render_option_popup,
 };
 use crate::app::{App, AppMode};
+use crate::protocol::editor_value::{
+    BAND_BANDWIDTHS, BAND_MODULATIONS, decimal_value, option_label,
+};
 use crate::ui::theme::*;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
 
 pub(crate) fn render_bandplan_editor(f: &mut Frame, app: &App) {
@@ -22,6 +25,9 @@ pub(crate) fn render_bandplan_editor(f: &mut Frame, app: &App) {
         BANDPLAN_EDITOR_WIDTH,
         BANDPLAN_EDITOR_HEIGHT,
     );
+    if inner_area.width < 2 || inner_area.height < 2 {
+        return;
+    }
 
     let current_field_idx = if let AppMode::EditBandPlan(idx) = app.mode {
         idx
@@ -29,30 +35,14 @@ pub(crate) fn render_bandplan_editor(f: &mut Frame, app: &App) {
         0
     };
 
-    let mod_str = match bp.modulation {
-        1 => "AM".to_string(),
-        2 => "USB".to_string(),
-        _ => "FM".to_string(),
-    };
-
-    let bw_str = match bp.bandwidth {
-        1 => "Narrow".to_string(),
-        _ => "Wide".to_string(),
-    };
+    let mod_str = option_label(BAND_MODULATIONS, bp.modulation);
+    let bw_str = option_label(BAND_BANDWIDTHS, bp.bandwidth);
 
     let fields = [
         ("Index", bp.index.to_string(), false),
-        (
-            "Start Freq",
-            format!("{:.5}", bp.start_freq as f64 / 100000.0),
-            false,
-        ),
-        (
-            "End Freq",
-            format!("{:.5}", bp.end_freq as f64 / 100000.0),
-            false,
-        ),
-        ("Max Power", bp.max_power.to_string(), false),
+        ("Start (MHz)", decimal_value(bp.start_freq, 5), false),
+        ("End (MHz)", decimal_value(bp.end_freq, 5), false),
+        ("Power (raw)", bp.max_power.to_string(), false),
         (
             "TX Allowed",
             if bp.tx_allowed { "Yes" } else { "No" }.to_string(),
@@ -68,7 +58,7 @@ pub(crate) fn render_bandplan_editor(f: &mut Frame, app: &App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(10),
             Constraint::Length(1),
         ])
@@ -84,9 +74,9 @@ pub(crate) fn render_bandplan_editor(f: &mut Frame, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                " {}-{} | {}",
-                bp.start_freq as f64 / 100000.0,
-                bp.end_freq as f64 / 100000.0,
+                " {}-{} MHz | {}",
+                decimal_value(bp.start_freq, 5),
+                decimal_value(bp.end_freq, 5),
                 fields[current_field_idx].0
             )),
         ]),
@@ -98,21 +88,22 @@ pub(crate) fn render_bandplan_editor(f: &mut Frame, app: &App) {
             Span::raw(if bp.wrap { "Yes" } else { "No" }),
             Span::raw(" | "),
             Span::styled("Mode ", Style::default().fg(COLOR_PRIMARY)),
-            Span::raw(match bp.modulation {
-                1 => "AM",
-                2 => "USB",
-                _ => "FM",
-            }),
+            Span::raw(option_label(BAND_MODULATIONS, bp.modulation)),
             Span::raw(" | "),
             Span::styled("BW ", Style::default().fg(COLOR_PRIMARY)),
-            Span::raw(if bp.bandwidth == 1 { "Narrow" } else { "Wide" }),
+            Span::raw(option_label(BAND_BANDWIDTHS, bp.bandwidth)),
         ]),
         Line::from(vec![
-            Span::styled("Max Power ", Style::default().fg(COLOR_PRIMARY)),
-            Span::raw(bp.max_power.to_string()),
+            Span::styled("Power raw ", Style::default().fg(COLOR_PRIMARY)),
+            Span::raw(if bp.max_power == 0 {
+                "0 (Ignore)".to_string()
+            } else {
+                bp.max_power.to_string()
+            }),
         ]),
     ])
     .style(Style::default().fg(COLOR_TEXT))
+    .wrap(ratatui::widgets::Wrap { trim: true })
     .block(Block::default().borders(Borders::BOTTOM).title(" Summary "));
     f.render_widget(summary, vertical[0]);
 
@@ -138,14 +129,9 @@ pub(crate) fn render_bandplan_editor(f: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(help_body),
-        Line::default(),
-        Line::from(if fields[current_field_idx].2 {
-            "Use ←/→ to change the selected option."
-        } else {
-            "Type to edit the numeric value directly."
-        }),
     ])
     .style(Style::default().fg(COLOR_TEXT))
+    .wrap(ratatui::widgets::Wrap { trim: true })
     .block(Block::default().borders(Borders::ALL).title(" Details "));
     f.render_widget(details, body[0]);
 
@@ -178,34 +164,52 @@ pub(crate) fn render_bandplan_editor(f: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(" ");
-    f.render_widget(table, body[1]);
+    let mut state = TableState::default();
+    state.select(Some(current_field_idx));
+    f.render_stateful_widget(table, body[1], &mut state);
 
     if fields[current_field_idx].2 {
         let options = match current_field_idx {
             4 | 5 => vec!["No", "Yes"],
-            6 => vec!["FM", "AM", "USB"],
-            7 => vec!["Wide", "Narrow"],
+            6 => BAND_MODULATIONS.to_vec(),
+            7 => BAND_BANDWIDTHS.to_vec(),
             _ => vec![],
         };
         render_option_popup(f, area, &options, app.selection_index);
     }
 
     f.render_widget(
-        Paragraph::new("↑/↓/Tab: Field | ←/→: Change Option | Enter: Save | Esc: Cancel")
-            .style(Style::default().fg(COLOR_DIM))
-            .alignment(ratatui::layout::Alignment::Center),
+        Paragraph::new(if app.status_message.starts_with("Invalid band:") {
+            app.status_message.as_str()
+        } else {
+            "↑/↓/Tab: Field | ←/→: Option | Enter: Save | Esc: Cancel"
+        })
+        .style(
+            Style::default().fg(if app.status_message.starts_with("Invalid band:") {
+                COLOR_WARNING
+            } else {
+                COLOR_DIM
+            }),
+        )
+        .alignment(ratatui::layout::Alignment::Center),
         vertical[2],
     );
 }
 
 fn bandplan_field_help(field_idx: usize) -> (&'static str, &'static str) {
     match field_idx {
-        0 => ("Index", "Band plan slot number stored on the radio."),
-        1 => ("Start Frequency", "Lower bound of the band plan in MHz."),
-        2 => ("End Frequency", "Upper bound of the band plan in MHz."),
+        0 => ("Index", "Unique band plan slot 0-19."),
+        1 => (
+            "Start Frequency",
+            "Lower bound: 0-1300 MHz, 10 Hz increments.",
+        ),
+        2 => (
+            "End Frequency",
+            "Greater than start; both 0 marks an unused plan.",
+        ),
         3 => (
             "Max Power",
-            "Maximum transmit power allowed for this band plan.",
+            "Raw power limit 0-255; 0=Ignore. This value is not watts.",
         ),
         4 => (
             "TX Allowed",
@@ -217,9 +221,12 @@ fn bandplan_field_help(field_idx: usize) -> (&'static str, &'static str) {
         ),
         6 => (
             "Modulation",
-            "Choose the default modulation for this range.",
+            "Ignore, FM/AM/USB defaults, or enforced modes.",
         ),
-        7 => ("Bandwidth", "Choose wide or narrow bandwidth for the plan."),
+        7 => (
+            "Bandwidth",
+            "Ignore, Wide/Narrow, enforced widths, or FM Tuner.",
+        ),
         _ => ("Field", ""),
     }
 }

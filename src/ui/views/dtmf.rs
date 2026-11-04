@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::protocol::editor_value::dtmf_text;
 use crate::ui::render_shortcut;
 use crate::ui::theme::{
     COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_PRIMARY, COLOR_SELECTION_BG, COLOR_SELECTION_FG,
@@ -105,7 +106,7 @@ pub fn render_dtmf(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Style::default().fg(COLOR_TEXT)
         };
-        let digits: String = dp.digits.iter().map(|d| format!("{:X}", d)).collect();
+        let digits = dtmf_text(&dp.digits);
         Row::new(vec![dp.index.to_string(), dp.label.clone(), digits]).style(style)
     });
 
@@ -152,11 +153,7 @@ pub fn render_dtmf(f: &mut Frame, app: &mut App, area: Rect) {
         .selected()
         .and_then(|index| app.dtmf_presets.get(index))
         .map(|preset| {
-            let digits: String = preset
-                .digits
-                .iter()
-                .map(|digit| format!("{:X}", digit))
-                .collect();
+            let digits = dtmf_text(&preset.digits);
             vec![
                 Line::from(vec![
                     Span::styled(

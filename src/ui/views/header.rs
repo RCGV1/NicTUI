@@ -1,6 +1,6 @@
 use crate::app::{App, AppMode, MainTab};
 use crate::ui::theme::{
-    COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_ERROR, COLOR_HEADER, COLOR_PRIMARY, COLOR_SUCCESS,
+    COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_ERROR, COLOR_HEADER, COLOR_PRIMARY,
     COLOR_SURFACE_3, COLOR_TEXT, COLOR_WARNING,
 };
 use ratatui::{
@@ -76,6 +76,11 @@ pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let state_summary = dirty_summary(app);
     let detail_text = if compact {
         format!(" {tab_label} | {tab_summary} | {state_summary}")
+    } else if has_unsaved_state(app) {
+        format!(
+            " {tab_label}  |  {tab_summary}  |  {state_summary}  |  {selected_port}  |  {}",
+            app.status_message
+        )
     } else if app.status_message.trim().is_empty() {
         format!(" {tab_label}  |  {tab_summary}  |  {selected_port}  |  {state_summary}")
     } else {
@@ -132,10 +137,10 @@ fn header_status(app: &App) -> (&'static str, ratatui::style::Color) {
         | AppMode::EditBandPlan(_) => ("EDITING", COLOR_ACCENT),
         AppMode::DeleteChannelConfirm(_) => ("CONFIRM", COLOR_WARNING),
         AppMode::Error(_) => ("ERROR", COLOR_ERROR),
-        _ if app.remote_active => ("REMOTE", COLOR_SUCCESS),
+        _ if app.remote_active => ("SESSION", COLOR_WARNING),
         _ if has_unsaved_state(app) => ("DIRTY", COLOR_WARNING),
-        _ if app.selected_port_candidate().is_some() => ("READY", COLOR_SUCCESS),
-        _ => ("NO RADIO", COLOR_DIM),
+        _ if app.selected_port_candidate().is_some() => ("TARGET", COLOR_PRIMARY),
+        _ => ("NO TARGET", COLOR_DIM),
     }
 }
 
@@ -216,9 +221,9 @@ fn tab_summary(app: &App, tab: MainTab, compact: bool) -> String {
         MainTab::Remote => {
             if app.remote_active {
                 if compact {
-                    "live".to_string()
+                    "open".to_string()
                 } else {
-                    "live session".to_string()
+                    "session open".to_string()
                 }
             } else {
                 "idle".to_string()
@@ -251,6 +256,8 @@ fn tab_summary(app: &App, tab: MainTab, compact: bool) -> String {
 fn has_unsaved_state(app: &App) -> bool {
     app.channels_dirty
         || app.settings_dirty
+        || app.scan_presets_dirty
+        || app.band_plans_dirty
         || app.dtmf_dirty
         || app.group_labels_dirty
         || !app.deleted_channels.is_empty()
@@ -264,6 +271,12 @@ fn dirty_summary(app: &App) -> String {
     if app.settings_dirty {
         parts.push("settings*");
     }
+    if app.scan_presets_dirty {
+        parts.push("scan*");
+    }
+    if app.band_plans_dirty {
+        parts.push("band*");
+    }
     if app.dtmf_dirty {
         parts.push("dtmf*");
     }
@@ -275,5 +288,34 @@ fn dirty_summary(app: &App) -> String {
         "workspace clean".to_string()
     } else {
         format!("pending {}", parts.join(" "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_remote_session_is_not_a_green_control_verdict() {
+        let mut app = App::new();
+        app.mode = AppMode::Main(MainTab::Remote);
+        app.remote_active = true;
+        assert_eq!(header_status(&app), ("SESSION", COLOR_WARNING));
+        assert_eq!(tab_summary(&app, MainTab::Remote, true), "open");
+    }
+
+    #[test]
+    fn scan_and_band_changes_are_unsaved_workspace_state() {
+        let mut app = App::new();
+        app.scan_presets_dirty = true;
+        assert!(has_unsaved_state(&app));
+        assert_eq!(dirty_summary(&app), "pending scan*");
+        assert_eq!(header_status(&app), ("DIRTY", COLOR_WARNING));
+        app.band_plans_dirty = true;
+        assert_eq!(dirty_summary(&app), "pending scan* band*");
+        app.scan_presets_dirty = false;
+        assert_eq!(dirty_summary(&app), "pending band*");
+        app.band_plans_dirty = false;
+        assert_eq!(dirty_summary(&app), "workspace clean");
     }
 }

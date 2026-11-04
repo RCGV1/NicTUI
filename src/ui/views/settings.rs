@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::protocol::setting_value::allowed_values;
 use crate::protocol::{SETTINGS_METADATA, SettingMetadata, SettingType, SettingsBlock};
 use crate::ui::render_shortcut;
 use crate::ui::theme::{
@@ -221,17 +222,7 @@ fn selected_setting_lines(
     let meta = &SETTINGS_METADATA[index];
     let display_value = settings.get_display_value(index);
     let raw_value = settings.get_value(index);
-    let detail = match &meta.setting_type {
-        SettingType::Boolean => "Allowed: Off or On".to_string(),
-        SettingType::Enum(options) => format!("Allowed: {}", options.join(" / ")),
-        SettingType::Numeric { min, max, unit } => {
-            if unit.is_empty() {
-                format!("Allowed: {}-{}", min, max)
-            } else {
-                format!("Allowed: {}-{} {}", min, max, unit)
-            }
-        }
-    };
+    let detail = format!("Allowed: {}", allowed_values(index));
     let bluetooth_hint = if index == BLUETOOTH_SETTING_INDEX {
         Some(if raw_value == 0 {
             "BLE is disabled. Turn this on before using a phone app or NicTUI over BLE."

@@ -1,6 +1,6 @@
 use super::radio::{
-    BAND_PLAN_RECORD_COUNT, BAND_PLAN_RECORD_SIZE, RadioProtocol, SCAN_PRESET_RECORD_COUNT,
-    SCAN_PRESET_RECORD_SIZE,
+    BAND_PLAN_RECORD_COUNT, BAND_PLAN_RECORD_SIZE, DTMF_PRESET_RECORD_COUNT,
+    DTMF_PRESET_RECORD_SIZE, RadioProtocol, SCAN_PRESET_RECORD_COUNT, SCAN_PRESET_RECORD_SIZE,
 };
 use super::types::*;
 use anyhow::{Context, Result};
@@ -47,28 +47,22 @@ pub fn infer_endianness_from_codeplug(data: &[u8]) -> Endianness {
 }
 
 pub fn infer_channel_endianness_from_codeplug(data: &[u8]) -> Endianness {
-    for block_num in 2..10 {
+    let mut samples = Vec::with_capacity(200);
+    for block_num in 0..200 {
         let offset = block_num * BLOCK_SIZE;
-        if offset + 4 > data.len() {
+        let Some(block) = data.get(offset..offset + BLOCK_SIZE) else {
             break;
-        }
-
-        let block = &data[offset..offset + BLOCK_SIZE];
-        let rx_freq_le = u32::from_le_bytes(block[0..4].try_into().unwrap_or([0; 4]));
-        let rx_freq_be = u32::from_be_bytes(block[0..4].try_into().unwrap_or([0; 4]));
-
-        let little_valid = (100_000..=100_000_000).contains(&rx_freq_le);
-        let big_valid = (100_000..=100_000_000).contains(&rx_freq_be);
-
-        if little_valid && !big_valid {
-            return Endianness::Little;
-        }
-        if big_valid && !little_valid {
-            return Endianness::Big;
-        }
-        if little_valid && big_valid {
-            return Endianness::Little;
-        }
+        };
+        samples.push(block.to_vec());
+    }
+    if let Ok((Some(endian), _)) = RadioProtocol::channel_endianness_from_samples(&samples) {
+        return endian;
+    }
+    // File inspection is best-effort; device writes require checked live detection.
+    if let Some(raw) = data.get(0x1900..0x1902)
+        && let Some(endian) = RadioProtocol::recognized_settings_endianness(raw)
+    {
+        return endian;
     }
 
     infer_endianness_from_codeplug(data)
@@ -180,10 +174,10 @@ pub fn extract_dtmf_presets_from_codeplug(data: &[u8]) -> Vec<DTMFPreset> {
     let mut presets = Vec::new();
     let start_offset = 0x1CF0;
 
-    for i in 0..20 {
-        let offset = start_offset + (i * 13);
-        if offset + 13 <= data.len() {
-            let dtmf_data = &data[offset..offset + 13];
+    for i in 0..DTMF_PRESET_RECORD_COUNT {
+        let offset = start_offset + (i * DTMF_PRESET_RECORD_SIZE);
+        if offset + DTMF_PRESET_RECORD_SIZE <= data.len() {
+            let dtmf_data = &data[offset..offset + DTMF_PRESET_RECORD_SIZE];
             let preset = RadioProtocol::parse_dtmf_preset(dtmf_data, i as u8);
             presets.push(preset);
         }
@@ -247,9 +241,9 @@ pub fn create_codeplug(
     }
 
     // Write DTMF presets (starting at 0x1CF0)
-    for preset in dtmf_presets.iter().take(20) {
-        let offset = 0x1CF0 + (preset.index as usize * 13);
-        if offset + 13 <= codeplug.len() {
+    for preset in dtmf_presets.iter().take(DTMF_PRESET_RECORD_COUNT) {
+        let offset = 0x1CF0 + (preset.index as usize * DTMF_PRESET_RECORD_SIZE);
+        if offset + DTMF_PRESET_RECORD_SIZE <= codeplug.len() {
             let dtmf_data = RadioProtocol::pack_dtmf_preset(preset);
             codeplug[offset..offset + dtmf_data.len()].copy_from_slice(&dtmf_data);
         }
@@ -260,4 +254,77 @@ pub fn create_codeplug(
         .copy_from_slice(&group_label_data);
 
     codeplug
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_endianness_inference_accepts_every_partial_record_length_without_panicking() {
+        for length in 0..10 * BLOCK_SIZE {
+            let data = vec![0xFF; length];
+            assert_eq!(
+                infer_channel_endianness_from_codeplug(&data),
+                Endianness::Big
+            );
+        }
+    }
+
+    #[test]
+    fn channel_endianness_inference_ignores_incomplete_records() {
+        let mut data = vec![0xFF; 3 * BLOCK_SIZE];
+        data[2 * BLOCK_SIZE..2 * BLOCK_SIZE + 4].copy_from_slice(&14_550_000u32.to_le_bytes());
+        for length in 2 * BLOCK_SIZE..3 * BLOCK_SIZE {
+            assert_eq!(
+                infer_channel_endianness_from_codeplug(&data[..length]),
+                Endianness::Big
+            );
+        }
+        assert_eq!(
+            infer_channel_endianness_from_codeplug(&data),
+            Endianness::Little
+        );
+    }
+
+    #[test]
+    fn channel_endianness_inference_uses_strong_evidence_after_ambiguous_records() {
+        let mut data = vec![0xFF; EEPROM_SIZE];
+        for (block, frequency) in [(2, 14_400_000u32), (3, 14_535_000)] {
+            let offset = block * BLOCK_SIZE;
+            data[offset..offset + 4].copy_from_slice(&frequency.to_be_bytes());
+            data[offset + 4..offset + 8].copy_from_slice(&frequency.to_be_bytes());
+        }
+        assert_eq!(
+            infer_channel_endianness_from_codeplug(&data),
+            Endianness::Big
+        );
+    }
+
+    #[test]
+    fn late_channel_evidence_takes_priority_over_settings_byte_order() {
+        let mut data = vec![0xFF; EEPROM_SIZE];
+        data[0x1900..0x1902].copy_from_slice(&0xD82Fu16.to_le_bytes());
+        let offset = 100 * BLOCK_SIZE;
+        data[offset..offset + 4].copy_from_slice(&14_535_000u32.to_be_bytes());
+        data[offset + 4..offset + 8].copy_from_slice(&14_535_000u32.to_be_bytes());
+        assert_eq!(
+            infer_channel_endianness_from_codeplug(&data),
+            Endianness::Big
+        );
+    }
+
+    #[test]
+    fn ambiguous_file_samples_use_recognized_settings_marker() {
+        let mut data = vec![0xFF; EEPROM_SIZE];
+        data[64..68].copy_from_slice(&14_400_000u32.to_be_bytes());
+        data[68..72].copy_from_slice(&14_400_000u32.to_be_bytes());
+        for (marker, expected) in [
+            (0xD82Fu16.to_be_bytes(), Endianness::Big),
+            (0xD82Fu16.to_le_bytes(), Endianness::Little),
+        ] {
+            data[0x1900..0x1902].copy_from_slice(&marker);
+            assert_eq!(infer_channel_endianness_from_codeplug(&data), expected);
+        }
+    }
 }

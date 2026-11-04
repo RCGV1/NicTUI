@@ -1,8 +1,9 @@
 use crate::app::App;
+use crate::protocol::editor_value::{SCAN_MODULATIONS, decimal_value, option_label};
 use crate::ui::render_shortcut;
 use crate::ui::theme::{
     COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_PRIMARY, COLOR_SELECTION_BG, COLOR_SELECTION_FG,
-    COLOR_SURFACE_1, COLOR_SURFACE_2, COLOR_TEXT,
+    COLOR_SURFACE_1, COLOR_SURFACE_2, COLOR_TEXT, COLOR_WARNING,
 };
 use crate::ui::views::ready_state::{ReadyStateAction, ReadyStateContent, render_ready_state};
 use ratatui::{
@@ -16,7 +17,7 @@ use ratatui::{
 
 pub fn render_scanning_page(f: &mut Frame, app: &mut App, area: Rect) {
     let summary_height = if area.width < 90 { 3 } else { 2 };
-    let detail_height = if area.width < 90 { 6 } else { 5 };
+    let detail_height = 6;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -26,7 +27,12 @@ pub fn render_scanning_page(f: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(area);
 
-    let summary_text = if area.width < 90 {
+    let summary_text = if app.scan_presets_dirty {
+        format!(
+            "Unsaved | w write | {} presets | Enter edit",
+            app.scan_presets.len()
+        )
+    } else if area.width < 90 {
         format!("{} presets | Enter edit | 4 groups", app.scan_presets.len())
     } else {
         format!(
@@ -35,7 +41,11 @@ pub fn render_scanning_page(f: &mut Frame, app: &mut App, area: Rect) {
         )
     };
     let summary = Paragraph::new(summary_text)
-        .style(Style::default().fg(COLOR_DIM))
+        .style(Style::default().fg(if app.scan_presets_dirty {
+            COLOR_WARNING
+        } else {
+            COLOR_DIM
+        }))
         .wrap(ratatui::widgets::Wrap { trim: true })
         .block(
             Block::default()
@@ -60,7 +70,11 @@ pub fn render_scanning_page(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_preset_table(f: &mut Frame, app: &mut App, area: Rect, compact: bool) {
-    let preset_border_style = Style::default().fg(COLOR_PRIMARY);
+    let preset_border_style = Style::default().fg(if app.scan_presets_dirty {
+        COLOR_WARNING
+    } else {
+        COLOR_PRIMARY
+    });
 
     if app.scan_presets.is_empty() {
         render_ready_state(
@@ -85,16 +99,16 @@ fn render_preset_table(f: &mut Frame, app: &mut App, area: Rect, compact: bool) 
         Row::new(vec![
             Cell::from("#").style(Style::default().fg(COLOR_ACCENT)),
             Cell::from("Label").style(Style::default().fg(COLOR_ACCENT)),
-            Cell::from("Start").style(Style::default().fg(COLOR_ACCENT)),
-            Cell::from("Span").style(Style::default().fg(COLOR_ACCENT)),
-            Cell::from("Step").style(Style::default().fg(COLOR_ACCENT)),
+            Cell::from("Start MHz").style(Style::default().fg(COLOR_ACCENT)),
+            Cell::from("MHz").style(Style::default().fg(COLOR_ACCENT)),
+            Cell::from("kHz").style(Style::default().fg(COLOR_ACCENT)),
             Cell::from("Mod").style(Style::default().fg(COLOR_ACCENT)),
         ])
     } else {
         Row::new(vec![
             Cell::from("#").style(Style::default().fg(COLOR_ACCENT)),
             Cell::from("Label").style(Style::default().fg(COLOR_ACCENT)),
-            Cell::from("Start").style(Style::default().fg(COLOR_ACCENT)),
+            Cell::from("Start MHz").style(Style::default().fg(COLOR_ACCENT)),
             Cell::from("Range").style(Style::default().fg(COLOR_ACCENT)),
             Cell::from("Step").style(Style::default().fg(COLOR_ACCENT)),
             Cell::from("Resume").style(Style::default().fg(COLOR_ACCENT)),
@@ -119,20 +133,20 @@ fn render_preset_table(f: &mut Frame, app: &mut App, area: Rect, compact: bool) 
             Row::new(vec![
                 preset.index.to_string(),
                 preset.label.clone(),
-                format!("{:.5}", preset.start_freq as f64 / 100000.0),
-                format!("{}M", preset.range),
-                format!("{}Hz", preset.step),
-                scan_modulation_label(preset.modulation).to_string(),
+                decimal_value(preset.start_freq, 5),
+                decimal_value(preset.range as u32, 2),
+                decimal_value(preset.step as u32, 2),
+                option_label(SCAN_MODULATIONS, preset.modulation),
             ])
         } else {
             Row::new(vec![
                 preset.index.to_string(),
                 preset.label.clone(),
-                format!("{:.5}", preset.start_freq as f64 / 100000.0),
-                format!("{} MHz", preset.range),
-                format!("{} Hz", preset.step),
+                decimal_value(preset.start_freq, 5),
+                format!("{} MHz", decimal_value(preset.range as u32, 2)),
+                format!("{} kHz", decimal_value(preset.step as u32, 2)),
                 format!("{}s", preset.resume),
-                scan_modulation_label(preset.modulation).to_string(),
+                option_label(SCAN_MODULATIONS, preset.modulation),
             ])
         }
         .style(style)
@@ -165,7 +179,11 @@ fn render_preset_table(f: &mut Frame, app: &mut App, area: Rect, compact: bool) 
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" SCAN PRESETS ")
+            .title(if app.scan_presets_dirty {
+                " SCAN PRESETS (Unsaved) "
+            } else {
+                " SCAN PRESETS "
+            })
             .border_style(preset_border_style)
             .bg(COLOR_SURFACE_1),
     )
@@ -188,6 +206,27 @@ fn selected_scan_preset_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         return vec![Line::from("No scan preset selected")];
     };
 
+    let mut controls = vec![
+        render_shortcut("Enter"),
+        Span::raw(": Edit | "),
+        render_shortcut("r"),
+        Span::raw(": Read"),
+    ];
+    if app.scan_presets_dirty {
+        controls.extend([
+            Span::raw(" | "),
+            render_shortcut("w"),
+            Span::styled(": Write", Style::default().fg(COLOR_WARNING)),
+        ]);
+    }
+    if !compact {
+        controls.extend([
+            Span::raw(" | "),
+            render_shortcut("4"),
+            Span::raw(": Memory groups"),
+        ]);
+    }
+
     vec![
         Line::from(vec![
             Span::styled(
@@ -208,51 +247,194 @@ fn selected_scan_preset_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         ]),
         Line::from(if compact {
             format!(
-                "{:.5} | {} MHz | {} Hz",
-                preset.start_freq as f64 / 100000.0,
-                preset.range,
-                preset.step
+                "{} | {} MHz | {} kHz",
+                decimal_value(preset.start_freq, 5),
+                decimal_value(preset.range as u32, 2),
+                decimal_value(preset.step as u32, 2)
             )
         } else {
             format!(
-                "Start {:.5} | Range {} MHz | Step {} Hz",
-                preset.start_freq as f64 / 100000.0,
-                preset.range,
-                preset.step
+                "Start {} MHz | Range {} MHz | Step {} kHz",
+                decimal_value(preset.start_freq, 5),
+                decimal_value(preset.range as u32, 2),
+                decimal_value(preset.step as u32, 2)
             )
         }),
         Line::from(if compact {
             format!(
-                "Res {}s | Hold {}s | {} | U {}",
+                "Res {}s | Persist {}s | {} | Ultra raw {}",
                 preset.resume,
-                preset.persist,
-                scan_modulation_label(preset.modulation),
+                decimal_value(preset.persist as u32, 1),
+                option_label(SCAN_MODULATIONS, preset.modulation),
                 preset.ultrascan
             )
         } else {
             format!(
-                "Resume {}s | Persist {}s | {} | Ultrascan {}",
+                "Resume {}s | Persist {}s | {} | Ultrascan raw {}",
                 preset.resume,
-                preset.persist,
-                scan_modulation_label(preset.modulation),
+                decimal_value(preset.persist as u32, 1),
+                option_label(SCAN_MODULATIONS, preset.modulation),
                 preset.ultrascan
             )
         }),
-        Line::from(vec![
-            render_shortcut("Enter"),
-            Span::raw(": Edit | "),
-            render_shortcut("r"),
-            Span::raw(": Read | "),
-            render_shortcut("4"),
-            Span::raw(": Memory groups"),
-        ]),
+        Line::from(controls),
     ]
 }
 
-fn scan_modulation_label(value: u8) -> &'static str {
-    match value {
-        1 => "AM",
-        2 => "USB",
-        _ => "FM",
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{AppEvent, AppMode, MainTab, WriteScope};
+    use crate::protocol::{BandPlan, DTMFPreset, ScanPreset};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn domain_tables_render_protocol_values_without_hex_or_scaling_errors() {
+        let mut app = App::new();
+        app.scan_presets.push(ScanPreset {
+            start_freq: 11_800_000,
+            range: 1900,
+            step: 1250,
+            persist: 200,
+            ultrascan: 20,
+            ..ScanPreset::default()
+        });
+        app.preset_state.select(Some(0));
+        app.band_plans.push(BandPlan {
+            modulation: 4,
+            bandwidth: 5,
+            max_power: 255,
+            ..BandPlan::default()
+        });
+        app.bandplan_state.select(Some(0));
+        app.dtmf_presets.push(DTMFPreset {
+            digits: vec![12, 14, 15],
+            ..DTMFPreset::default()
+        });
+        app.dtmf_state.select(Some(0));
+        for (tab, expected) in [
+            (MainTab::Scanning, "19.00 MHz"),
+            (MainTab::BandPlan, "Enforce FM"),
+            (MainTab::DTMF, "C*#"),
+        ] {
+            app.mode = AppMode::Main(tab);
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            terminal
+                .draw(|frame| match tab {
+                    MainTab::Scanning => render_scanning_page(frame, &mut app, frame.area()),
+                    MainTab::BandPlan => {
+                        crate::ui::views::bandplan::render_bandplan(frame, &mut app, frame.area())
+                    }
+                    MainTab::DTMF => {
+                        crate::ui::views::dtmf::render_dtmf(frame, &mut app, frame.area())
+                    }
+                    _ => unreachable!(),
+                })
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains(expected), "{expected}");
+            if matches!(tab, MainTab::Scanning) {
+                assert!(text.contains("12.50 kHz"));
+                assert!(text.contains("20.0s"));
+            }
+            if matches!(tab, MainTab::BandPlan) {
+                assert!(text.contains("FM Tuner"));
+                assert!(text.contains("Pwr raw"));
+            }
+        }
+    }
+
+    #[test]
+    fn scan_and_band_unsaved_state_and_write_actions_survive_full_layout() {
+        for tab in [MainTab::Scanning, MainTab::BandPlan] {
+            let mut app = App::new();
+            app.mode = AppMode::Main(tab);
+            app.last_main_tab = tab;
+            app.scan_presets.push(ScanPreset::default());
+            app.preset_state.select(Some(0));
+            app.band_plans.push(BandPlan::default());
+            app.bandplan_state.select(Some(0));
+            for dirty in [true, false] {
+                if dirty {
+                    app.scan_presets_dirty = tab == MainTab::Scanning;
+                    app.band_plans_dirty = tab == MainTab::BandPlan;
+                } else {
+                    let scope = if tab == MainTab::Scanning {
+                        WriteScope::ScanPresets
+                    } else {
+                        WriteScope::BandPlans
+                    };
+                    app.event_tx.send(AppEvent::WriteComplete(scope)).unwrap();
+                    app.update();
+                }
+                assert_eq!(app.scan_presets_dirty, dirty && tab == MainTab::Scanning);
+                assert_eq!(app.band_plans_dirty, dirty && tab == MainTab::BandPlan);
+                for (width, height, sidebar) in
+                    [(80, 24, 20), (100, 30, 22), (160, 45, 28), (180, 50, 28)]
+                {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            crate::ui::views::main_layout::render_main_layout(
+                                frame,
+                                &mut app,
+                                frame.area(),
+                                tab,
+                            )
+                        })
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    let text = (0..height)
+                        .map(|y| {
+                            (0..width)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let nav = (3..height - 2)
+                        .map(|y| {
+                            (0..sidebar)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if dirty {
+                        assert!(text.contains("DIRTY"), "{tab:?} {width}x{height}: {text}");
+                        assert!(text.contains("Unsaved"), "{text}");
+                        assert!(
+                            text.contains(if tab == MainTab::Scanning {
+                                "pending scan*"
+                            } else {
+                                "pending band*"
+                            }),
+                            "{text}"
+                        );
+                        assert!(nav.contains("1*"), "{nav}");
+                        assert!(nav.contains("1 dirty"), "{nav}");
+                        let footer = (0..width)
+                            .map(|x| buffer[(x, height - 1)].symbol())
+                            .collect::<String>()
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        assert!(footer.contains("w write"), "{footer}");
+                    } else {
+                        assert!(!text.contains("DIRTY"), "{text}");
+                        assert!(!text.contains("pending scan*"));
+                        assert!(!text.contains("pending band*"));
+                        assert!(!text.contains("Unsaved"));
+                        assert!(!nav.contains("1*"));
+                    }
+                }
+            }
+        }
     }
 }

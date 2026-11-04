@@ -44,8 +44,8 @@ pub(crate) fn render_channel_editor(f: &mut Frame, app: &App) {
         ("TX Tone", ch.tx_tone.clone(), false),
         ("Power", power_str, false),
         (
-            "Active",
-            if ch.position == 1 { "On" } else { "Off" }.to_string(),
+            "Reverse",
+            if ch.reverse { "On" } else { "Off" }.to_string(),
             true,
         ),
         ("Bandwidth", ch.bandwidth.clone(), true),
@@ -147,11 +147,10 @@ pub(crate) fn render_channel_editor(f: &mut Frame, app: &App) {
             6 => vec!["Off".to_string(), "On".to_string()],
             7 => vec!["Wide".to_string(), "Narrow".to_string()],
             8 => vec![
+                "Auto".to_string(),
                 "FM".to_string(),
                 "AM".to_string(),
                 "USB".to_string(),
-                "LSB".to_string(),
-                "CW".to_string(),
             ],
             9 => group_options,
             _ => vec![],
@@ -209,10 +208,11 @@ fn channel_field_help_lines(_ch: &Channel, field_idx: usize) -> (&'static str, V
             )],
         ),
         6 => (
-            "Active",
-            vec![Line::from(
-                "On keeps the channel available. Off parks it without deleting it.",
-            )],
+            "Reverse",
+            vec![
+                Line::from("Toggle the channel's Reverse flag."),
+                Line::from("This does not activate or delete the channel."),
+            ],
         ),
         7 => (
             "Bandwidth",
@@ -280,7 +280,7 @@ mod tests {
         group_option_labels, group_slot_label, primary_group, primary_group_label,
         use_stacked_channel_editor,
     };
-    use crate::protocol::Channel;
+    use crate::protocol::{Channel, GROUP_LABEL_COUNT};
 
     #[test]
     fn desktop_channel_editor_stays_side_by_side() {
@@ -294,8 +294,44 @@ mod tests {
     }
 
     #[test]
+    fn reverse_field_is_not_presented_as_channel_activation() {
+        use crate::app::{App, AppMode};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = App::new();
+        app.pending_channel_edit = Some(Channel {
+            reverse: true,
+            position: 0,
+            ..Channel::default()
+        });
+        app.mode = AppMode::EditChannel(6);
+        app.update_edit_buffer();
+        assert_eq!(app.edit_buffer, "On");
+        for (width, height) in [(80, 24), (100, 30), (160, 45), (180, 50)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| super::render_channel_editor(frame, &app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = (0..height)
+                .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>();
+            assert!(text.contains("Reverse"), "{width}x{height}: {text}");
+            assert!(!text.contains("Active"), "{width}x{height}: {text}");
+            assert!(!text.contains("parks"), "{width}x{height}: {text}");
+        }
+        let (title, help) = super::channel_field_help_lines(&Channel::default(), 6);
+        assert_eq!(title, "Reverse");
+        assert_eq!(help[0].to_string(), "Toggle the channel's Reverse flag.");
+        assert_eq!(
+            help[1].to_string(),
+            "This does not activate or delete the channel."
+        );
+    }
+
+    #[test]
     fn group_slot_label_uses_saved_name_when_available() {
-        let mut labels = vec![String::new(); 16];
+        let mut labels = vec![String::new(); GROUP_LABEL_COUNT];
         labels[0] = "Ham".to_string();
 
         assert_eq!(group_slot_label(1, &labels), "Ham");
@@ -305,9 +341,10 @@ mod tests {
 
     #[test]
     fn group_option_labels_include_none_and_all_groups() {
-        let options = group_option_labels(&vec![String::new(); 16]);
-        assert_eq!(options.len(), 17);
+        let options = group_option_labels(&vec![String::new(); GROUP_LABEL_COUNT]);
+        assert_eq!(options.len(), GROUP_LABEL_COUNT + 1);
         assert_eq!(options[0], "None");
+        assert_eq!(options.last().unwrap(), "O");
     }
 
     #[test]

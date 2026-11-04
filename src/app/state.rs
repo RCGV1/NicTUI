@@ -1,9 +1,9 @@
 use ratatui::widgets::TableState;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use crate::device::PortCandidate;
 use crate::protocol::{
@@ -32,6 +32,10 @@ pub enum AppMode {
 
 #[derive(Clone, Default)]
 pub struct RemoteScreen {
+    pub display: crate::remote_display::RadioDisplay,
+    /// Drawing observed this session, not evidence of a complete screen snapshot.
+    pub has_display_updates: bool,
+    pub show_diagnostics: bool,
     pub elements: VecDeque<RemotePacket>,
     pub signal_strength: u8,
     pub noise_level: u8,
@@ -45,11 +49,27 @@ pub struct RemoteScreen {
     pub last_text_update: Option<std::time::Instant>,
     pub last_status_update: Option<std::time::Instant>,
     pub last_led_update: Option<std::time::Instant>,
+    pub last_received: Option<std::time::Instant>,
     pub phase: RemoteSessionPhase,
     pub last_control_report: Option<RemoteControlReport>,
     pub last_failure: Option<RemoteSessionFailure>,
     pub last_delta: Option<String>,
     pub unknown_packet_count: usize,
+}
+
+impl RemoteScreen {
+    pub(crate) fn reset_session(&mut self) {
+        *self = Self {
+            show_diagnostics: self.show_diagnostics,
+            ..Self::default()
+        };
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RemoteInputState {
+    pub ready: bool,
+    pub pending: bool,
 }
 
 #[derive(PartialEq, Clone, Debug, Copy)]
@@ -81,6 +101,7 @@ pub enum AppEvent {
     RemotePhase(RemoteSessionPhase),
     RemoteControl(RemoteControlReport),
     RemoteDelta(String),
+    RemoteReceived(std::time::Instant),
     RemotePacket(RemotePacket),
     RemoteStopped {
         message: String,
@@ -122,6 +143,8 @@ pub enum WriteScope {
     Dtmf,
     GroupLabels,
     Settings,
+    ScanPresets,
+    BandPlans,
     Codeplug,
     None,
 }
@@ -151,6 +174,7 @@ pub struct App {
     pub settings_state: TableState,
     pub remote_screen: RemoteScreen,
     pub protocol_port_name: Option<String>,
+    pub active_port_candidate: Option<PortCandidate>,
     pub ble_scan_in_progress: bool,
     pub ble_scan_ui_suspended: bool,
     pub ble_reconnect_required: bool,
@@ -165,18 +189,23 @@ pub struct App {
     pub remote_active: bool,
     pub remote_stop_signal: Arc<AtomicBool>,
     pub remote_tx: Option<Sender<RemoteControlCommand>>,
+    pub(crate) remote_input_state: Arc<Mutex<RemoteInputState>>,
     pub last_main_tab: MainTab,
     pub last_non_remote_tab: MainTab,
     pub settings_dirty: bool,
     pub channels_dirty: bool,
     pub dtmf_dirty: bool,
     pub group_labels_dirty: bool,
+    pub scan_presets_dirty: bool,
+    pub band_plans_dirty: bool,
     pub codeplug_data: Option<Vec<u8>>,
+    pub codeplug_workspace_baseline: Option<Vec<u8>>,
     pub codeplug_path: Option<PathBuf>,
     pub bin_firmware_data: Option<Vec<u8>>,
     pub bin_file_path: Option<PathBuf>,
     pub dialog_open: bool,
     pub pending_channel_edit: Option<Channel>,
     pub dtmf_edit_preset_idx: Option<usize>,
+    pub pending_dtmf_edit: Option<DTMFPreset>,
     pub demo_mode: bool,
 }

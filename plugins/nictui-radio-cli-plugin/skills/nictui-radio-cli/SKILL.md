@@ -204,14 +204,14 @@ nictui remote pvojh-sweep "${NICTUI_TARGET[@]}" --gap-ms 0,50,100 --json
 Remote guidance:
 - `remote probe --preset ...` selects a logical action and lets NicTUI translate it to the programmer wire bytes. `remote probe --bytes ...` sends literal wire bytes unchanged.
 - Start with `nictui remote diagnose "${NICTUI_TARGET[@]}" --json` when you need to know whether control is actually confirmed.
-- `telemetry-primed` and `primed-telemetry-carrythrough` mean telemetry woke up, but control is still unconfirmed unless the report shows a decoded control delta and `remote_control_confirmed: true`.
-- `nictui remote key` now prints reaction evidence. Do not describe RX, surfaced packets, or carrythrough telemetry as successful remote control unless a decoded delta was observed.
+- `telemetry-primed` and `primed-telemetry-carrythrough` mean telemetry woke up, not that control worked. Only explicit command-specific confirmation may establish `remote_control_confirmed: true`.
+- `nictui remote key` prints transport and reaction evidence. Passive signal, noise, and display changes do not prove that a key was accepted; do not turn a delta count into a claim of confirmed control.
 
 ## BLE notes
 
 - `nictui bluetooth on` only flips the radio-side Bluetooth setting. It does not connect your local session by itself.
 - NicTUI can open the radio natively over BLE through `--ble-device`, `--ble-name`, `ble://<uuid>`, or `nictui bluetooth connect`.
-- `nictui bluetooth connect` resolves and opens the BLE transport; it does not change the radio setting.
+- `nictui bluetooth connect` checks the native Rust BLE transport and closes the check session; it does not run a bridge, keep a connection open, or change the radio setting.
 - The expected TD-H3 BLE programming transport uses:
   - service `0000ff00-0000-1000-8000-00805f9b34fb`
   - notify/read `0000ff01-0000-1000-8000-00805f9b34fb`

@@ -14,12 +14,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+pub mod activity;
 pub mod app;
 pub mod ble;
+pub mod cancellation;
 pub mod channel_file;
 pub mod cli;
 pub mod device;
 pub mod protocol;
 pub mod remote;
+pub mod remote_display;
 pub mod skill;
 pub mod ui;

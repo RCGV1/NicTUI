@@ -14,11 +14,12 @@ use crate::ble::{
     scan_td_h3_ble_devices,
 };
 use crate::channel_file::{
-    ChannelFileFormat, infer_channel_file_format, load_channels_from_path, save_channels_to_writer,
+    ChannelFileDocument, ChannelFileFormat, infer_channel_file_format,
+    load_channel_document_from_path, save_channels_to_writer,
 };
 use crate::device::{
     FirmwareVariant, PortCandidate, PortKind, ProgressEvent, RemoteMonitorEvent,
-    RemoteMonitorOptions, flash_firmware, inspect_codeplug, list_port_candidates, list_ports,
+    RemoteMonitorOptions, flash_firmware, inspect_codeplug, list_port_candidates,
     live_mode_capability, live_mode_hint, monitor_remote, monitor_remote_with_summary, probe_port,
     read_band_plans, read_channels, read_codeplug, read_dtmf_presets, read_group_labels,
     read_scan_presets, read_settings, resolve_port, send_remote_key_with_report,
@@ -38,15 +39,15 @@ use crate::skill::{
 };
 
 const CLI_AFTER_HELP: &str = "\
-Safe release workflow:
+Programming workflow:
   1. Find a target:      nictui ports --verbose
   2. Identify firmware:  nictui probe --port <serial>
-  3. Capture evidence:   nictui doctor --port <serial> --output-dir ./.live-debug/session --json
+  3. Check the radio:    nictui doctor --port <serial> --json
   4. Preview writes:     nictui <section> write --input <file> --validate-only
-  5. Apply writes:       nictui <section> write --input <file>
+  5. Apply writes:       nictui <section> write --port <serial> --input <file>
   6. Verify afterward:   nictui <section> read --port <serial>
 
-BLE is available through a local bridge, but bridge readiness does not prove
+BLE connects directly through NicTUI's native Rust transport. A connection does not prove
 remote/live control. Run `nictui remote diagnose --json`; only
 `remote_control_confirmed: true` confirms remote control.";
 
@@ -62,7 +63,7 @@ prove remote control or live-mode EEPROM access.";
 
 const DOCTOR_AFTER_HELP: &str = "\
 Examples:
-  nictui doctor --port /dev/cu.usbserial-210 --output-dir ./.live-debug/session
+  nictui doctor --port /dev/cu.usbserial-210
   nictui doctor --ble-name TD-H3 --json
 
 Doctor performs no EEPROM writes. Over USB it may run read-only live-mode timing
@@ -79,7 +80,7 @@ const REMOTE_AFTER_HELP: &str = "\
 Remote evidence notes:
   - RX bytes, telemetry packets, and PVOJH collisions are activity evidence.
   - They are not proof of remote control by themselves.
-  - Confirmed control requires a decoded state delta; use:
+  - Passive state changes do not confirm control; use:
     nictui remote diagnose --port <serial> --json";
 
 #[derive(Parser, Debug)]
@@ -119,7 +120,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: SettingsCommand,
     },
-    /// Scan, diagnose, bridge, or change the radio Bluetooth setting
+    /// Scan, connect, diagnose, or change the radio Bluetooth setting
     #[command(visible_alias = "ble", after_help = BLUETOOTH_AFTER_HELP)]
     Bluetooth {
         #[command(subcommand)]
@@ -194,10 +195,10 @@ pub struct PortArgs {
     /// Serial port to use. If omitted, NicTUI auto-selects the only detected radio-like port.
     #[arg(long, conflicts_with_all = ["ble_device", "ble_name"])]
     pub port: Option<String>,
-    /// BLE device UUID to bridge through NicTUI's local BLE transport
+    /// BLE device UUID to connect through NicTUI's native Rust transport
     #[arg(long, conflicts_with_all = ["port", "ble_name"])]
     pub ble_device: Option<String>,
-    /// BLE advertised device name to scan for and bridge locally
+    /// BLE advertised device name to scan for and connect directly
     #[arg(long, conflicts_with_all = ["port", "ble_device"])]
     pub ble_name: Option<String>,
     /// Scan timeout in seconds when resolving a BLE device by name
@@ -388,7 +389,7 @@ pub enum RemoteCommand {
     Probe(RemoteProbeArgs),
     /// Run the same probe across several remote-session strategies
     Matrix(RemoteMatrixArgs),
-    /// Run built-in probes and confirm control only when a decoded state delta appears
+    /// Run built-in probes and distinguish passive telemetry from control evidence
     Diagnose(RemoteDiagnoseArgs),
     /// Sweep read-only PVOJH timing to classify whether live-mode start behaves normally
     PvojhSweep(RemotePvojhSweepArgs),
@@ -535,7 +536,7 @@ pub struct ReadJsonArgs {
 pub struct ReadGroupArgs {
     #[command(flatten)]
     pub port: PortArgs,
-    /// Group number to read (1-16)
+    /// Group number to read (1-15, A-O)
     #[arg(long)]
     pub group: u8,
     #[arg(short, long)]
@@ -546,7 +547,7 @@ pub struct ReadGroupArgs {
 pub struct SetGroupArgs {
     #[command(flatten)]
     pub port: PortArgs,
-    /// Group number to update (1-16)
+    /// Group number to update (1-15, A-O)
     #[arg(long)]
     pub group: u8,
     /// Label to store for this group
@@ -829,7 +830,7 @@ pub struct RemoteMonitorArgs {
     /// Include idle RX zero-byte logs that are normally suppressed in raw mode
     #[arg(long)]
     pub raw_all: bool,
-    /// Send one or more keys during monitoring to exercise the session
+    /// Send physical key actions (may change saved radio state; PTT may transmit)
     #[arg(long = "send", value_enum)]
     pub send: Vec<RemoteKey>,
     /// Delay between scripted key presses in milliseconds
@@ -848,10 +849,10 @@ pub struct RemoteProbeArgs {
     #[command(flatten)]
     pub port: PortArgs,
     /// Named logical probe action to send; presets translate to programmer wire bytes automatically
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, conflicts_with = "bytes")]
     pub preset: Option<RemoteProbePreset>,
     /// Literal wire bytes to send as-is, for example 0B,00 or 4A 0B 00
-    #[arg(long)]
+    #[arg(long, conflicts_with = "preset")]
     pub bytes: Option<String>,
     /// Number of times to repeat the sequence
     #[arg(long, default_value_t = 1)]
@@ -1056,6 +1057,7 @@ pub enum Dispatch {
 }
 
 pub fn dispatch(cli: Cli) -> Result<Dispatch> {
+    check_cli_interruption()?;
     match cli.command {
         None => Ok(Dispatch::LaunchTui {
             port: None,
@@ -1451,11 +1453,9 @@ fn run_read_channels(args: ReadChannelsArgs) -> Result<()> {
 }
 
 fn run_write_channels(args: WriteChannelsArgs) -> Result<()> {
-    let channels = load_channels_from_path(&args.input)
-        .with_context(|| format!("Failed to load {}", args.input.display()))?;
-    validate_channels(&channels)?;
+    let document = load_channel_write_document(&args.input)?;
     if args.validate_only {
-        print_channel_validation_summary(&args.input, &channels);
+        print_channel_validation_summary(&args.input, &document);
         return Ok(());
     }
 
@@ -1463,13 +1463,18 @@ fn run_write_channels(args: WriteChannelsArgs) -> Result<()> {
     let mut progress = ProgressPrinter::default();
     write_channels(
         &port,
-        &channels,
-        &[],
+        &document.channels,
+        &document.inactive_channels,
         crate::protocol::Endianness::Big,
         args.reboot,
         |event| progress.handle(event),
     )?;
-    eprintln!("Wrote {} channels to {}", channels.len(), port);
+    eprintln!(
+        "Wrote {} channels and cleared {} explicit slots on {}",
+        document.channels.len(),
+        document.inactive_channels.len(),
+        port
+    );
     Ok(())
 }
 
@@ -1682,7 +1687,7 @@ fn run_bluetooth_connect(args: BleConnectArgs) -> Result<()> {
     println!("BLE transport validated: {}", bridge.device_id);
     println!("Use this target as: {}", bridge.tty_path);
     println!(
-        "This validates the BLE connection only; it does not start a persistent bridge or confirm remote control/live-mode EEPROM access."
+        "This checks a native BLE connection only; it does not keep a session open or confirm remote control/live-mode EEPROM access."
     );
 
     Ok(())
@@ -1729,6 +1734,8 @@ fn update_setting_value(
     validate_only: bool,
     no_reboot: bool,
 ) -> Result<()> {
+    crate::protocol::setting_value::validate_raw_value(setting_index, setting_value)
+        .map_err(|error| anyhow!(error))?;
     if validate_only {
         print_setting_change_validation_summary(setting_index, setting_value);
         return Ok(());
@@ -1738,7 +1745,6 @@ fn update_setting_value(
     let mut read_progress = ProgressPrinter::default();
     let (mut settings, endian) = read_settings(&port, |event| read_progress.handle(event))?;
     settings.set_value(setting_index, setting_value);
-    validate_settings_payload(&settings)?;
 
     let mut write_progress = ProgressPrinter::default();
     write_settings(&port, &settings, endian, !no_reboot, |event| {
@@ -1781,6 +1787,7 @@ fn run_get_group(args: ReadGroupArgs) -> Result<()> {
 
 fn run_set_group(args: SetGroupArgs) -> Result<()> {
     let group_index = validate_group_number(args.group)?;
+    crate::device::validate_group_labels_payload(&[args.label.trim().to_string()])?;
     let normalized_label = normalize_group_label(&args.label);
 
     if args.validate_only {
@@ -1988,6 +1995,7 @@ fn run_read_codeplug(args: ReadCodeplugArgs) -> Result<()> {
     let port = resolve_port_for_args(&args.port)?;
     let mut progress = ProgressPrinter::default();
     let (codeplug, _) = read_codeplug(&port, |event| progress.handle(event))?;
+    check_cli_interruption()?;
     save_codeplug(&args.output, &codeplug)?;
     eprintln!("Saved codeplug to {}", args.output.display());
     Ok(())
@@ -1995,6 +2003,7 @@ fn run_read_codeplug(args: ReadCodeplugArgs) -> Result<()> {
 
 fn run_write_codeplug(args: WriteCodeplugArgs) -> Result<()> {
     let codeplug = load_codeplug(&args.input)?;
+    crate::device::validate_codeplug_payload(&codeplug)?;
     let inspection = inspect_codeplug(&codeplug)?;
     if args.validate_only {
         print_codeplug_validation_summary(&args.input, &inspection);
@@ -2158,7 +2167,16 @@ fn summarize_remote_key_send_report(report: &crate::device::RemoteKeySendReport)
     }
 }
 
+fn control_transport_outcome(sent: bool) -> &'static str {
+    if sent { "SENT" } else { "FAILED" }
+}
+
 fn run_remote_capture(args: RemoteMonitorArgs) -> Result<()> {
+    if !args.send.is_empty() {
+        eprintln!(
+            "Warning: --send can change saved radio state; PTT keys may transmit. This is not a read-only capture."
+        );
+    }
     let port = resolve_port_for_args(&args.port)?;
     let options = RemoteMonitorOptions {
         duration: std::time::Duration::from_secs(args.duration),
@@ -2194,7 +2212,7 @@ fn run_remote_capture(args: RemoteMonitorArgs) -> Result<()> {
                 eprintln!("[{timestamp}] PHASE {phase}");
             }
             RemoteMonitorEvent::Control(report) => {
-                let outcome = if report.success { "OK" } else { "ERR" };
+                let outcome = control_transport_outcome(report.success);
                 println!(
                     "[{timestamp}] CTRL {outcome} {} [{}] {}",
                     report.label, report.strategy, report.detail
@@ -2214,7 +2232,6 @@ fn run_remote_capture(args: RemoteMonitorArgs) -> Result<()> {
 }
 
 fn run_remote_probe(args: RemoteProbeArgs) -> Result<()> {
-    let port = resolve_port_for_args(&args.port)?;
     if args.preset.is_some() == args.bytes.is_some() {
         bail!("Pass exactly one of --preset or --bytes for remote probe");
     }
@@ -2225,6 +2242,7 @@ fn run_remote_probe(args: RemoteProbeArgs) -> Result<()> {
         args.gap_ms,
         args.hold_ms,
     )?;
+    let port = resolve_port_for_args(&args.port)?;
     let duration = std::time::Duration::from_millis(args.pre_ms + args.post_ms + 800)
         + command.estimated_duration();
 
@@ -2251,7 +2269,7 @@ fn run_remote_probe(args: RemoteProbeArgs) -> Result<()> {
             RemoteMonitorEvent::Log(message) => println!("[{timestamp}] {message}"),
             RemoteMonitorEvent::Phase(phase) => eprintln!("[{timestamp}] PHASE {phase}"),
             RemoteMonitorEvent::Control(report) => {
-                let outcome = if report.success { "OK" } else { "ERR" };
+                let outcome = control_transport_outcome(report.success);
                 println!(
                     "[{timestamp}] CTRL {outcome} {} [{}] bytes {} | {}",
                     report.label, report.strategy, report.bytes_hex, report.detail
@@ -2319,7 +2337,7 @@ fn run_remote_matrix(args: RemoteMatrixArgs) -> Result<()> {
                         eprintln!("[{timestamp}] PHASE {phase}");
                     }
                     RemoteMonitorEvent::Control(report) => {
-                        let outcome = if report.success { "OK" } else { "ERR" };
+                        let outcome = control_transport_outcome(report.success);
                         println!(
                             "[{timestamp}] CTRL {outcome} {} [{}] bytes {} | {}",
                             report.label, report.strategy, report.bytes_hex, report.detail
@@ -2626,6 +2644,9 @@ fn run_remote_diagnose_case(
             }),
         ),
     };
+    let control_confirmed = control.as_ref().is_some_and(|report| {
+        report.evidence == crate::remote::RemoteEvidenceKind::ControlConfirmed
+    });
     let control = control.map(|report| RemoteDiagnoseControlView {
         label: report.label,
         strategy: report.strategy.to_string(),
@@ -2663,6 +2684,7 @@ fn run_remote_diagnose_case(
         delta_count,
         control.as_ref(),
         failure.as_ref(),
+        control_confirmed,
     );
     RemoteDiagnoseCaseView {
         label: label.to_string(),
@@ -2691,6 +2713,7 @@ fn diagnose_remote_case(
     delta_count: usize,
     control: Option<&RemoteDiagnoseControlView>,
     failure: Option<&RemoteDiagnoseFailureView>,
+    control_confirmed: bool,
 ) -> RemoteDiagnoseOutcome {
     let telemetry_observed = packet_count > 0
         || delta_count > 0
@@ -2700,7 +2723,7 @@ fn diagnose_remote_case(
                 || control.rx_first_ms.is_some()
         });
     let control_delta_observed =
-        control.is_some_and(|control| control.success && control.deltas > 0);
+        control_confirmed && control.is_some_and(|control| control.success);
 
     if let Some(failure) = failure {
         return RemoteDiagnoseOutcome {
@@ -3229,9 +3252,9 @@ fn parse_u64_list(value: &str) -> Result<Vec<u64>> {
 }
 
 fn run_remote_live_read(args: RemoteLiveReadArgs) -> Result<()> {
-    let port = resolve_port_for_args(&args.port)?;
     let start_address = parse_u16_address(&args.address)?;
     validate_live_block_span(start_address, args.blocks)?;
+    let port = resolve_port_for_args(&args.port)?;
     let (mut session, id) = LiveModeSession::begin(&port)?;
     let mut blocks = Vec::with_capacity(args.blocks as usize);
 
@@ -3892,6 +3915,7 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
                 let inspection = inspect_codeplug(&codeplug)?;
                 let output = if let Some(dir) = output_dir.as_deref() {
                     let codeplug_path = dir.join("radio.nfw");
+                    check_cli_interruption()?;
                     save_codeplug(&codeplug_path, &codeplug)?;
 
                     let inspection_path = dir.join("codeplug-inspection.json");
@@ -4013,6 +4037,7 @@ fn write_channels_output(
     output: Option<&Path>,
     format: ChannelOutputFormat,
 ) -> Result<()> {
+    check_cli_interruption()?;
     match output {
         Some(path) => {
             let writer = BufWriter::new(
@@ -4057,14 +4082,18 @@ fn write_single_channel_output(
 }
 
 fn write_json_output<T: Serialize>(value: &T, output: Option<&Path>) -> Result<()> {
+    check_cli_interruption()?;
     match output {
         Some(path) => {
-            let writer = BufWriter::new(
+            let mut writer = BufWriter::new(
                 File::create(path)
                     .with_context(|| format!("Failed to create {}", path.display()))?,
             );
-            serde_json::to_writer_pretty(writer, value)
-                .with_context(|| format!("Failed to write {}", path.display()))
+            serde_json::to_writer_pretty(&mut writer, value)
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+            writer
+                .flush()
+                .with_context(|| format!("Failed to flush {}", path.display()))
         }
         None => {
             let stdout = io::stdout();
@@ -4106,10 +4135,28 @@ fn read_single_json_or_array_input<T: DeserializeOwned>(path: &Path, label: &str
     }
 }
 
+fn load_channel_write_document(path: &Path) -> Result<ChannelFileDocument> {
+    let document = load_channel_document_from_path(path)
+        .with_context(|| format!("Failed to load {}", path.display()))?;
+    if document.group_labels.is_some() {
+        bail!(
+            "Channel file contains GroupLabels metadata; channels write/update will not write group names. Import it into the TUI workspace and save group names explicitly, or use `nictui groups set` for intentional group-name changes."
+        );
+    }
+    validate_channels(&document.channels)?;
+    Ok(document)
+}
+
 fn load_single_channel_from_path(path: &Path) -> Result<Channel> {
     match infer_channel_file_format(path)? {
         ChannelFileFormat::Csv => {
-            let mut channels = load_channels_from_path(path)?;
+            let document = load_channel_write_document(path)?;
+            if !document.inactive_channels.is_empty() {
+                bail!(
+                    "Channel update accepts one channel only, not inactive/deletion slots. Use `nictui channels write` to apply explicit deletions."
+                );
+            }
+            let mut channels = document.channels;
             if channels.len() != 1 {
                 bail!(
                     "Expected exactly one channel in {}, found {}.",
@@ -4119,7 +4166,31 @@ fn load_single_channel_from_path(path: &Path) -> Result<Channel> {
             }
             Ok(channels.remove(0))
         }
-        ChannelFileFormat::Json => read_single_json_or_array_input(path, "channel"),
+        ChannelFileFormat::Json => {
+            let value: serde_json::Value = read_json_input(path)?;
+            if value.get("channels").is_some() {
+                let document = load_channel_write_document(path)?;
+                if !document.inactive_channels.is_empty() {
+                    bail!(
+                        "Channel update accepts one channel only, not inactive/deletion slots. Use `nictui channels write` to apply explicit deletions."
+                    );
+                }
+                if document.channels.len() != 1 {
+                    bail!(
+                        "Expected exactly one channel in {}, found {}.",
+                        path.display(),
+                        document.channels.len()
+                    );
+                }
+                return Ok(document.channels.into_iter().next().unwrap());
+            }
+            if value.get("group_labels").is_some() || value.get("inactive_channels").is_some() {
+                bail!(
+                    "Channel update cannot apply group-label or inactive/deletion metadata; use a channel document with `nictui channels write` for deletions or `nictui groups set` for group names."
+                );
+            }
+            read_single_json_or_array_input(path, "channel")
+        }
     }
 }
 
@@ -4161,7 +4232,7 @@ fn normalize_group_label(label: &str) -> String {
     label
         .trim()
         .chars()
-        .take(crate::protocol::GROUP_LABEL_SIZE)
+        .take(crate::protocol::GROUP_LABEL_TEXT_SIZE)
         .collect()
 }
 
@@ -4328,12 +4399,18 @@ fn build_setting_view(settings: &SettingsBlock, index: usize) -> SettingView {
 }
 
 fn validate_settings_payload(settings: &SettingsBlock) -> Result<()> {
-    let _ = RadioProtocol::pack_settings_block(settings, Endianness::Little);
-    let _ = RadioProtocol::pack_settings_block(settings, Endianness::Big);
+    if settings.magic != crate::protocol::radio::SETTINGS_MAGIC {
+        bail!("Settings payload has no supported NicSure marker");
+    }
+    for index in 0..SETTINGS_METADATA.len() {
+        crate::protocol::setting_value::validate_raw_value(index, settings.get_value(index))
+            .map_err(|error| anyhow!(error))?;
+    }
     Ok(())
 }
 
 fn validate_firmware_image(path: &Path, firmware: &[u8]) -> Result<()> {
+    crate::device::validate_firmware_data(firmware)?;
     let rounded_len = firmware.len().div_ceil(32) * 32;
     if rounded_len > 0xF800 {
         bail!(
@@ -4355,18 +4432,12 @@ fn validate_firmware_image(path: &Path, firmware: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn print_channel_validation_summary(path: &Path, channels: &[Channel]) {
-    let active = channels
-        .iter()
-        .filter(|channel| channel.position == 1)
-        .count();
-    let inactive = channels.len().saturating_sub(active);
+fn print_channel_validation_summary(path: &Path, document: &ChannelFileDocument) {
     println!(
-        "Validated channel file {}: {} channels ({} active, {} parked)",
+        "Validated channel file {}: {} programmed channels, {} explicit deletions; unspecified slots are unchanged",
         path.display(),
-        channels.len(),
-        active,
-        inactive
+        document.channels.len(),
+        document.inactive_channels.len()
     );
 }
 
@@ -4486,6 +4557,13 @@ fn ensure_probe_supports_live_mode(port: &str, probe: &crate::device::ProbeResul
     Ok(())
 }
 
+fn check_cli_interruption() -> Result<()> {
+    if crate::cancellation::is_requested() {
+        bail!("Interrupted: signal requested");
+    }
+    Ok(())
+}
+
 fn resolve_optional_port_for_args(args: &PortArgs) -> Result<Option<String>> {
     if args.port.is_none() && args.ble_device.is_none() && args.ble_name.is_none() {
         return Ok(None);
@@ -4495,6 +4573,7 @@ fn resolve_optional_port_for_args(args: &PortArgs) -> Result<Option<String>> {
 }
 
 fn resolve_port_for_args(args: &PortArgs) -> Result<String> {
+    check_cli_interruption()?;
     if let Some(port) = args.port.as_deref()
         && let Some(device_id) = port
             .strip_prefix("ble://")
@@ -4520,9 +4599,22 @@ fn resolve_port_for_args(args: &PortArgs) -> Result<String> {
         );
     }
 
-    let port = resolve_port(args.port.as_deref())?;
-    if args.port.is_none() && list_ports()?.len() > 1 {
-        eprintln!("Auto-detected radio port: {}", port);
+    resolve_serial_port_with(args.port.as_deref(), resolve_port, |status| {
+        eprintln!("{status}");
+    })
+}
+
+fn resolve_serial_port_with(
+    requested: Option<&str>,
+    resolve: impl FnOnce(Option<&str>) -> Result<String>,
+    mut report: impl FnMut(&str),
+) -> Result<String> {
+    if requested.is_none() {
+        report("Discovering radio ports...");
+    }
+    let port = resolve(requested)?;
+    if requested.is_none() {
+        report(&format!("Auto-detected radio port: {port}"));
     }
     Ok(port)
 }
@@ -4635,9 +4727,10 @@ mod tests {
     use super::{
         BluetoothCommand, ChannelsCommand, Cli, Commands, PvojhSweepResult, PvojhSweepStage,
         RemoteCommand, RemoteDiagnoseCaseView, RemoteDiagnoseControlView, RemoteProbePreset,
-        SkillCommand, assess_remote_capability, classify_remote_diagnose, decode_live_mode_block,
-        doctor_port_label, explicit_ble_doctor_target, normalize_group_label, parse_u16_address,
-        parse_u64_list, probe_view, summarize_pvojh_results, summarize_remote_diagnose,
+        SkillCommand, assess_remote_capability, classify_remote_diagnose,
+        control_transport_outcome, decode_live_mode_block, doctor_port_label,
+        explicit_ble_doctor_target, normalize_group_label, parse_u16_address, parse_u64_list,
+        probe_view, summarize_pvojh_results, summarize_remote_diagnose,
         summarize_remote_key_send_report, validate_channel_range, validate_group_number,
         validate_live_block_span,
     };
@@ -4646,6 +4739,177 @@ mod tests {
         RemoteCommandReaction, RemoteControlReport, RemoteControlStrategy, RemoteEvidenceKind,
     };
     use clap::{CommandFactory, Parser, ValueEnum};
+
+    fn channel_document_test_path(extension: &str) -> std::path::PathBuf {
+        static NEXT_PATH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "nictui-cli-document-{}-{nonce}-{sequence}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn channel_document_write_keeps_explicit_deletions_without_inventing_missing_slots() {
+        for extension in ["csv", "json"] {
+            for channels in [Vec::new(), crate::app::App::demo().channels[..1].to_vec()] {
+                let path = channel_document_test_path(extension);
+                let document = crate::channel_file::ChannelFileDocument {
+                    channels,
+                    inactive_channels: vec![198],
+                    group_labels: None,
+                };
+                crate::channel_file::save_channel_document_to_path(&path, &document).unwrap();
+                let loaded = super::load_channel_write_document(&path).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&loaded.channels).unwrap(),
+                    serde_json::to_value(&document.channels).unwrap()
+                );
+                assert_eq!(loaded.inactive_channels, [198]);
+                let error = super::load_single_channel_from_path(&path)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("inactive/deletion"), "{error}");
+                assert!(error.contains("channels write"), "{error}");
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn channel_document_write_and_update_reject_group_metadata_including_explicit_empty_labels() {
+        for extension in ["csv", "json"] {
+            for labels in [
+                vec!["LOCAL".into()],
+                vec![String::new(); crate::protocol::GROUP_LABEL_COUNT],
+            ] {
+                let path = channel_document_test_path(extension);
+                let document = crate::channel_file::ChannelFileDocument {
+                    channels: crate::app::App::demo().channels[..1].to_vec(),
+                    group_labels: Some(labels),
+                    ..Default::default()
+                };
+                crate::channel_file::save_channel_document_to_path(&path, &document).unwrap();
+                for error in [
+                    super::load_channel_write_document(&path).unwrap_err(),
+                    super::load_single_channel_from_path(&path).unwrap_err(),
+                ] {
+                    let message = error.to_string();
+                    assert!(message.contains("GroupLabels"), "{message}");
+                    assert!(message.contains("groups set"), "{message}");
+                }
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn channel_document_channels_only_json_and_single_record_updates_stay_compatible() {
+        let path = channel_document_test_path("json");
+        let channels = crate::app::App::demo().channels[..1].to_vec();
+        crate::channel_file::save_channels_to_path(&path, &channels).unwrap();
+        let document = super::load_channel_write_document(&path).unwrap();
+        assert!(document.inactive_channels.is_empty() && document.group_labels.is_none());
+        assert_eq!(
+            super::load_single_channel_from_path(&path)
+                .unwrap()
+                .channel_num,
+            channels[0].channel_num
+        );
+        super::write_json_output(&channels[0], Some(&path)).unwrap();
+        assert_eq!(
+            super::load_single_channel_from_path(&path)
+                .unwrap()
+                .channel_num,
+            channels[0].channel_num
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn serial_resolution_discovers_once_and_reports_before_blocking() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let port = super::resolve_serial_port_with(
+            None,
+            |requested| {
+                assert_eq!(requested, None);
+                assert_eq!(&*events.borrow(), &["Discovering radio ports..."]);
+                events.borrow_mut().push("resolve".into());
+                Ok("test-radio".into())
+            },
+            |status| events.borrow_mut().push(status.to_string()),
+        )
+        .unwrap();
+        assert_eq!(port, "test-radio");
+        assert_eq!(
+            &*events.borrow(),
+            &[
+                "Discovering radio ports...",
+                "resolve",
+                "Auto-detected radio port: test-radio",
+            ]
+        );
+    }
+
+    #[test]
+    fn serial_resolution_reports_discovery_failure_without_retrying() {
+        let calls = std::cell::Cell::new(0);
+        let mut statuses = Vec::new();
+        let error = super::resolve_serial_port_with(
+            None,
+            |_| {
+                calls.set(calls.get() + 1);
+                anyhow::bail!("no radio found")
+            },
+            |status| statuses.push(status.to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(statuses, ["Discovering radio ports..."]);
+        assert_eq!(error.to_string(), "no radio found");
+    }
+
+    #[test]
+    fn serial_resolution_explicit_port_has_no_discovery_status() {
+        let port = super::resolve_serial_port_with(
+            Some("test-radio"),
+            |requested| {
+                assert_eq!(requested, Some("test-radio"));
+                Ok(requested.unwrap().to_string())
+            },
+            |_| panic!("explicit port must not announce discovery"),
+        )
+        .unwrap();
+        assert_eq!(port, "test-radio");
+    }
+
+    #[test]
+    fn control_transport_labels_do_not_claim_radio_acceptance() {
+        assert_eq!(control_transport_outcome(true), "SENT");
+        assert_eq!(control_transport_outcome(false), "FAILED");
+    }
+
+    #[test]
+    fn capture_help_explains_key_actions_are_not_read_only() {
+        let mut command = Cli::command();
+        let capture = command
+            .find_subcommand_mut("remote")
+            .unwrap()
+            .find_subcommand_mut("capture")
+            .unwrap();
+        let help = capture
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(help.contains("may change saved radio state"));
+        assert!(help.contains("PTT may transmit"));
+    }
 
     #[test]
     fn validate_channel_range_accepts_inclusive_range() {
@@ -4660,12 +4924,13 @@ mod tests {
     #[test]
     fn validate_group_number_accepts_one_based_groups() {
         assert_eq!(validate_group_number(1).unwrap(), 0);
-        assert_eq!(validate_group_number(16).unwrap(), 15);
+        assert_eq!(validate_group_number(15).unwrap(), 14);
+        assert!(validate_group_number(16).is_err());
     }
 
     #[test]
     fn normalize_group_label_trims_and_truncates() {
-        assert_eq!(normalize_group_label("  WEATHER  "), "WEATHE");
+        assert_eq!(normalize_group_label("  WEATHER  "), "WEATH");
     }
 
     #[test]
@@ -4768,8 +5033,9 @@ mod tests {
         let mut command = Cli::command();
         let help = command.render_help().to_string();
 
-        assert!(help.contains("Safe release workflow"));
-        assert!(help.contains("bridge readiness does not prove"));
+        assert!(help.contains("Programming workflow"));
+        assert!(help.contains("native Rust transport"));
+        assert!(!help.contains(".live-debug"));
         assert!(help.contains("remote_control_confirmed: true"));
     }
 
@@ -4783,12 +5049,12 @@ mod tests {
             .to_string();
 
         assert!(help.contains("Remote evidence notes"));
-        assert!(help.contains("Confirmed control requires a decoded state delta"));
+        assert!(help.contains("Passive state changes do not confirm control"));
         assert!(help.contains("nictui remote diagnose --port <serial> --json"));
     }
 
     #[test]
-    fn bluetooth_help_distinguishes_bridge_from_control() {
+    fn bluetooth_help_distinguishes_native_connection_from_control() {
         let mut command = Cli::command();
         let help = command
             .find_subcommand_mut("bluetooth")
@@ -5314,6 +5580,25 @@ mod tests {
 
         assert_eq!(classify_remote_diagnose(&cases), "confirmed-control-delta");
         assert!(summarize_remote_diagnose(&cases).contains("remote control is confirmed"));
+    }
+
+    #[test]
+    fn passive_deltas_cannot_confirm_remote_control() {
+        let control = RemoteDiagnoseControlView {
+            label: "menu".into(),
+            strategy: "sequence".into(),
+            bytes_hex: "8A FF".into(),
+            success: true,
+            detail: String::new(),
+            window_ms: 250,
+            rx_first_ms: Some(10),
+            surfaced_packets: 3,
+            unknown_packets: 0,
+            deltas: 2,
+        };
+        let diagnosis = super::diagnose_remote_case("menu", 3, 2, Some(&control), None, false);
+        assert!(!diagnosis.control_delta_observed);
+        assert_ne!(diagnosis.verdict, "confirmed-control-delta");
     }
 
     #[test]

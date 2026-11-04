@@ -1,6 +1,8 @@
 pub mod codeplug;
+pub mod editor_value;
 pub mod metadata;
 pub mod radio;
+pub mod setting_value;
 pub mod types;
 
 pub use codeplug::*;

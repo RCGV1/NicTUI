@@ -14,13 +14,15 @@ use crate::protocol::codeplug::{
     extract_vfo_memories_from_codeplug, infer_channel_endianness_from_codeplug,
     infer_endianness_from_codeplug,
 };
-use crate::protocol::radio::SETTINGS_MAGIC;
+use crate::protocol::radio::{
+    DTMF_PRESET_RECORD_COUNT, DTMF_PRESET_RECORD_SIZE, ReadTiming, SETTINGS_MAGIC,
+};
 use crate::protocol::{
     BAND_PLAN_RECORD_COUNT, BAND_PLAN_RECORD_SIZE, BIN_FLASH_BAUD_RATE, BLOCK_SIZE, BandPlan,
     Channel, DTMFPreset, EEPROM_SIZE, Endianness, GROUP_LABEL_COUNT, GROUP_LABEL_SIZE,
-    GROUP_LABELS_BLOCK_COUNT, GROUP_LABELS_BLOCK_OFFSET, GROUP_LABELS_BLOCK_START,
-    GROUP_LABELS_OFFSET, RadioProtocol, RemotePacket, SCAN_PRESET_RECORD_COUNT,
-    SCAN_PRESET_RECORD_SIZE, ScanPreset, SettingsBlock, TOTAL_BLOCKS,
+    GROUP_LABEL_TEXT_SIZE, GROUP_LABELS_BLOCK_COUNT, GROUP_LABELS_BLOCK_OFFSET,
+    GROUP_LABELS_BLOCK_START, GROUP_LABELS_OFFSET, RadioProtocol, RemotePacket,
+    SCAN_PRESET_RECORD_COUNT, SCAN_PRESET_RECORD_SIZE, ScanPreset, SettingsBlock, TOTAL_BLOCKS,
 };
 use crate::remote::{
     RemoteCaptureEvent, RemoteCaptureSummary, RemoteControlCommand, RemoteControlReport,
@@ -37,7 +39,7 @@ const SETTINGS_OFFSET: usize = 0x1900;
 const SETTINGS_SIZE: usize = SETTINGS_BLOCK_COUNT * BLOCK_SIZE;
 const SCAN_PRESET_START: usize = 0x1B00 / BLOCK_SIZE;
 const SCAN_PRESET_BLOCK_COUNT: usize =
-    (SCAN_PRESET_RECORD_COUNT * SCAN_PRESET_RECORD_SIZE) / BLOCK_SIZE;
+    (SCAN_PRESET_RECORD_COUNT * SCAN_PRESET_RECORD_SIZE).div_ceil(BLOCK_SIZE);
 const SCAN_PRESET_OFFSET: usize = 0x1B00;
 const SCAN_PRESET_SIZE: usize = SCAN_PRESET_RECORD_COUNT * SCAN_PRESET_RECORD_SIZE;
 const BAND_PLAN_START: usize = 0x1A00 / BLOCK_SIZE;
@@ -45,10 +47,12 @@ const BAND_PLAN_BLOCK_COUNT: usize = 7;
 const BAND_PLAN_OFFSET: usize = 0x1A02;
 const BAND_PLAN_SIZE: usize = BAND_PLAN_RECORD_COUNT * BAND_PLAN_RECORD_SIZE;
 const DTMF_START: usize = 0x1CF0 / BLOCK_SIZE;
-const DTMF_BLOCK_COUNT: usize = 9;
-const DTMF_PRESET_COUNT: usize = 20;
+const DTMF_BLOCK_OFFSET: usize = 0x1CF0 % BLOCK_SIZE;
+const DTMF_RECORD_SIZE: usize = DTMF_PRESET_RECORD_SIZE;
+const DTMF_PRESET_COUNT: usize = DTMF_PRESET_RECORD_COUNT;
 const DTMF_OFFSET: usize = 0x1CF0;
-const DTMF_SIZE: usize = DTMF_PRESET_COUNT * 13;
+const DTMF_SIZE: usize = DTMF_PRESET_COUNT * DTMF_RECORD_SIZE;
+const DTMF_BLOCK_COUNT: usize = (DTMF_BLOCK_OFFSET + DTMF_SIZE).div_ceil(BLOCK_SIZE);
 const NICSURE_REQUIRED_HINT: &str = "NicTUI requires NicSure mod firmware for live radio reads and writes. Install the NicSure firmware and try again.";
 
 #[derive(Debug, Clone)]
@@ -111,8 +115,12 @@ impl RemoteCommandSchedule {
         }
     }
 
-    fn reset(&self, start_delay: Duration) {
-        self.next_command_at.set(start_delay);
+    fn on_phase(&self, phase: RemoteSessionPhase, start_delay: Duration) {
+        // Armed also follows commands without telemetry; only Opening starts
+        // a session with a new elapsed-time base, including recovery attempts.
+        if phase == RemoteSessionPhase::Opening {
+            self.next_command_at.set(start_delay);
+        }
     }
 
     fn command_due(&self, elapsed: Duration) -> bool {
@@ -311,29 +319,114 @@ pub fn probe_port(port_name: &str) -> Result<ProbeResult> {
     })
 }
 
-pub fn read_codeplug<F>(port_name: &str, mut report: F) -> Result<(Vec<u8>, Endianness)>
+pub fn read_codeplug<F>(port_name: &str, report: F) -> Result<(Vec<u8>, Endianness)>
 where
     F: FnMut(ProgressEvent),
 {
+    read_codeplug_with_timing(port_name, normal_read_timing(port_name), report)
+}
+
+fn normal_read_timing(port_name: &str) -> ReadTiming {
+    if crate::ble::parse_ble_device_uri(port_name).is_some() {
+        ReadTiming::Conservative
+    } else {
+        ReadTiming::Responsive
+    }
+}
+
+struct ReadSession {
+    protocol: RadioProtocol,
+    resume_required: bool,
+}
+
+impl ReadSession {
+    fn read_blocks<F>(
+        &mut self,
+        start_block: usize,
+        block_count: usize,
+        report: &mut F,
+    ) -> Result<Vec<u8>>
+    where
+        F: FnMut(ProgressEvent),
+    {
+        let mut data = Vec::with_capacity(block_count * BLOCK_SIZE);
+        for offset in 0..block_count {
+            check_read_interruption()?;
+            let block = start_block + offset;
+            let bytes = self
+                .protocol
+                .read_block(block as u8)
+                .with_context(|| format!("Failed to read block {block}"))?;
+            data.extend_from_slice(&bytes);
+            report(ProgressEvent::Progress(
+                (offset + 1) as f64 / block_count as f64,
+            ));
+        }
+        check_read_interruption()?;
+        Ok(data)
+    }
+
+    fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+        let resume_result = if self.resume_required {
+            self.protocol
+                .enable_radio()
+                .context("Failed to resume radio after read")
+                .and_then(|ack| {
+                    if ack {
+                        self.resume_required = false;
+                        Ok(())
+                    } else {
+                        bail!("Radio did not acknowledge read resume");
+                    }
+                })
+        } else {
+            Ok(())
+        };
+        // Keep cleanup armed after a failed ACK for one final best-effort
+        // attempt on drop, without reporting the read as successful.
+        match (result, resume_result) {
+            (Ok(data), Ok(())) => Ok(data),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(resume_error)) => {
+                Err(error.context(format!("Radio resume also failed: {resume_error:#}")))
+            }
+        }
+    }
+}
+
+impl Drop for ReadSession {
+    fn drop(&mut self) {
+        if self.resume_required {
+            let _ = self.protocol.enable_radio();
+        }
+    }
+}
+
+fn check_read_interruption() -> Result<()> {
+    if crate::cancellation::is_requested() {
+        bail!("Interrupted: signal requested during radio read");
+    }
+    Ok(())
+}
+
+/// Read a complete snapshot, optionally using response-paced USB transactions.
+pub fn read_codeplug_with_timing<F>(
+    port_name: &str,
+    timing: ReadTiming,
+    mut report: F,
+) -> Result<(Vec<u8>, Endianness)>
+where
+    F: FnMut(ProgressEvent),
+{
+    if timing == ReadTiming::Responsive && crate::ble::parse_ble_device_uri(port_name).is_some() {
+        bail!("Response-paced reads currently require USB serial; use conservative timing for BLE");
+    }
     report(ProgressEvent::Status(format!(
         "Opening {} and reading full radio memory",
         port_name
     )));
 
-    let mut proto = open_handshaken_protocol(port_name)?;
-    let mut eeprom = vec![0u8; EEPROM_SIZE];
-
-    for block in 0..TOTAL_BLOCKS {
-        let data = proto
-            .read_block(block as u8)
-            .with_context(|| format!("Failed to read block {}", block))?;
-        let start = block * BLOCK_SIZE;
-        eeprom[start..start + BLOCK_SIZE].copy_from_slice(&data);
-        report(ProgressEvent::Progress(
-            (block + 1) as f64 / TOTAL_BLOCKS as f64,
-        ));
-    }
-
+    let eeprom = read_memory_range(port_name, timing, 0, TOTAL_BLOCKS, &mut report)?;
     let endian = infer_endianness_from_codeplug(&eeprom);
     report(ProgressEvent::Status(format!(
         "Read {} bytes from radio",
@@ -341,6 +434,126 @@ where
     )));
 
     Ok((eeprom, endian))
+}
+
+fn read_normal_memory_range<F>(
+    port_name: &str,
+    start_block: usize,
+    block_count: usize,
+    report: &mut F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(ProgressEvent),
+{
+    read_memory_range(
+        port_name,
+        normal_read_timing(port_name),
+        start_block,
+        block_count,
+        report,
+    )
+}
+
+fn read_memory_range<F>(
+    port_name: &str,
+    timing: ReadTiming,
+    start_block: usize,
+    block_count: usize,
+    report: &mut F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(ProgressEvent),
+{
+    with_read_session(port_name, timing, |session| {
+        session.read_blocks(start_block, block_count, report)
+    })
+}
+
+fn with_read_session<T>(
+    port_name: &str,
+    timing: ReadTiming,
+    read: impl FnOnce(&mut ReadSession) -> Result<T>,
+) -> Result<T> {
+    check_read_interruption()?;
+    let pause_radio = timing == ReadTiming::Responsive;
+    // Identification is shared with writes and is deliberately not cancellable.
+    let protocol = open_handshaken_protocol(port_name)?;
+    check_read_interruption()?;
+    let mut session = ReadSession {
+        // Identify supported firmware conservatively before pausing the radio.
+        protocol,
+        // Arm before sending pause: a missing ACK may still mean it paused.
+        resume_required: pause_radio,
+    };
+    let result = (|| {
+        if pause_radio {
+            if !session
+                .protocol
+                .disable_radio()
+                .context("Failed to pause radio for read")?
+            {
+                bail!("Radio did not acknowledge read pause");
+            }
+            session.protocol.set_read_timing(timing);
+        }
+        let data = read(&mut session)?;
+        check_read_interruption()?;
+        Ok(data)
+    })();
+    let data = session.finish(result)?;
+    // A signal arriving during the resume ACK must not produce a successful backup.
+    check_read_interruption()?;
+    Ok(data)
+}
+
+fn read_memory_with_group_labels<F>(
+    port_name: &str,
+    start_block: usize,
+    block_count: usize,
+    report: &mut F,
+) -> Result<(Vec<u8>, Result<Vec<String>>)>
+where
+    F: FnMut(ProgressEvent),
+{
+    let timing = normal_read_timing(port_name);
+    let primary_blocks = start_block..start_block + block_count;
+    let label_blocks =
+        GROUP_LABELS_BLOCK_START..GROUP_LABELS_BLOCK_START + GROUP_LABELS_BLOCK_COUNT;
+    // Only a paused USB session guarantees that overlapping bytes are stable.
+    let reuse_overlap = timing == ReadTiming::Responsive;
+    let overlap = label_blocks
+        .clone()
+        .filter(|block| reuse_overlap && primary_blocks.contains(block))
+        .count();
+    let total = block_count + GROUP_LABELS_BLOCK_COUNT - overlap;
+    let mut completed = 0;
+    let mut complete_block = || {
+        completed += 1;
+        report(ProgressEvent::Progress(completed as f64 / total as f64));
+    };
+
+    with_read_session(port_name, timing, |session| {
+        let primary = session.read_blocks(start_block, block_count, &mut |_| complete_block())?;
+        let labels = (|| {
+            let mut data = Vec::with_capacity(GROUP_LABELS_BLOCK_COUNT * BLOCK_SIZE);
+            for block in label_blocks {
+                check_read_interruption()?;
+                if reuse_overlap && primary_blocks.contains(&block) {
+                    let offset = (block - start_block) * BLOCK_SIZE;
+                    data.extend_from_slice(&primary[offset..offset + BLOCK_SIZE]);
+                } else {
+                    let bytes = session
+                        .protocol
+                        .read_block(block as u8)
+                        .with_context(|| format!("Failed to read group names block {block}"))?;
+                    data.extend_from_slice(&bytes);
+                    complete_block();
+                }
+            }
+            Ok(parse_group_label_memory(&data))
+        })();
+        Ok((primary, labels))
+    })
 }
 
 pub fn write_codeplug<F>(
@@ -352,13 +565,7 @@ pub fn write_codeplug<F>(
 where
     F: FnMut(ProgressEvent),
 {
-    if codeplug_data.len() != EEPROM_SIZE {
-        bail!(
-            "Invalid codeplug size: expected {} bytes, got {} bytes",
-            EEPROM_SIZE,
-            codeplug_data.len()
-        );
-    }
+    validate_codeplug_payload(codeplug_data)?;
 
     report(ProgressEvent::Status(format!(
         "Opening {} and writing full radio memory",
@@ -366,6 +573,15 @@ where
     )));
 
     let mut proto = open_handshaken_protocol(port_name)?;
+    let current_settings = proto.read_block(SETTINGS_BLOCK_START as u8)?;
+    let current_band_plan = proto.read_block(BAND_PLAN_START as u8)?;
+    if codeplug_data[SETTINGS_OFFSET..SETTINGS_OFFSET + 2] != current_settings[..2]
+        || codeplug_data[0x1A00..0x1A02] != current_band_plan[..2]
+    {
+        bail!(
+            "Codeplug version or byte order does not match the target radio; no blocks were written"
+        );
+    }
     for block in 0..TOTAL_BLOCKS {
         let offset = block * BLOCK_SIZE;
         let acknowledged = proto
@@ -388,6 +604,24 @@ where
     Ok(())
 }
 
+pub(crate) fn validate_codeplug_payload(data: &[u8]) -> Result<()> {
+    if data.len() != EEPROM_SIZE {
+        bail!(
+            "Invalid codeplug size: expected {EEPROM_SIZE} bytes, got {} bytes",
+            data.len()
+        );
+    }
+    let settings = &data[SETTINGS_OFFSET..SETTINGS_OFFSET + 2];
+    if settings != SETTINGS_MAGIC.to_be_bytes() && settings != SETTINGS_MAGIC.to_le_bytes() {
+        bail!("Codeplug has no supported NicSure settings marker");
+    }
+    let band_plan = &data[0x1A00..0x1A02];
+    if band_plan != 0xA46Du16.to_be_bytes() && band_plan != 0xA46Du16.to_le_bytes() {
+        bail!("Codeplug has no supported NicSure band-plan version marker");
+    }
+    Ok(())
+}
+
 pub fn read_channels<F>(port_name: &str, mut report: F) -> Result<(Vec<Channel>, Endianness)>
 where
     F: FnMut(ProgressEvent),
@@ -397,23 +631,13 @@ where
         port_name
     )));
 
-    let mut proto = open_handshaken_protocol(port_name)?;
-    let mut eeprom = vec![0u8; (CHANNEL_START_BLOCK + CHANNEL_RECORD_COUNT) * BLOCK_SIZE];
-
-    for offset in 0..CHANNEL_RECORD_COUNT {
-        let block = CHANNEL_START_BLOCK + offset;
-        let data = proto
-            .read_block(block as u8)
-            .with_context(|| format!("Failed to read block {}", block))?;
-        let start = block * BLOCK_SIZE;
-        eeprom[start..start + BLOCK_SIZE].copy_from_slice(&data);
-        report(ProgressEvent::Progress(
-            (offset + 1) as f64 / CHANNEL_RECORD_COUNT as f64,
-        ));
-    }
-
-    let channel_endian = infer_channel_endianness_from_codeplug(&eeprom);
-    let channels = extract_channels_from_codeplug(&eeprom, channel_endian);
+    let data = read_normal_memory_range(
+        port_name,
+        CHANNEL_START_BLOCK,
+        CHANNEL_RECORD_COUNT,
+        &mut report,
+    )?;
+    let (channels, channel_endian) = parse_channel_memory(&data);
 
     report(ProgressEvent::Status(format!(
         "Loaded {} channels",
@@ -423,11 +647,48 @@ where
     Ok((channels, channel_endian))
 }
 
+/// Read channels and group names in one session. Label errors are nonfatal;
+/// handshake, primary-read, and radio-resume errors fail the entire operation.
+pub fn read_channels_with_group_labels<F>(
+    port_name: &str,
+    mut report: F,
+) -> Result<(Vec<Channel>, Endianness, Result<Vec<String>>)>
+where
+    F: FnMut(ProgressEvent),
+{
+    report(ProgressEvent::Status(format!(
+        "Opening {} and reading channels and group names",
+        port_name
+    )));
+    let (data, labels) = read_memory_with_group_labels(
+        port_name,
+        CHANNEL_START_BLOCK,
+        CHANNEL_RECORD_COUNT,
+        &mut report,
+    )?;
+    let (channels, endian) = parse_channel_memory(&data);
+    report(ProgressEvent::Status(format!(
+        "Loaded {} channels",
+        channels.len()
+    )));
+    Ok((channels, endian, labels))
+}
+
+fn parse_channel_memory(data: &[u8]) -> (Vec<Channel>, Endianness) {
+    let mut eeprom = vec![0u8; (CHANNEL_START_BLOCK + CHANNEL_RECORD_COUNT) * BLOCK_SIZE];
+    eeprom[CHANNEL_DATA_OFFSET..].copy_from_slice(data);
+
+    let channel_endian = infer_channel_endianness_from_codeplug(&eeprom);
+    let channels = extract_channels_from_codeplug(&eeprom, channel_endian);
+
+    (channels, channel_endian)
+}
+
 pub fn write_channels<F>(
     port_name: &str,
     channels: &[Channel],
     deleted_channels: &[u16],
-    default_endian: Endianness,
+    _default_endian: Endianness,
     reboot: bool,
     mut report: F,
 ) -> Result<()>
@@ -435,6 +696,12 @@ where
     F: FnMut(ProgressEvent),
 {
     validate_channels(channels)?;
+    let mut seen: HashSet<u16> = channels.iter().map(|channel| channel.channel_num).collect();
+    for &channel in deleted_channels {
+        if !(1..=198).contains(&channel) || !seen.insert(channel) {
+            bail!("Invalid, duplicate, or conflicting channel deletion: {channel}");
+        }
+    }
 
     let total_operations = channels.len() + deleted_channels.len();
     if total_operations == 0 {
@@ -450,7 +717,9 @@ where
     )));
 
     let mut proto = open_handshaken_protocol(port_name)?;
-    let channel_endian = proto.detect_channel_endianness().unwrap_or(default_endian);
+    let channel_endian = proto
+        .detect_channel_endianness()
+        .context("Failed to determine channel byte order; no channel blocks were written")?;
     let mut completed = 0usize;
 
     for channel in channels {
@@ -521,9 +790,8 @@ where
         port_name
     )));
 
-    let mut proto = open_handshaken_protocol(port_name)?;
-    let data = read_block_range(
-        &mut proto,
+    let data = read_normal_memory_range(
+        port_name,
         SETTINGS_BLOCK_START,
         SETTINGS_BLOCK_COUNT,
         &mut report,
@@ -558,7 +826,10 @@ where
         &mut report,
     )?;
     let endian = RadioProtocol::infer_settings_endianness(&current);
-    let packed = RadioProtocol::pack_settings_block(settings, endian);
+    let mut packed = current;
+    let encoded = RadioProtocol::pack_settings_block(settings, endian);
+    // Fields beyond the modeled prefix belong to newer firmware versions.
+    packed[..0x67].copy_from_slice(&encoded[..0x67]);
     write_block_range(
         &mut proto,
         SETTINGS_BLOCK_START,
@@ -585,14 +856,49 @@ where
         port_name
     )));
 
-    let mut proto = open_handshaken_protocol(port_name)?;
-    let data = read_block_range(
-        &mut proto,
+    let data = read_normal_memory_range(
+        port_name,
         SCAN_PRESET_START,
         SCAN_PRESET_BLOCK_COUNT,
         &mut report,
     )?;
-    let endian = RadioProtocol::infer_scan_preset_endianness(&data);
+    let (presets, endian) = parse_scan_preset_memory(&data);
+    report(ProgressEvent::Status(format!(
+        "Read {} scan presets",
+        presets.len()
+    )));
+    Ok((presets, endian))
+}
+
+/// Read scan presets and group names in one session, reusing shared blocks only
+/// while paused. Label errors are nonfatal, but radio-resume errors are fatal.
+pub fn read_scan_presets_with_group_labels<F>(
+    port_name: &str,
+    mut report: F,
+) -> Result<(Vec<ScanPreset>, Endianness, Result<Vec<String>>)>
+where
+    F: FnMut(ProgressEvent),
+{
+    report(ProgressEvent::Status(format!(
+        "Opening {} and reading scan presets and group names",
+        port_name
+    )));
+    let (data, labels) = read_memory_with_group_labels(
+        port_name,
+        SCAN_PRESET_START,
+        SCAN_PRESET_BLOCK_COUNT,
+        &mut report,
+    )?;
+    let (presets, endian) = parse_scan_preset_memory(&data);
+    report(ProgressEvent::Status(format!(
+        "Read {} scan presets",
+        presets.len()
+    )));
+    Ok((presets, endian, labels))
+}
+
+fn parse_scan_preset_memory(data: &[u8]) -> (Vec<ScanPreset>, Endianness) {
+    let endian = RadioProtocol::infer_scan_preset_endianness(data);
 
     let mut presets = Vec::new();
     for index in 0..SCAN_PRESET_RECORD_COUNT {
@@ -607,11 +913,7 @@ where
         }
     }
 
-    report(ProgressEvent::Status(format!(
-        "Read {} scan presets",
-        presets.len()
-    )));
-    Ok((presets, endian))
+    (presets, endian)
 }
 
 pub fn write_scan_presets<F>(
@@ -637,8 +939,11 @@ where
         SCAN_PRESET_BLOCK_COUNT,
         &mut report,
     )?;
-    let endian = RadioProtocol::infer_scan_preset_endianness(&existing);
-    let mut packed = vec![0xFFu8; SCAN_PRESET_BLOCK_COUNT * BLOCK_SIZE];
+    let endian = RadioProtocol::infer_scan_preset_endianness_checked(&existing[..SCAN_PRESET_SIZE])
+        .context("Scan byte order is uncertain; no scan preset blocks were written")?;
+    let mut packed = existing;
+    // The final scan block also contains the beginning of the group-name table.
+    packed[..SCAN_PRESET_RECORD_COUNT * SCAN_PRESET_RECORD_SIZE].fill(0xFF);
 
     for preset in presets {
         let offset = preset.index as usize * SCAN_PRESET_RECORD_SIZE;
@@ -678,7 +983,8 @@ where
         SCAN_PRESET_BLOCK_COUNT,
         &mut report,
     )?;
-    let endian = RadioProtocol::infer_scan_preset_endianness(&packed);
+    let endian = RadioProtocol::infer_scan_preset_endianness_checked(&packed[..SCAN_PRESET_SIZE])
+        .context("Scan byte order is uncertain; no scan preset blocks were written")?;
     let offset = preset.index as usize * SCAN_PRESET_RECORD_SIZE;
     let bytes = RadioProtocol::pack_scan_preset(preset, endian);
     packed[offset..offset + bytes.len()].copy_from_slice(&bytes);
@@ -707,9 +1013,8 @@ where
         port_name
     )));
 
-    let mut proto = open_handshaken_protocol(port_name)?;
-    let data = read_block_range(
-        &mut proto,
+    let data = read_normal_memory_range(
+        port_name,
         BAND_PLAN_START,
         BAND_PLAN_BLOCK_COUNT,
         &mut report,
@@ -791,13 +1096,12 @@ where
         port_name
     )));
 
-    let mut proto = open_handshaken_protocol(port_name)?;
-    let data = read_block_range(&mut proto, DTMF_START, DTMF_BLOCK_COUNT, &mut report)?;
+    let data = read_normal_memory_range(port_name, DTMF_START, DTMF_BLOCK_COUNT, &mut report)?;
 
     let mut presets = Vec::new();
     for index in 0..DTMF_PRESET_COUNT {
-        let start = index * 13;
-        let end = start + 13;
+        let start = DTMF_BLOCK_OFFSET + index * DTMF_RECORD_SIZE;
+        let end = start + DTMF_RECORD_SIZE;
         if end <= data.len() {
             presets.push(RadioProtocol::parse_dtmf_preset(
                 &data[start..end],
@@ -822,16 +1126,13 @@ where
         port_name
     )));
 
-    let mut proto = open_handshaken_protocol(port_name)?;
-    let data = read_block_range(
-        &mut proto,
+    let data = read_normal_memory_range(
+        port_name,
         GROUP_LABELS_BLOCK_START,
         GROUP_LABELS_BLOCK_COUNT,
         &mut report,
     )?;
-    let start = GROUP_LABELS_BLOCK_OFFSET;
-    let end = start + GROUP_LABEL_COUNT * GROUP_LABEL_SIZE;
-    let labels = RadioProtocol::parse_group_labels(&data[start..end]);
+    let labels = parse_group_label_memory(&data);
 
     report(ProgressEvent::Status(format!(
         "Loaded {} group names",
@@ -843,10 +1144,17 @@ where
     Ok(labels)
 }
 
+fn parse_group_label_memory(data: &[u8]) -> Vec<String> {
+    let start = GROUP_LABELS_BLOCK_OFFSET;
+    let end = start + GROUP_LABEL_COUNT * GROUP_LABEL_SIZE;
+    RadioProtocol::parse_group_labels(&data[start..end])
+}
+
 pub fn write_group_labels<F>(port_name: &str, labels: &[String], mut report: F) -> Result<()>
 where
     F: FnMut(ProgressEvent),
 {
+    validate_group_labels_payload(labels)?;
     report(ProgressEvent::Status(format!(
         "Opening {} and saving group names",
         port_name
@@ -887,10 +1195,11 @@ where
     )));
 
     let mut proto = open_handshaken_protocol(port_name)?;
-    let mut packed = vec![0xFFu8; DTMF_BLOCK_COUNT * BLOCK_SIZE];
+    let mut packed = read_block_range(&mut proto, DTMF_START, DTMF_BLOCK_COUNT, &mut report)?;
+    packed[DTMF_BLOCK_OFFSET..DTMF_BLOCK_OFFSET + DTMF_SIZE].fill(0xFF);
 
     for preset in presets {
-        let offset = preset.index as usize * 13;
+        let offset = DTMF_BLOCK_OFFSET + preset.index as usize * DTMF_RECORD_SIZE;
         let bytes = RadioProtocol::pack_dtmf_preset(preset);
         packed[offset..offset + bytes.len()].copy_from_slice(&bytes);
     }
@@ -913,7 +1222,7 @@ where
 
     let mut proto = open_handshaken_protocol(port_name)?;
     let mut packed = read_block_range(&mut proto, DTMF_START, DTMF_BLOCK_COUNT, &mut report)?;
-    let offset = preset.index as usize * 13;
+    let offset = DTMF_BLOCK_OFFSET + preset.index as usize * DTMF_RECORD_SIZE;
     let bytes = RadioProtocol::pack_dtmf_preset(preset);
     packed[offset..offset + bytes.len()].copy_from_slice(&bytes);
 
@@ -935,12 +1244,8 @@ where
         0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
     ];
 
-    let rounded_len = firmware_data.len().div_ceil(32) * 32;
-    if rounded_len > 0xF800 {
-        bail!("Firmware file too large");
-    }
-
-    let last_block = (rounded_len / 32) as u16;
+    validate_firmware_data(firmware_data)?;
+    let block_count = firmware_data.len().div_ceil(BLOCK_SIZE);
     report(ProgressEvent::Status(format!(
         "Opening {} at {} baud for firmware flashing",
         port_name, BIN_FLASH_BAUD_RATE
@@ -955,69 +1260,9 @@ where
 
     let start_time = Instant::now();
     let timeout = Duration::from_secs(60);
-    let mut detected = false;
-    let mut flashing = false;
-    let mut block: u16 = 0;
-    let mut need_to_send_block = true;
-    let mut last_block_sent = false;
-    let mut a5_count = 0usize;
-    let mut block_sent_at = Instant::now();
-
     loop {
         if start_time.elapsed() > timeout {
             bail!("Timeout waiting for radio bootloader");
-        }
-
-        if flashing && need_to_send_block && block <= last_block {
-            let is_last = block == last_block;
-            let mut packet = [0u8; 36];
-            packet[0] = if is_last { 0xA2 } else { 0xA1 };
-            packet[1] = ((block >> 8) & 0xFF) as u8;
-            packet[2] = (block & 0xFF) as u8;
-
-            let start = block as usize * 32;
-            let end = (start + 32).min(firmware_data.len());
-            packet[4..4 + (end - start)].copy_from_slice(&firmware_data[start..end]);
-            packet[3] = packet[4..36]
-                .iter()
-                .fold(0u8, |accumulator, value| accumulator.wrapping_add(*value));
-
-            proto
-                .send_bytes(&packet)
-                .context("Failed to send firmware block")?;
-            block_sent_at = Instant::now();
-            need_to_send_block = false;
-
-            if is_last {
-                last_block_sent = true;
-            } else {
-                block += 1;
-            }
-
-            report(ProgressEvent::Progress(
-                (block as f64 + if last_block_sent { 1.0 } else { 0.0 })
-                    / (last_block as f64 + 1.0),
-            ));
-        }
-
-        if last_block_sent
-            && !need_to_send_block
-            && block_sent_at.elapsed() > Duration::from_millis(500)
-        {
-            report(ProgressEvent::Progress(1.0));
-            report(ProgressEvent::Status(
-                "Firmware flashing completed. Power-cycle the radio to boot the new image."
-                    .to_string(),
-            ));
-            return Ok(());
-        }
-
-        if flashing
-            && !need_to_send_block
-            && !last_block_sent
-            && block_sent_at.elapsed() > Duration::from_millis(500)
-        {
-            need_to_send_block = true;
         }
 
         match proto
@@ -1025,23 +1270,67 @@ where
             .context("Failed while waiting for bootloader")?
         {
             Some(0xA5) => {
-                a5_count += 1;
-                if !detected && a5_count >= 3 {
-                    detected = true;
-                    proto
-                        .send_bytes(&INIT_SEQUENCE)
-                        .context("Failed to send bootloader init sequence")?;
-                    report(ProgressEvent::Status(
-                        "Bootloader handshake detected. Starting transfer.".to_string(),
-                    ));
-                } else if detected {
-                    flashing = true;
-                }
+                proto
+                    .send_bytes(&INIT_SEQUENCE)
+                    .context("Failed to send bootloader init sequence")?;
+                break;
             }
             Some(_) => {}
             None => {}
         }
     }
+
+    // The bootloader repeats A5 until the initialization burst has settled.
+    let settle_started = Instant::now();
+    loop {
+        match proto.read_byte()? {
+            Some(0xA5) if settle_started.elapsed() < Duration::from_secs(2) => {}
+            None => break,
+            Some(byte) => bail!("Unexpected bootloader initialization response: {byte:02X}"),
+        }
+    }
+    report(ProgressEvent::Status(
+        "Bootloader handshake detected. Starting transfer.".to_string(),
+    ));
+
+    for (block, data) in firmware_data.chunks(BLOCK_SIZE).enumerate() {
+        let mut packet = [0u8; 36];
+        packet[0] = if block + 1 == block_count { 0xA2 } else { 0xA1 };
+        packet[1..3].copy_from_slice(&(block as u16).to_be_bytes());
+        packet[4..4 + data.len()].copy_from_slice(data);
+        packet[3] = packet[4..]
+            .iter()
+            .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        proto
+            .send_bytes(&packet)
+            .with_context(|| format!("Failed to send firmware block {block}"))?;
+        let ack = proto
+            .recv(1, Duration::from_secs(1))
+            .with_context(|| format!("Missing bootloader ACK for block {block}"))?;
+        if ack[0] != 0xA3 {
+            bail!(
+                "Bootloader rejected block {block}: expected A3, got {:02X}",
+                ack[0]
+            );
+        }
+        report(ProgressEvent::Progress(
+            (block + 1) as f64 / block_count as f64,
+        ));
+    }
+    report(ProgressEvent::Status(
+        "Firmware transfer acknowledged. Power-cycle the radio to boot the new image.".to_string(),
+    ));
+    Ok(())
+}
+
+pub(crate) fn validate_firmware_data(data: &[u8]) -> Result<()> {
+    if data.is_empty() {
+        bail!("Firmware image is empty");
+    }
+    if data.len() > 0xF800 {
+        bail!("Firmware image exceeds the radio limit of 63488 bytes");
+    }
+    Ok(())
 }
 
 pub fn send_remote_key(port_name: &str, key_code: u8) -> Result<()> {
@@ -1135,8 +1424,8 @@ where
             }
         },
         |event| {
-            if let RemoteCaptureEvent::Phase(RemoteSessionPhase::Armed) = &event {
-                schedule.reset(options.command_start_delay);
+            if let RemoteCaptureEvent::Phase(phase) = &event {
+                schedule.on_phase(*phase, options.command_start_delay);
             }
 
             match event {
@@ -1154,6 +1443,7 @@ where
                 }
                 RemoteCaptureEvent::Packet(packet) => on_event(RemoteMonitorEvent::Packet(packet)),
                 RemoteCaptureEvent::Delta(delta) => on_event(RemoteMonitorEvent::Delta(delta)),
+                RemoteCaptureEvent::Received(_) => {}
             }
         },
     )?;
@@ -1178,7 +1468,7 @@ fn remote_key_name(key_code: u8) -> &'static str {
         0x0E => "exit",
         0x0F => "*",
         0x10 => "#",
-        0x11 => "v/m",
+        0x11 => "B",
         0x12 => "flashlight",
         0x13 => "ptt-a",
         0x1A => "ptt-b",
@@ -1559,6 +1849,22 @@ pub(crate) fn validate_channels(channels: &[Channel]) -> Result<()> {
                 channel.channel_num
             );
         }
+        validate_label(&channel.name, 12, "channel name")?;
+        validate_channel_frequency(&channel.rx_freq, false)?;
+        validate_channel_frequency(&channel.tx_freq, true)?;
+        validate_tone(&channel.rx_tone)?;
+        validate_tone(&channel.tx_tone)?;
+        if !matches!(channel.bandwidth.as_str(), "Wide" | "Narrow")
+            || !matches!(channel.modulation.as_str(), "Auto" | "FM" | "AM" | "USB")
+            || channel.position > 1
+            || channel.ptt_id > 3
+            || channel.groups.iter().any(|group| *group > 15)
+        {
+            bail!(
+                "Channel {} contains an invalid mode, flag, or group slot",
+                channel.channel_num
+            );
+        }
     }
     Ok(())
 }
@@ -1568,7 +1874,28 @@ pub(crate) fn validate_scan_presets(presets: &[ScanPreset]) -> Result<()> {
         presets.iter().map(|preset| preset.index),
         SCAN_PRESET_RECORD_COUNT,
         "scan preset",
-    )
+    )?;
+    for preset in presets {
+        validate_label(&preset.label, 8, "scan preset label")?;
+        let enabled = preset.start_freq != 0;
+        if (enabled
+            && (!(1_800_000..=130_000_000).contains(&preset.start_freq)
+                || preset.range == 0
+                || preset.step == 0))
+            || preset.range > 60_000
+            || preset.step > 50_000
+            || preset.resume > 250
+            || preset.persist > 200
+            || preset.modulation > 2
+            || preset.ultrascan > 20
+        {
+            bail!(
+                "Scan preset {} contains an invalid frequency, range, step, timing, or mode",
+                preset.index
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_band_plans_payload(band_plans: &[BandPlan]) -> Result<()> {
@@ -1576,7 +1903,21 @@ pub(crate) fn validate_band_plans_payload(band_plans: &[BandPlan]) -> Result<()>
         band_plans.iter().map(|plan| plan.index),
         BAND_PLAN_RECORD_COUNT,
         "band plan",
-    )
+    )?;
+    for plan in band_plans {
+        if plan.start_freq > 130_000_000
+            || plan.end_freq > 130_000_000
+            || ((plan.start_freq != 0 || plan.end_freq != 0) && plan.start_freq >= plan.end_freq)
+            || plan.modulation > 7
+            || plan.bandwidth > 5
+        {
+            bail!(
+                "Band plan {} contains invalid frequency bounds or mode",
+                plan.index
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_dtmf_presets_payload(presets: &[DTMFPreset]) -> Result<()> {
@@ -1584,7 +1925,81 @@ pub(crate) fn validate_dtmf_presets_payload(presets: &[DTMFPreset]) -> Result<()
         presets.iter().map(|preset| preset.index),
         DTMF_PRESET_COUNT,
         "DTMF preset",
-    )
+    )?;
+    for preset in presets {
+        validate_label(&preset.label, 7, "DTMF label")?;
+        if preset.digits.len() > 9 || preset.digits.iter().any(|digit| *digit > 15) {
+            bail!(
+                "DTMF preset {} accepts at most nine digits, each from 0 to 15",
+                preset.index
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_label(value: &str, max_bytes: usize, label: &str) -> Result<()> {
+    if value.len() > max_bytes
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+    {
+        bail!("{label} must contain at most {max_bytes} printable ASCII bytes");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_group_labels_payload(labels: &[String]) -> Result<()> {
+    if labels.len() > GROUP_LABEL_COUNT {
+        bail!("Radio supports at most {GROUP_LABEL_COUNT} group labels");
+    }
+    for label in labels {
+        validate_label(label, GROUP_LABEL_TEXT_SIZE, "group label")?;
+    }
+    Ok(())
+}
+
+fn validate_channel_frequency(value: &str, allow_zero: bool) -> Result<()> {
+    let parsed = value
+        .parse::<f64>()
+        .context("Channel frequency must be numeric MHz")?;
+    if !parsed.is_finite() || !((18.0..=1300.0).contains(&parsed) || allow_zero && parsed == 0.0) {
+        bail!(
+            "Channel frequency must be 18-1300 MHz{}",
+            if allow_zero {
+                " or 0 for TX disabled"
+            } else {
+                ""
+            }
+        );
+    }
+    let scaled = parsed * 100_000.0;
+    if (scaled - scaled.round()).abs() > 0.00001 {
+        bail!("Channel frequency must be representable in 10 Hz steps");
+    }
+    Ok(())
+}
+
+fn validate_tone(value: &str) -> Result<()> {
+    if value.is_empty() || value.eq_ignore_ascii_case("off") {
+        return Ok(());
+    }
+    let upper = value.to_ascii_uppercase();
+    if let Some(dcs) = upper.strip_prefix('D') {
+        let digits = dcs.strip_suffix(['I', 'N']).unwrap_or(dcs);
+        if digits.is_empty() || digits.len() > 3 || u16::from_str_radix(digits, 8).is_err() {
+            bail!("Invalid DCS tone {value:?}: use octal D000-D777 with optional n/i suffix");
+        }
+        return Ok(());
+    }
+    let tone = value.parse::<f64>().context("Invalid CTCSS tone")?;
+    if !tone.is_finite()
+        || !(0.0..=300.0).contains(&tone)
+        || (tone * 10.0 - (tone * 10.0).round()).abs() > 0.00001
+    {
+        bail!("CTCSS tone must be 0-300 Hz in 0.1 Hz steps");
+    }
+    Ok(())
 }
 
 fn validate_indexed_items<I>(indices: I, max_len: usize, label: &str) -> Result<()>
@@ -1815,6 +2230,65 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn normal_reads_select_responsive_serial_but_keep_ble_conservative() {
+        use crate::protocol::radio::ReadTiming;
+
+        for port in [
+            "/dev/ttyUSB0",
+            "/dev/cu.usbserial-test",
+            "COM3",
+            "/dev/pts/1",
+        ] {
+            assert_eq!(super::normal_read_timing(port), ReadTiming::Responsive);
+        }
+        for port in ["ble://read-test", "ble:read-test"] {
+            assert_eq!(super::normal_read_timing(port), ReadTiming::Conservative);
+        }
+        assert_eq!(ReadTiming::default(), ReadTiming::Conservative);
+    }
+
+    #[test]
+    fn semantic_validation_rejects_lossy_or_invalid_payloads() {
+        let channel = crate::protocol::Channel {
+            channel_num: 1,
+            name: "TEST".into(),
+            rx_freq: "145.35000".into(),
+            tx_freq: "0".into(),
+            rx_tone: "D023n".into(),
+            tx_tone: "Off".into(),
+            bandwidth: "Wide".into(),
+            modulation: "FM".into(),
+            ..Default::default()
+        };
+        assert!(super::validate_channels(std::slice::from_ref(&channel)).is_ok());
+        for value in ["NaN", "inf", "-145", "not a frequency", "145.000001"] {
+            let mut invalid = channel.clone();
+            invalid.rx_freq = value.into();
+            assert!(super::validate_channels(&[invalid]).is_err(), "{value}");
+        }
+        for tone in ["D089n", "D1000n", "garbage", "NaN", "301"] {
+            let mut invalid = channel.clone();
+            invalid.tx_tone = tone.into();
+            assert!(super::validate_channels(&[invalid]).is_err(), "{tone}");
+        }
+        let mut preset = crate::protocol::ScanPreset {
+            start_freq: 14_500_000,
+            range: 100,
+            step: 1250,
+            ..Default::default()
+        };
+        assert!(super::validate_scan_presets(&[preset.clone()]).is_ok());
+        preset.step = 0;
+        assert!(super::validate_scan_presets(&[preset]).is_err());
+        let invalid = crate::protocol::DTMFPreset {
+            index: 0,
+            digits: vec![255; 11],
+            label: String::new(),
+        };
+        assert!(super::validate_dtmf_presets_payload(&[invalid]).is_err());
+    }
+
+    #[test]
     fn sorts_usb_radio_ports_ahead_of_auxiliary_ports() {
         let mut ports = [
             "/dev/cu.Bluetooth-Incoming-Port".to_string(),
@@ -1887,19 +2361,56 @@ mod tests {
     }
 
     #[test]
-    fn remote_command_schedule_resets_when_session_rearms() {
-        let schedule = super::RemoteCommandSchedule::new(Duration::from_millis(250));
+    fn remote_command_schedule_resets_only_for_new_sessions() {
+        use crate::remote::RemoteSessionPhase;
 
-        assert!(!schedule.command_due(Duration::from_millis(249)));
-        assert!(schedule.command_due(Duration::from_millis(250)));
+        let start_delay = Duration::from_millis(200);
+        let schedule = super::RemoteCommandSchedule::new(start_delay);
 
-        schedule.mark_sent(Duration::from_millis(250), Duration::from_millis(350));
-        assert!(!schedule.command_due(Duration::from_millis(599)));
-        assert!(schedule.command_due(Duration::from_millis(600)));
+        schedule.on_phase(RemoteSessionPhase::Opening, start_delay);
+        schedule.on_phase(RemoteSessionPhase::Armed, start_delay);
+        assert!(!schedule.command_due(Duration::from_millis(199)));
+        assert!(schedule.command_due(start_delay));
 
-        schedule.reset(Duration::from_millis(250));
-        assert!(!schedule.command_due(Duration::from_millis(249)));
-        assert!(schedule.command_due(Duration::from_millis(250)));
+        schedule.mark_sent(start_delay, Duration::from_millis(200));
+        for phase in [
+            RemoteSessionPhase::Probing,
+            RemoteSessionPhase::Armed,
+            RemoteSessionPhase::Live,
+        ] {
+            schedule.on_phase(phase, start_delay);
+            assert!(!schedule.command_due(Duration::from_millis(399)));
+            assert!(schedule.command_due(Duration::from_millis(400)));
+        }
+
+        schedule.on_phase(RemoteSessionPhase::Recovering, start_delay);
+        assert!(!schedule.command_due(start_delay));
+        schedule.on_phase(RemoteSessionPhase::Opening, start_delay);
+        schedule.on_phase(RemoteSessionPhase::Armed, start_delay);
+        assert!(!schedule.command_due(Duration::from_millis(199)));
+        assert!(schedule.command_due(start_delay));
+    }
+
+    #[test]
+    fn remote_command_schedule_rejects_stale_elapsed_after_send() {
+        use crate::remote::RemoteSessionPhase;
+
+        let start_delay = Duration::from_millis(200);
+        let schedule = super::RemoteCommandSchedule::new(start_delay);
+        let elapsed = Duration::from_millis(230);
+        assert!(schedule.command_due(elapsed));
+        schedule.mark_sent(elapsed, Duration::from_millis(200));
+        schedule.on_phase(RemoteSessionPhase::Probing, start_delay);
+        schedule.on_phase(RemoteSessionPhase::Armed, start_delay);
+
+        // The session's send loop can reuse the pre-command elapsed value.
+        assert!(!schedule.command_due(elapsed));
+        assert!(!schedule.command_due(Duration::from_millis(429)));
+        assert!(schedule.command_due(Duration::from_millis(430)));
+        schedule.mark_sent(Duration::from_millis(600), Duration::from_millis(200));
+        assert!(!schedule.command_due(Duration::from_millis(600)));
+        assert!(!schedule.command_due(Duration::from_millis(799)));
+        assert!(schedule.command_due(Duration::from_millis(800)));
     }
 
     #[test]
@@ -1958,7 +2469,7 @@ mod tests {
                 && region.first_non_ff_offset == Some(0x1AE0)
         }));
         assert!(unknown_regions.iter().any(|region| {
-            region.start_offset == 0x1DF4
+            region.start_offset == 0x1DE0
                 && region.end_offset_exclusive == EEPROM_SIZE
                 && region.non_ff_bytes == 1
                 && region.first_non_ff_offset == Some(0x1E10)

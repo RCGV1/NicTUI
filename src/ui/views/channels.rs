@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::channel_file::is_populated_channel;
 use crate::protocol::{group_label, group_letter};
 use crate::ui::theme::{
     COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_SELECTION_BG, COLOR_SELECTION_FG, COLOR_SURFACE_1,
@@ -57,13 +58,18 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(area);
 
-    let active_loaded = app
+    let remaining = app
         .channels
         .iter()
         .filter(|ch| !app.deleted_channels.contains(&ch.channel_num))
         .collect::<Vec<_>>();
-    let active_count = active_loaded.iter().filter(|ch| ch.position == 1).count();
-    let parked_count = active_loaded.len().saturating_sub(active_count);
+    let active_loaded = remaining
+        .iter()
+        .copied()
+        .filter(|ch| is_populated_channel(ch))
+        .collect::<Vec<_>>();
+    let active_count = active_loaded.len();
+    let empty_count = remaining.len().saturating_sub(active_count);
     let wide_count = active_loaded
         .iter()
         .filter(|ch| ch.bandwidth == "Wide")
@@ -75,10 +81,10 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
         .count();
 
     let summary = Paragraph::new(format!(
-        "{} loaded | {} active | {} parked | {} wide | {} narrow | {} FM",
+        "{} loaded | {} active | {} empty | {} wide | {} narrow | {} FM",
         app.channels.len(),
         active_count,
-        parked_count,
+        empty_count,
         wide_count,
         narrow_count,
         fm_count
@@ -162,7 +168,7 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
                     .fg(COLOR_ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
-            Cell::from("Power").style(
+            Cell::from("Pwr raw").style(
                 Style::default()
                     .fg(COLOR_ACCENT)
                     .add_modifier(Modifier::BOLD),
@@ -189,7 +195,7 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
 
     let rows = app.channels.iter().enumerate().map(|(i, ch)| {
         let is_deleted = app.deleted_channels.contains(&ch.channel_num);
-        let is_inactive = ch.position == 0;
+        let is_inactive = !is_populated_channel(ch);
         let is_selected = Some(i) == app.channel_state.selected();
 
         let style = if is_deleted {
@@ -282,7 +288,7 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
                 Constraint::Length(10),
                 Constraint::Length(8),
                 Constraint::Length(8),
-                Constraint::Length(6),
+                Constraint::Length(7),
                 Constraint::Length(4),
                 Constraint::Length(4),
                 Constraint::Min(10),
@@ -319,7 +325,11 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
 
     let detail_block = Block::default()
         .borders(Borders::ALL)
-        .title(" Selected Channel ")
+        .title(if chunks[2].width >= 60 {
+            " Selected Channel | Power: raw PWM, not watts "
+        } else {
+            " Selected Channel "
+        })
         .border_style(Style::default().fg(COLOR_BORDER))
         .bg(COLOR_SURFACE_1);
     let detail_inner = detail_block.inner(chunks[2]);
@@ -335,8 +345,8 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
         };
         if compact {
             let header_width = detail_inner.width.saturating_sub(9) as usize;
-            let freq_width = detail_inner.width.saturating_sub(10) as usize;
-            let tone_width = detail_inner.width.saturating_sub(21) as usize;
+            let freq_width = detail_inner.width as usize;
+            let tone_width = detail_inner.width as usize;
             let detail_lines = vec![
                 Line::from(vec![
                     Span::styled(
@@ -360,7 +370,7 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
                 )),
                 Line::from(truncate_line(
                     &format!(
-                        "Tone {} | Pwr {} | Group {}",
+                        "Tone {} | Pwr raw {} | Group {}",
                         compact_tone(&channel.rx_tone, &channel.tx_tone),
                         power,
                         groups
@@ -431,7 +441,7 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
 
             let right = Paragraph::new(vec![
                 Line::from(vec![
-                    Span::styled("Power ", Style::default().fg(COLOR_DIM)),
+                    Span::styled("Pwr raw ", Style::default().fg(COLOR_DIM)),
                     Span::styled(power, Style::default().fg(COLOR_TEXT)),
                 ]),
                 Line::from(vec![
@@ -493,7 +503,6 @@ fn compact_mode(bandwidth: &str, modulation: &str) -> String {
 fn display_power(power: u8) -> String {
     match power {
         0 => "Off".to_string(),
-        0xFF => "Unset".to_string(),
         value => value.to_string(),
     }
 }
@@ -519,10 +528,93 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_power_uses_plain_language_for_sentinel_values() {
+    fn channel_availability_counts_and_row_styles_use_rx_not_position() {
+        use crate::protocol::Channel;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let populated = Channel {
+            channel_num: 1,
+            name: "AVAILABLE".to_string(),
+            rx_freq: "145.35000".to_string(),
+            tx_freq: "0".to_string(),
+            bandwidth: "Wide".to_string(),
+            modulation: "FM".to_string(),
+            ..Channel::default()
+        };
+        let mut app = App::new();
+        app.channels = vec![
+            populated.clone(),
+            Channel {
+                channel_num: 2,
+                name: "EMPTY".to_string(),
+                rx_freq: "0".to_string(),
+                position: 1,
+                bandwidth: "Narrow".to_string(),
+                ..populated.clone()
+            },
+            Channel {
+                channel_num: 3,
+                name: "DELETED".to_string(),
+                ..populated
+            },
+        ];
+        app.deleted_channels = vec![3];
+        app.channel_state.select(None);
+        let mut previous: Option<ratatui::buffer::Buffer> = None;
+        for position in [0, 1] {
+            app.channels[0].position = position;
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            terminal
+                .draw(|frame| render_channels_table(frame, &mut app, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows = (0..30)
+                .map(|y| {
+                    (0..120)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                rows[0].contains("3 loaded | 1 active | 1 empty"),
+                "{}",
+                rows[0]
+            );
+            assert!(rows[0].contains("1 wide | 0 narrow | 1 FM"), "{}", rows[0]);
+            assert!(rows.iter().any(|row| row.contains("2 (OFF)")));
+            assert!(rows.iter().any(|row| row.contains("3 (DEL)")));
+            assert!(!rows.iter().any(|row| row.contains("1 (OFF)")));
+            for (name, italic, crossed_out) in [
+                ("AVAILABLE", false, false),
+                ("EMPTY", true, false),
+                ("DELETED", false, true),
+            ] {
+                let y = rows.iter().position(|row| row.contains(name)).unwrap() as u16;
+                let x = (0..120)
+                    .find(|&x| buffer[(x, y)].symbol() == &name[..1])
+                    .unwrap();
+                let style = &buffer[(x, y)];
+                assert_eq!(style.modifier.contains(Modifier::ITALIC), italic, "{name}");
+                assert_eq!(
+                    style.modifier.contains(Modifier::CROSSED_OUT),
+                    crossed_out,
+                    "{name}"
+                );
+            }
+            if let Some(previous) = previous.as_ref() {
+                assert_eq!(buffer, previous);
+            }
+            previous = Some(buffer.clone());
+        }
+    }
+
+    #[test]
+    fn display_power_preserves_all_nonzero_raw_pwm_values() {
         assert_eq!(display_power(0), "Off");
-        assert_eq!(display_power(0xFF), "Unset");
-        assert_eq!(display_power(7), "7");
+        assert_eq!(display_power(255), "255");
+        for power in 1..=255 {
+            assert_eq!(display_power(power), power.to_string());
+        }
     }
 
     #[test]
@@ -530,5 +622,75 @@ mod tests {
         assert_eq!(truncate_line("Memory Group Alpha", 9), "Memory...");
         assert_eq!(truncate_line("ABC", 2), "AB");
         assert_eq!(truncate_line("ABC", 3), "ABC");
+    }
+
+    #[test]
+    fn compact_details_keep_complete_frequencies_and_group_name() {
+        use crate::protocol::Channel;
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new();
+        app.channels = vec![Channel {
+            channel_num: 123,
+            name: "Repeater".to_string(),
+            rx_freq: "146.52000".to_string(),
+            tx_freq: "146.52000".to_string(),
+            rx_tone: "Off".to_string(),
+            tx_tone: "Off".to_string(),
+            bandwidth: "Wide".to_string(),
+            modulation: "FM".to_string(),
+            power: 7,
+            groups: [1, 0, 0, 0],
+            ..Channel::default()
+        }];
+        app.group_labels = vec!["Local".to_string()];
+        app.channel_state.select(Some(0));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render_channels_table(frame, &mut app, Rect::new(20, 3, 60, 19)))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (17..22)
+            .flat_map(|y| (20..80).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(text.contains("RX 146.52000 | TX 146.52000"), "{text}");
+        assert!(
+            text.contains("Tone Off | Pwr raw 7 | Group Local"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn maximum_raw_power_is_numeric_and_not_watts_at_requested_sizes() {
+        use crate::protocol::Channel;
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new();
+        app.channels = vec![Channel {
+            power: 255,
+            ..Channel::default()
+        }];
+        app.channel_state.select(Some(0));
+        for (width, height, sidebar) in [(80, 24, 20), (100, 30, 22), (160, 45, 28), (180, 50, 28)]
+        {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_channels_table(
+                        frame,
+                        &mut app,
+                        Rect::new(sidebar, 3, width - sidebar, height - 5),
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = (3..height - 2)
+                .flat_map(|y| (sidebar..width).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>();
+            assert!(text.contains("Pwr raw 255"), "{width}x{height}: {text}");
+            assert!(
+                text.contains("raw PWM, not watts"),
+                "{width}x{height}: {text}"
+            );
+            assert!(!text.contains("Unset"));
+        }
     }
 }

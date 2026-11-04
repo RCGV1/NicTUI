@@ -3,7 +3,7 @@ use crate::app::MainTab;
 use crate::protocol::SETTINGS_METADATA;
 use crate::ui::theme::{
     COLOR_BORDER, COLOR_DIM, COLOR_PRIMARY, COLOR_SELECTION_BG, COLOR_SELECTION_FG, COLOR_SIDEBAR,
-    COLOR_SUCCESS, COLOR_SURFACE_2, COLOR_TEXT, COLOR_WARNING,
+    COLOR_SURFACE_2, COLOR_TEXT, COLOR_WARNING,
 };
 use ratatui::{
     Frame,
@@ -25,9 +25,9 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .constraints([Constraint::Length(5), Constraint::Min(0)])
         .split(inner);
-    let content_width = sections[1].width.saturating_sub(2) as usize;
+    let content_width = sections[1].width.saturating_sub(4) as usize;
     let session_width = sections[0].width.saturating_sub(4) as usize;
 
     let has_target = app.selected_port_candidate().is_some();
@@ -35,6 +35,8 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
     let changes = [
         app.channels_dirty || !app.deleted_channels.is_empty(),
         app.settings_dirty,
+        app.scan_presets_dirty,
+        app.band_plans_dirty,
         app.dtmf_dirty,
         app.group_labels_dirty,
     ]
@@ -60,9 +62,9 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
             ),
             Span::raw(" "),
             Span::styled(
-                if has_target { "ready" } else { "idle" },
+                if has_target { "target" } else { "none" },
                 Style::default()
-                    .fg(if has_target { COLOR_SUCCESS } else { COLOR_DIM })
+                    .fg(if has_target { COLOR_PRIMARY } else { COLOR_DIM })
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -155,10 +157,10 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
         ),
     ];
 
-    let body_chunks = if sections[1].height >= 14 {
+    let body_chunks = if sections[1].height >= 17 {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(8), Constraint::Length(5)])
+            .constraints([Constraint::Min(12), Constraint::Length(5)])
             .split(sections[1])
             .to_vec()
     } else {
@@ -191,6 +193,11 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
             };
             let (label_display, badge_display) =
                 fit_sidebar_row(index, label, &badge, content_width);
+            let row_label = if app.remote_active {
+                label_display
+            } else {
+                format!("{index}. {label_display}")
+            };
             let mut spans = vec![
                 Span::styled(
                     if active { ">" } else { " " },
@@ -204,7 +211,7 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
                     },
                 ),
                 Span::raw(" "),
-                Span::styled(format!("{index}. {label_display}"), style),
+                Span::styled(row_label, style),
             ];
             if !badge_display.is_empty() {
                 spans.push(Span::raw(" "));
@@ -218,10 +225,14 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Navigate ")
+            .title(if app.remote_active {
+                " Views (Tab) "
+            } else {
+                " Navigate "
+            })
             .border_style(Style::default().fg(COLOR_BORDER))
             .bg(COLOR_SIDEBAR)
-            .padding(Padding::symmetric(1, 1)),
+            .padding(Padding::horizontal(1)),
     );
     f.render_widget(list, body_chunks[0]);
 
@@ -247,7 +258,28 @@ fn fit_session_status(transport: &str, dirty: &str, max_width: usize) -> (String
         return (String::new(), String::new());
     }
 
+    let transport = transport.trim();
     let dirty = dirty.trim();
+    let total_width =
+        transport.chars().count() + dirty.chars().count() + if dirty.is_empty() { 0 } else { 2 };
+    if total_width <= max_width {
+        return (transport.to_string(), dirty.to_string());
+    }
+
+    let transport = if let Some(rest) = transport.strip_prefix("BLE ready") {
+        format!("BLE{rest}")
+    } else if let Some(rest) = transport.strip_prefix("BLE target") {
+        format!("BLE{rest}")
+    } else if let Some(rest) = transport.strip_prefix("BLE reconnect needed") {
+        format!("BLE reconnect{rest}")
+    } else {
+        transport.to_string()
+    };
+    let dirty = if dirty == "Clean" && transport.chars().count() + 7 > max_width {
+        ""
+    } else {
+        dirty
+    };
     let dirty_width = dirty.chars().count();
     if dirty_width >= max_width {
         return (String::new(), fit_word_boundary(dirty, max_width));
@@ -259,6 +291,16 @@ fn fit_session_status(transport: &str, dirty: &str, max_width: usize) -> (String
         return (String::new(), dirty.to_string());
     }
 
+    // Never leave a partial RSSI value or detach its unit at the right edge.
+    let transport = if transport.chars().count() > transport_width {
+        transport
+            .strip_suffix(" dBm")
+            .and_then(|label| label.rsplit_once(' '))
+            .filter(|(_, value)| value.parse::<i32>().is_ok())
+            .map_or(transport.as_str(), |(state, _)| state)
+    } else {
+        transport.as_str()
+    };
     (
         fit_word_boundary(transport, transport_width),
         dirty.to_string(),
@@ -280,7 +322,8 @@ fn fit_sidebar_row(
     }
 
     let badge = badge.trim();
-    let show_badge = !badge.is_empty() && available > badge.len() + 4;
+    let badge_label = compact_sidebar_label(label, available.saturating_sub(badge.len() + 1));
+    let show_badge = !badge.is_empty() && available > badge_label.chars().count() + badge.len();
     let label_width = if show_badge {
         available.saturating_sub(badge.len() + 1)
     } else {
@@ -375,11 +418,15 @@ fn sidebar_badge(app: &App, tab: MainTab) -> String {
             badge
         }
         MainTab::Scanning => {
-            if app.scan_presets.is_empty() {
+            let mut badge = if app.scan_presets.is_empty() {
                 String::new()
             } else {
                 app.scan_presets.len().to_string()
+            };
+            if app.scan_presets_dirty {
+                badge.push('*');
             }
+            badge
         }
         MainTab::MemoryGroups => {
             let named_groups = app
@@ -398,11 +445,15 @@ fn sidebar_badge(app: &App, tab: MainTab) -> String {
             badge
         }
         MainTab::BandPlan => {
-            if app.band_plans.is_empty() {
+            let mut badge = if app.band_plans.is_empty() {
                 String::new()
             } else {
                 app.band_plans.len().to_string()
+            };
+            if app.band_plans_dirty {
+                badge.push('*');
             }
+            badge
         }
         MainTab::DTMF => {
             let mut badge = if app.dtmf_presets.is_empty() {
@@ -417,7 +468,7 @@ fn sidebar_badge(app: &App, tab: MainTab) -> String {
         }
         MainTab::Remote => {
             if app.remote_active {
-                "live".to_string()
+                "open".to_string()
             } else {
                 "idle".to_string()
             }
@@ -498,8 +549,51 @@ fn sidebar_context_lines(app: &App, active_tab: MainTab, width: usize) -> Vec<Li
                 Style::default().fg(COLOR_TEXT),
             )),
             Line::from(Span::styled(
-                fit_word_boundary("R refresh", width),
-                Style::default().fg(COLOR_DIM),
+                fit_word_boundary(
+                    if app.scan_presets_dirty {
+                        "w write changes"
+                    } else {
+                        "r read"
+                    },
+                    width,
+                ),
+                Style::default().fg(if app.scan_presets_dirty {
+                    COLOR_WARNING
+                } else {
+                    COLOR_DIM
+                }),
+            )),
+        ],
+        MainTab::BandPlan => vec![
+            Line::from(Span::styled(
+                "Band Plan",
+                Style::default().fg(COLOR_PRIMARY).bold(),
+            )),
+            Line::from(Span::styled(
+                fit_word_boundary(
+                    if app.band_plans.is_empty() {
+                        "Read band plan first"
+                    } else {
+                        "Enter edits"
+                    },
+                    width,
+                ),
+                Style::default().fg(COLOR_TEXT),
+            )),
+            Line::from(Span::styled(
+                fit_word_boundary(
+                    if app.band_plans_dirty {
+                        "w write changes"
+                    } else {
+                        "r read"
+                    },
+                    width,
+                ),
+                Style::default().fg(if app.band_plans_dirty {
+                    COLOR_WARNING
+                } else {
+                    COLOR_DIM
+                }),
             )),
         ],
         _ => vec![
@@ -514,7 +608,14 @@ fn sidebar_context_lines(app: &App, active_tab: MainTab, width: usize) -> Vec<Li
                 Style::default().fg(COLOR_TEXT),
             )),
             Line::from(Span::styled(
-                fit_word_boundary("1-9 navigate", width),
+                fit_word_boundary(
+                    if app.remote_active {
+                        "D details  p stop"
+                    } else {
+                        "0-9 navigate"
+                    },
+                    width,
+                ),
                 Style::default().fg(COLOR_DIM),
             )),
         ],
@@ -554,10 +655,54 @@ mod tests {
     }
 
     #[test]
-    fn session_status_preserves_clean_label() {
+    fn session_status_preserves_reconnect_warning_before_clean_badge() {
         let (transport, dirty) = fit_session_status("BLE reconnect needed -69 dBm", "Clean", 18);
-        assert_eq!(transport, "BLE..");
-        assert_eq!(dirty, "Clean");
+        assert_eq!(transport, "BLE reconnect");
+        assert_eq!(dirty, "");
+    }
+
+    #[test]
+    fn session_status_compacts_ble_before_truncating_rssi() {
+        for state in ["ready", "target"] {
+            for rssi in [-58, -128] {
+                for width in [26, 23, 17, 15] {
+                    let (transport, dirty) =
+                        fit_session_status(&format!("BLE {state} {rssi} dBm"), "Clean", width);
+                    assert!(transport.contains(&format!("{rssi} dBm")), "{transport}");
+                    let gap = usize::from(!dirty.is_empty()) * 2;
+                    assert!(transport.len() + gap + dirty.len() <= width);
+                }
+            }
+        }
+        let (transport, dirty) = fit_session_status("BLE ready -58 dBm", "1 dirty", 15);
+        assert_eq!(transport, "BLE");
+        assert_eq!(dirty, "1 dirty");
+    }
+
+    #[test]
+    fn sidebar_session_retains_rssi_unit_at_requested_terminal_sizes() {
+        use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+        let app = App::demo();
+        for (width, height, sidebar) in [(180, 50, 28), (100, 30, 22), (80, 24, 20)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    super::render_sidebar(
+                        frame,
+                        &app,
+                        Rect::new(0, 3, sidebar, height - 5),
+                        MainTab::Remote,
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let line = (0..sidebar)
+                .map(|x| buffer[(x, 6)].symbol())
+                .collect::<String>();
+            assert!(line.contains("BLE"));
+            assert!(line.contains("-58 dBm"), "{width}x{height}: {line}");
+            assert!(!line.contains(".."), "{width}x{height}: {line}");
+        }
     }
 
     #[test]
@@ -567,5 +712,50 @@ mod tests {
         assert_eq!(sidebar_badge(&app, MainTab::Settings), "");
         assert_eq!(sidebar_badge(&app, MainTab::MemoryGroups), "");
         assert_eq!(sidebar_badge(&app, MainTab::Codeplug), "");
+    }
+
+    #[test]
+    fn scan_and_band_badges_keep_unsaved_markers() {
+        use crate::protocol::{BandPlan, ScanPreset};
+        let mut app = App::new();
+        app.scan_presets.push(ScanPreset::default());
+        app.band_plans.push(BandPlan::default());
+        app.scan_presets_dirty = true;
+        app.band_plans_dirty = true;
+        assert_eq!(sidebar_badge(&app, MainTab::Scanning), "1*");
+        assert_eq!(sidebar_badge(&app, MainTab::BandPlan), "1*");
+        app.scan_presets_dirty = false;
+        app.band_plans_dirty = false;
+        assert_eq!(sidebar_badge(&app, MainTab::Scanning), "1");
+        assert_eq!(sidebar_badge(&app, MainTab::BandPlan), "1");
+    }
+
+    #[test]
+    fn short_sidebar_keeps_all_ten_views_visible() {
+        use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+        let mut app = App::new();
+        for remote_active in [false, true] {
+            app.remote_active = remote_active;
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    super::render_sidebar(frame, &app, Rect::new(0, 3, 20, 19), MainTab::Remote)
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = (3..22)
+                .flat_map(|y| (0..20).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>();
+            for label in [
+                "Channels", "Settings", "Scan", "Groups", "Band", "DTMF", "Remote", "Codeplug",
+                "Flash", "Logs",
+            ] {
+                assert!(text.contains(label), "missing {label}: {text}");
+            }
+            if remote_active {
+                assert!(text.contains("Views (Tab)"));
+                assert!(!text.contains("1. Channels"));
+            }
+        }
     }
 }

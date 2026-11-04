@@ -2,13 +2,14 @@ use super::common::{
     SCAN_PRESET_EDITOR_HEIGHT, SCAN_PRESET_EDITOR_WIDTH, begin_editor, render_option_popup,
 };
 use crate::app::{App, AppMode};
+use crate::protocol::editor_value::{SCAN_MODULATIONS, decimal_value, option_label};
 use crate::ui::theme::*;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
 
 pub(crate) fn render_scan_preset_editor(f: &mut Frame, app: &App) {
@@ -22,6 +23,9 @@ pub(crate) fn render_scan_preset_editor(f: &mut Frame, app: &App) {
         SCAN_PRESET_EDITOR_WIDTH,
         SCAN_PRESET_EDITOR_HEIGHT,
     );
+    if inner_area.width < 2 || inner_area.height < 2 {
+        return;
+    }
 
     let current_field_idx = if let AppMode::EditScanPreset(idx) = app.mode {
         idx
@@ -31,21 +35,17 @@ pub(crate) fn render_scan_preset_editor(f: &mut Frame, app: &App) {
 
     let fields = [
         ("Label", sp.label.clone(), false),
-        (
-            "Start Freq",
-            format!("{:.5}", sp.start_freq as f64 / 100000.0),
-            false,
-        ),
-        ("Range (MHz)", sp.range.to_string(), false),
-        ("Step (Hz)", sp.step.to_string(), false),
-        ("Persist (s)", sp.persist.to_string(), false),
+        ("Start (MHz)", decimal_value(sp.start_freq, 5), false),
+        ("Range (MHz)", decimal_value(sp.range as u32, 2), false),
+        ("Step (kHz)", decimal_value(sp.step as u32, 2), false),
+        ("Persist (s)", decimal_value(sp.persist as u32, 1), false),
         ("Resume (s)", sp.resume.to_string(), false),
         (
             "Modulation",
-            modulation_label(sp.modulation).to_string(),
+            option_label(SCAN_MODULATIONS, sp.modulation),
             true,
         ),
-        ("Ultrascan", ultrascan_label(sp.ultrascan).to_string(), true),
+        ("Ultrascan (raw)", sp.ultrascan.to_string(), false),
     ];
     let current_value = &fields[current_field_idx].1;
     let (help_title, help_body) = scan_field_help(current_field_idx);
@@ -53,7 +53,7 @@ pub(crate) fn render_scan_preset_editor(f: &mut Frame, app: &App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(10),
             Constraint::Length(1),
         ])
@@ -80,29 +80,30 @@ pub(crate) fn render_scan_preset_editor(f: &mut Frame, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("Start ", Style::default().fg(COLOR_PRIMARY)),
-            Span::raw(format!("{:.5}", sp.start_freq as f64 / 100000.0)),
+            Span::raw(decimal_value(sp.start_freq, 5)),
             Span::raw(" | "),
             Span::styled("Range ", Style::default().fg(COLOR_PRIMARY)),
-            Span::raw(format!("{} MHz", sp.range)),
+            Span::raw(format!("{} MHz", decimal_value(sp.range as u32, 2))),
             Span::raw(" | "),
             Span::styled("Step ", Style::default().fg(COLOR_PRIMARY)),
-            Span::raw(format!("{} Hz", sp.step)),
+            Span::raw(format!("{} kHz", decimal_value(sp.step as u32, 2))),
         ]),
         Line::from(vec![
             Span::styled("Resume ", Style::default().fg(COLOR_PRIMARY)),
             Span::raw(format!("{}s", sp.resume)),
             Span::raw(" | "),
             Span::styled("Persist ", Style::default().fg(COLOR_PRIMARY)),
-            Span::raw(format!("{}s", sp.persist)),
+            Span::raw(format!("{}s", decimal_value(sp.persist as u32, 1))),
             Span::raw(" | "),
             Span::styled("Mode ", Style::default().fg(COLOR_PRIMARY)),
-            Span::raw(modulation_label(sp.modulation)),
+            Span::raw(option_label(SCAN_MODULATIONS, sp.modulation)),
             Span::raw(" | "),
-            Span::styled("Ultra ", Style::default().fg(COLOR_PRIMARY)),
-            Span::raw(ultrascan_label(sp.ultrascan)),
+            Span::styled("Ultra raw ", Style::default().fg(COLOR_PRIMARY)),
+            Span::raw(sp.ultrascan.to_string()),
         ]),
     ])
     .style(Style::default().fg(COLOR_TEXT))
+    .wrap(ratatui::widgets::Wrap { trim: true })
     .block(Block::default().borders(Borders::BOTTOM).title(" Summary "));
     f.render_widget(summary, vertical[0]);
 
@@ -128,14 +129,9 @@ pub(crate) fn render_scan_preset_editor(f: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(help_body),
-        Line::default(),
-        Line::from(if fields[current_field_idx].2 {
-            "Use ←/→ to change the selected option."
-        } else {
-            "Type to edit the value directly."
-        }),
     ])
     .style(Style::default().fg(COLOR_TEXT))
+    .wrap(ratatui::widgets::Wrap { trim: true })
     .block(Block::default().borders(Borders::ALL).title(" Details "));
     f.render_widget(details, body[0]);
 
@@ -168,66 +164,52 @@ pub(crate) fn render_scan_preset_editor(f: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(" ");
-    f.render_widget(table, body[1]);
+    let mut state = TableState::default();
+    state.select(Some(current_field_idx));
+    f.render_stateful_widget(table, body[1], &mut state);
 
     if fields[current_field_idx].2 {
         let options = match current_field_idx {
-            6 => vec!["FM", "AM", "USB"],
-            7 => vec!["0", "1", "2"],
+            6 => SCAN_MODULATIONS.to_vec(),
             _ => vec![],
         };
         render_option_popup(f, area, &options, app.selection_index);
     }
 
     f.render_widget(
-        Paragraph::new("↑/↓/Tab: Field | ←/→: Change Option | Enter: Save | Esc: Cancel")
-            .style(Style::default().fg(COLOR_DIM))
-            .alignment(ratatui::layout::Alignment::Center),
+        Paragraph::new(if app.status_message.starts_with("Invalid scan:") {
+            app.status_message.as_str()
+        } else {
+            "↑/↓/Tab: Field | ←/→: Option | Enter: Save | Esc: Cancel"
+        })
+        .style(
+            Style::default().fg(if app.status_message.starts_with("Invalid scan:") {
+                COLOR_WARNING
+            } else {
+                COLOR_DIM
+            }),
+        )
+        .alignment(ratatui::layout::Alignment::Center),
         vertical[2],
     );
 }
 
-fn modulation_label(modulation: u8) -> &'static str {
-    match modulation {
-        1 => "AM",
-        2 => "USB",
-        _ => "FM",
-    }
-}
-
-fn ultrascan_label(ultrascan: u8) -> &'static str {
-    match ultrascan {
-        1 => "1",
-        2 => "2",
-        _ => "0",
-    }
-}
-
 fn scan_field_help(field_idx: usize) -> (&'static str, &'static str) {
     match field_idx {
-        0 => (
-            "Preset Label",
-            "Short name shown in the scan preset list and summaries.",
-        ),
+        0 => ("Preset Label", "Up to 8 printable ASCII characters."),
         1 => (
             "Start Frequency",
-            "Enter the scan start frequency in MHz, for example 118.00000.",
+            "18-1300 MHz in 10 Hz increments. 0 disables this preset.",
         ),
         2 => (
             "Range",
-            "Scan span in MHz starting from the selected start frequency.",
+            "Scan span: 0.01-600.00 MHz, in 0.01 MHz increments.",
         ),
-        3 => (
-            "Step",
-            "Tuning step in Hz used while scanning through the range.",
-        ),
-        4 => (
-            "Persist",
-            "How long to stay on an active frequency before moving on.",
-        ),
+        3 => ("Step", "0.01-500.00 kHz, in 0.01 kHz (10 Hz) increments."),
+        4 => ("Persist", "Hold after signal loss: 0.0-20.0 seconds."),
         5 => (
             "Resume",
-            "Delay before the scan resumes after activity stops.",
+            "Resume while signal remains: 0-250 seconds; 0 disables.",
         ),
         6 => (
             "Modulation",
@@ -235,8 +217,84 @@ fn scan_field_help(field_idx: usize) -> (&'static str, &'static str) {
         ),
         7 => (
             "Ultrascan",
-            "Select the radio's ultrascan tail value. The current firmware exposes 0, 1, and 2.",
+            "Raw level 0-20; 0=Off. Type a value or use left/right.",
         ),
         _ => ("Field", ""),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{BandPlan, DTMFPreset, ScanPreset};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn render(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| match app.mode {
+                AppMode::EditScanPreset(_) => render_scan_preset_editor(frame, app),
+                AppMode::EditBandPlan(_) => crate::ui::editors::render_bandplan_editor(frame, app),
+                AppMode::EditDTMF(_) => crate::ui::editors::render_dtmf_editor(frame, app),
+                _ => unreachable!(),
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn editors_render_physical_units_canonical_digits_and_all_modes() {
+        let mut app = App::new();
+        app.editing_scan_preset = Some(ScanPreset {
+            start_freq: 11_800_000,
+            range: 1900,
+            step: 1250,
+            persist: 200,
+            ultrascan: 20,
+            ..ScanPreset::default()
+        });
+        app.mode = AppMode::EditScanPreset(3);
+        app.update_scan_preset_edit_buffer();
+        let text = render(&app, 100, 40);
+        for expected in ["19.00 MHz", "12.50 kHz", "20.0s", "Ultra raw 20"] {
+            assert!(text.contains(expected), "{expected}");
+        }
+        app.editing_band_plan = Some(BandPlan {
+            modulation: 7,
+            bandwidth: 5,
+            max_power: 255,
+            ..BandPlan::default()
+        });
+        app.mode = AppMode::EditBandPlan(6);
+        app.update_bandplan_edit_buffer();
+        let text = render(&app, 100, 40);
+        for expected in ["Enforce None", "FM Tuner", "Power (raw)", "255"] {
+            assert!(text.contains(expected), "{expected}");
+        }
+        app.pending_dtmf_edit = Some(DTMFPreset {
+            label: "Test".to_string(),
+            digits: vec![1, 12, 14, 15],
+            ..DTMFPreset::default()
+        });
+        app.dtmf_edit_preset_idx = Some(0);
+        app.mode = AppMode::EditDTMF(1);
+        app.update_dtmf_edit_buffer();
+        assert!(render(&app, 100, 40).contains("1C*#"));
+        for mode in [
+            AppMode::EditScanPreset(7),
+            AppMode::EditBandPlan(7),
+            AppMode::EditDTMF(1),
+        ] {
+            app.mode = mode;
+            for (width, height) in [(80, 24), (40, 18), (12, 8), (1, 1)] {
+                render(&app, width, height);
+            }
+        }
     }
 }

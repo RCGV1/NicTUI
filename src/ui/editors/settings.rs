@@ -1,12 +1,13 @@
 use super::common::{SETTINGS_EDITOR_HEIGHT, SETTINGS_EDITOR_WIDTH, begin_editor};
 use crate::app::{App, AppMode};
+use crate::protocol::setting_value::allowed_values;
 use crate::protocol::{SETTINGS_METADATA, SettingType};
 use crate::ui::theme::*;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
-    widgets::{Block, Cell, Paragraph, Row, Table},
+    widgets::{Block, Cell, Paragraph, Row, Table, TableState},
 };
 
 const BLUETOOTH_SETTING_INDEX: usize = 30;
@@ -36,20 +37,16 @@ pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
             .split(inner_area);
 
         match meta.setting_type {
-            SettingType::Numeric { min, max, unit } => {
+            SettingType::Numeric { .. } => {
                 let numeric_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(3),
+                        Constraint::Length(4),
                         Constraint::Length(4),
                         Constraint::Min(1),
                     ])
                     .split(chunks[0]);
-                let help_text = if unit.is_empty() {
-                    format!("Range {}-{}", min, max)
-                } else {
-                    format!("Range {}-{} {}", min, max, unit)
-                };
+                let help_text = format!("Range {}", allowed_values(idx));
                 f.render_widget(
                     Paragraph::new(format!("Current: {}\n{}", current_value, help_text))
                         .style(Style::default().fg(COLOR_TEXT))
@@ -73,7 +70,8 @@ pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
                 );
 
                 f.render_widget(
-                    Paragraph::new("Type a value, then press Enter to save it.")
+                    Paragraph::new("Enter a value in the units shown above.\nEnter saves; invalid input stays open.")
+                        .wrap(ratatui::widgets::Wrap { trim: true })
                         .style(Style::default().fg(COLOR_DIM)),
                     numeric_chunks[2],
                 );
@@ -141,15 +139,78 @@ pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
                             .add_modifier(Modifier::BOLD),
                     )
                     .highlight_symbol(" ");
-                f.render_widget(table, option_chunks[1]);
+                let mut state = TableState::default();
+                if app.selection_index < options.len() {
+                    state.select(Some(app.selection_index));
+                }
+                f.render_stateful_widget(table, option_chunks[1], &mut state);
             }
         }
 
+        let error = app.status_message.starts_with("Invalid setting:");
         f.render_widget(
-            Paragraph::new("↑/↓ change | Enter save | Esc cancel")
-                .style(Style::default().fg(COLOR_DIM))
-                .alignment(ratatui::layout::Alignment::Center),
+            Paragraph::new(if error {
+                app.status_message.as_str()
+            } else {
+                "↑/↓ change | Enter save | Esc cancel"
+            })
+            .style(Style::default().fg(if error { COLOR_WARNING } else { COLOR_DIM }))
+            .alignment(ratatui::layout::Alignment::Center),
             chunks[1],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::SettingsBlock;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn render(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 35)).unwrap();
+        terminal
+            .draw(|frame| render_settings_editor(frame, app))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn editor_displays_physical_values_and_ranges() {
+        let mut app = App::new();
+        app.settings = Some(SettingsBlock {
+            scan_persist: 200,
+            ..SettingsBlock::default()
+        });
+        app.mode = AppMode::EditSetting(13);
+        app.edit_buffer = "20.0".to_string();
+        let output = render(&app);
+        assert!(output.contains("Current: 20.0 s"));
+        assert!(output.contains("Range 0.0-20.0 s"));
+        assert!(!output.contains("2000.1s"));
+    }
+
+    #[test]
+    fn ninth_filter_option_scrolls_into_view() {
+        let mut app = App::new();
+        app.settings = Some(SettingsBlock::default());
+        app.mode = AppMode::EditSetting(50);
+        app.selection_index = 8;
+        assert!(render(&app).contains("> FSK Mode"));
+    }
+
+    #[test]
+    fn invalid_input_error_is_visible_inside_editor() {
+        let mut app = App::new();
+        app.settings = Some(SettingsBlock::default());
+        app.mode = AppMode::EditSetting(0);
+        app.status_message = "Invalid setting: Squelch accepts 0-9".to_string();
+        assert!(render(&app).contains("Invalid setting: Squelch accepts 0-9"));
     }
 }

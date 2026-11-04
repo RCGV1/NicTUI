@@ -1,8 +1,11 @@
 use crate::app::App;
+use crate::protocol::editor_value::{
+    BAND_BANDWIDTHS, BAND_MODULATIONS, decimal_value, option_label,
+};
 use crate::ui::render_shortcut;
 use crate::ui::theme::{
     COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_SELECTION_BG, COLOR_SELECTION_FG, COLOR_SURFACE_1,
-    COLOR_SURFACE_2, COLOR_TEXT,
+    COLOR_SURFACE_2, COLOR_TEXT, COLOR_WARNING,
 };
 use crate::ui::views::ready_state::{ReadyStateAction, ReadyStateContent, render_ready_state};
 use ratatui::{
@@ -43,7 +46,7 @@ pub fn render_bandplan(f: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or_else(|| "--".to_string());
 
     let summary_height = if area.width < 90 { 3 } else { 2 };
-    let detail_height = if area.width < 90 { 6 } else { 5 };
+    let detail_height = 6;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -53,7 +56,13 @@ pub fn render_bandplan(f: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(area);
 
-    let summary_text = if area.width < 90 {
+    let summary_text = if app.band_plans_dirty {
+        format!(
+            "Unsaved | w write | {} plans | {} TX",
+            app.band_plans.len(),
+            tx_enabled
+        )
+    } else if area.width < 90 {
         format!(
             "{} plans | {} TX | {}",
             app.band_plans.len(),
@@ -69,7 +78,11 @@ pub fn render_bandplan(f: &mut Frame, app: &mut App, area: Rect) {
         )
     };
     let summary = Paragraph::new(summary_text)
-        .style(Style::default().fg(COLOR_DIM))
+        .style(Style::default().fg(if app.band_plans_dirty {
+            COLOR_WARNING
+        } else {
+            COLOR_DIM
+        }))
         .wrap(ratatui::widgets::Wrap { trim: true })
         .block(
             Block::default()
@@ -80,9 +93,9 @@ pub fn render_bandplan(f: &mut Frame, app: &mut App, area: Rect) {
 
     let header = Row::new(vec![
         Cell::from("#").style(Style::default().fg(COLOR_ACCENT)),
-        Cell::from("Start").style(Style::default().fg(COLOR_ACCENT)),
-        Cell::from("End").style(Style::default().fg(COLOR_ACCENT)),
-        Cell::from("Power").style(Style::default().fg(COLOR_ACCENT)),
+        Cell::from("Start MHz").style(Style::default().fg(COLOR_ACCENT)),
+        Cell::from("End MHz").style(Style::default().fg(COLOR_ACCENT)),
+        Cell::from("Pwr raw").style(Style::default().fg(COLOR_ACCENT)),
         Cell::from("TX").style(Style::default().fg(COLOR_ACCENT)),
         Cell::from("Mod").style(Style::default().fg(COLOR_ACCENT)),
         Cell::from("BW").style(Style::default().fg(COLOR_ACCENT)),
@@ -105,24 +118,20 @@ pub fn render_bandplan(f: &mut Frame, app: &mut App, area: Rect) {
         };
         Row::new(vec![
             bp.index.to_string(),
-            format!("{:.5}", bp.start_freq as f64 / 100000.0),
-            format!("{:.5}", bp.end_freq as f64 / 100000.0),
-            bp.max_power.to_string(),
+            decimal_value(bp.start_freq, 5),
+            decimal_value(bp.end_freq, 5),
+            if bp.max_power == 0 {
+                "Ignore".to_string()
+            } else {
+                bp.max_power.to_string()
+            },
             if bp.tx_allowed {
                 "Yes".to_string()
             } else {
                 "No".to_string()
             },
-            match bp.modulation {
-                1 => "AM".to_string(),
-                2 => "USB".to_string(),
-                _ => "FM".to_string(),
-            },
-            if bp.bandwidth == 1 {
-                "Narrow".to_string()
-            } else {
-                "Wide".to_string()
-            },
+            option_label(BAND_MODULATIONS, bp.modulation),
+            option_label(BAND_BANDWIDTHS, bp.bandwidth),
         ])
         .style(style)
     });
@@ -134,8 +143,8 @@ pub fn render_bandplan(f: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(8),
-            Constraint::Length(6),
-            Constraint::Length(6),
+            Constraint::Length(14),
+            Constraint::Length(14),
             Constraint::Length(6),
         ],
     )
@@ -143,8 +152,16 @@ pub fn render_bandplan(f: &mut Frame, app: &mut App, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" BAND PLAN ")
-            .border_style(Style::default().fg(COLOR_BORDER))
+            .title(if app.band_plans_dirty {
+                " BAND PLAN (Unsaved) "
+            } else {
+                " BAND PLAN "
+            })
+            .border_style(Style::default().fg(if app.band_plans_dirty {
+                COLOR_WARNING
+            } else {
+                COLOR_BORDER
+            }))
             .bg(COLOR_SURFACE_1),
     )
     .row_highlight_style(
@@ -173,27 +190,23 @@ pub fn render_bandplan(f: &mut Frame, app: &mut App, area: Rect) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(format!(
-                        " {:.5} - {:.5}",
-                        plan.start_freq as f64 / 100000.0,
-                        plan.end_freq as f64 / 100000.0,
+                        " {} - {} MHz",
+                        decimal_value(plan.start_freq, 5),
+                        decimal_value(plan.end_freq, 5),
                     )),
                 ]),
                 Line::from(vec![Span::raw(format!(
-                    "{} {} | {} {} {}",
+                    "{} raw {} | {} | Wrap {}",
                     if compact { "Pwr" } else { "Power" },
                     plan.max_power,
                     if plan.tx_allowed { "TX on" } else { "TX off" },
-                    match plan.modulation {
-                        1 => "AM",
-                        2 => "USB",
-                        _ => "FM",
-                    },
-                    if plan.bandwidth == 1 {
-                        "Narrow"
-                    } else {
-                        "Wide"
-                    }
+                    if plan.wrap { "Yes" } else { "No" }
                 ))]),
+                Line::from(format!(
+                    "{} | {}",
+                    option_label(BAND_MODULATIONS, plan.modulation),
+                    option_label(BAND_BANDWIDTHS, plan.bandwidth)
+                )),
                 Line::from(vec![
                     render_shortcut("↑/↓"),
                     Span::raw(": Nav | "),

@@ -28,7 +28,9 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     let compact = chunks[0].width < 18;
-    let nav = if compact {
+    let nav = if matches!(app.mode, AppMode::Main(MainTab::Remote)) && app.remote_active {
+        Line::from(vec![render_shortcut("Tab"), Span::raw(" leave")])
+    } else if compact {
         Line::from(Span::styled(" Views ", Style::default().fg(COLOR_PRIMARY)))
     } else {
         let mut spans = vec![
@@ -132,6 +134,9 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
             }
         }
         AppMode::Main(MainTab::Scanning) => {
+            if app.scan_presets_dirty {
+                push_warning_hint(&mut hints, "w", "write");
+            }
             push_hint(&mut hints, "Enter", "edit");
             push_hint(&mut hints, "r", "read");
         }
@@ -143,6 +148,9 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
             push_hint(&mut hints, "r", "read");
         }
         AppMode::Main(MainTab::BandPlan) => {
+            if app.band_plans_dirty {
+                push_warning_hint(&mut hints, "w", "write");
+            }
             push_hint(&mut hints, "Enter", "edit");
             push_hint(&mut hints, "r", "read");
         }
@@ -158,29 +166,33 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
         }
         AppMode::Main(MainTab::Remote) if app.remote_active => {
             push_warning_hint(&mut hints, "p", "stop");
+            push_hint(&mut hints, "D", "details");
+            push_hint(&mut hints, "Tab", "leave");
             push_hint(&mut hints, "Up/Down", "move");
             push_hint(&mut hints, "Enter", "menu");
-            if compact && !tight {
-                push_hint(&mut hints, "Tab", "leave");
-            }
             if !compact {
                 push_hint(&mut hints, "Esc", "exit menu");
-                push_hint(&mut hints, "Tab", "leave");
-                push_hint(&mut hints, "a/b", "ptt");
-                push_hint(&mut hints, "f/v", "light/vm");
+                push_hint(&mut hints, "a", "PTT");
+                push_hint(&mut hints, "f/v", "F/B");
             }
         }
         AppMode::Main(MainTab::Remote) => {
             push_hint(&mut hints, "o", "start");
+            push_hint(&mut hints, "D", "details");
             push_hint(&mut hints, "Esc", "back");
             if !tight {
                 push_hint(&mut hints, "Tab", "next");
             }
         }
         AppMode::Main(MainTab::Codeplug) => {
+            push_hint(&mut hints, "r", "read full");
             push_hint(&mut hints, "i", "import");
-            push_hint(&mut hints, "e", "export");
-            push_hint(&mut hints, "w", "write");
+            if app.codeplug_snapshot_is_current() {
+                push_hint(&mut hints, "e", "export");
+                if crate::ui::views::codeplug::write_block_reason(app, None).is_none() {
+                    push_warning_hint(&mut hints, "w", "write");
+                }
+            }
         }
         AppMode::Main(MainTab::BinFlash) => {
             push_hint(&mut hints, "i", "import");
@@ -210,7 +222,20 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
         }
     }
 
-    Line::from(hints)
+    // Drop optional hints as whole groups, never a half key/label at the edge.
+    let mut fitted = Vec::new();
+    let mut used = 0;
+    for group in hints.split(|span| span.content == "  | ") {
+        let gap = if fitted.is_empty() { 0 } else { 4 };
+        let needed = group.iter().map(Span::width).sum::<usize>() + gap;
+        if used + needed > width as usize {
+            break;
+        }
+        push_separator(&mut fitted);
+        fitted.extend_from_slice(group);
+        used += needed;
+    }
+    Line::from(fitted)
 }
 
 fn push_hint(spans: &mut Vec<Span<'static>>, key: &'static str, label: &'static str) {
@@ -293,5 +318,93 @@ mod tests {
         assert!(text.contains(" save"));
         assert!(text.contains(" edit"));
         assert!(!text.contains(" import"));
+    }
+
+    #[test]
+    fn hints_fit_without_partial_key_labels_at_every_width() {
+        let mut app = App::new();
+        app.channels_dirty = true;
+        app.settings_dirty = true;
+        app.remote_active = true;
+        for tab in [
+            MainTab::Channels,
+            MainTab::Settings,
+            MainTab::Remote,
+            MainTab::Codeplug,
+            MainTab::BinFlash,
+        ] {
+            app.mode = AppMode::Main(tab);
+            for width in 0..160 {
+                let line = footer_hints(&app, width);
+                assert!(line.width() <= width as usize, "{tab:?} at {width}");
+                let text = hint_text(&app, width);
+                assert!(!text.ends_with(" | "));
+            }
+        }
+    }
+
+    #[test]
+    fn active_remote_navigation_does_not_advertise_digit_tab_shortcuts() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new();
+        app.mode = AppMode::Main(MainTab::Remote);
+        app.remote_active = true;
+        let mut terminal = Terminal::new(TestBackend::new(160, 2)).unwrap();
+        terminal
+            .draw(|frame| render_footer(frame, &app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..160)
+            .map(|x| buffer[(x, 1)].symbol())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("Tab leave"));
+        assert!(!text.contains("0-9 views"));
+        assert!(text.contains("f/v F/B"));
+    }
+
+    #[test]
+    fn scan_and_band_write_hints_take_priority_until_saved() {
+        let mut app = App::new();
+        for tab in [MainTab::Scanning, MainTab::BandPlan] {
+            app.mode = AppMode::Main(tab);
+            app.scan_presets_dirty = tab == MainTab::Scanning;
+            app.band_plans_dirty = tab == MainTab::BandPlan;
+            let text = hint_text(&app, 36);
+            assert!(text.contains(" write"), "{text}");
+            assert!(text.contains(" edit"), "{text}");
+            assert!(footer_hints(&app, 36).width() <= 36);
+            app.scan_presets_dirty = false;
+            app.band_plans_dirty = false;
+            assert!(!hint_text(&app, 36).contains(" write"));
+        }
+    }
+
+    #[test]
+    fn codeplug_footer_prioritizes_full_read_and_hides_blocked_actions() {
+        let mut app = App::new();
+        app.mode = AppMode::Main(MainTab::Codeplug);
+        for width in [62, 76, 136, 156] {
+            let text = hint_text(&app, width)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(text.starts_with("r read full"), "{text}");
+            assert!(text.contains("i import"));
+            assert!(!text.contains("e export"));
+            assert!(!text.contains("w write"));
+        }
+        app.codeplug_data = Some(vec![0; crate::protocol::EEPROM_SIZE]);
+        app.codeplug_workspace_baseline = app.workspace_snapshot();
+        app.protocol_port_name = Some("test://no-hardware".to_string());
+        let text = hint_text(&app, 62);
+        assert!(text.contains(" export"));
+        assert!(text.contains(" write"));
+        app.scan_presets_dirty = true;
+        let text = hint_text(&app, 62);
+        assert!(!text.contains(" export"));
+        assert!(!text.contains(" write"));
     }
 }

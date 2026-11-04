@@ -80,7 +80,7 @@ impl App {
 
         match idx {
             6 | 7 => Some(2),
-            8 => Some(5),
+            8 => Some(4),
             9 => Some(GROUP_LABEL_COUNT + 1),
             _ => None,
         }
@@ -97,7 +97,7 @@ mod tests {
         let mut app = App::new();
         app.pending_channel_edit = Some(Channel::default());
         app.mode = AppMode::EditChannel(8);
-        app.selection_index = 4;
+        app.selection_index = 3;
 
         app.handle_channel_editor_key(KeyCode::Right);
 
@@ -105,15 +105,33 @@ mod tests {
     }
 
     #[test]
-    fn channel_boolean_fields_wrap_without_invalid_state() {
-        let mut app = App::new();
-        app.pending_channel_edit = Some(Channel::default());
-        app.mode = AppMode::EditChannel(6);
-        app.selection_index = 1;
+    fn channel_reverse_field_wraps_and_preserves_position_on_navigation() {
+        for position in [0, 1] {
+            let mut app = App::new();
+            app.pending_channel_edit = Some(Channel {
+                reverse: true,
+                position,
+                ..Channel::default()
+            });
+            app.mode = AppMode::EditChannel(6);
+            app.update_edit_buffer();
 
-        app.handle_channel_editor_key(KeyCode::Right);
+            app.handle_channel_editor_key(KeyCode::Right);
+            assert_eq!(app.selection_index, 0);
+            app.handle_channel_editor_key(KeyCode::Tab);
+            assert_eq!(app.mode, AppMode::EditChannel(7));
+            let pending = app.pending_channel_edit.as_ref().unwrap();
+            assert!(!pending.reverse);
+            assert_eq!(pending.position, position);
 
-        assert_eq!(app.selection_index, 0);
+            app.handle_channel_editor_key(KeyCode::BackTab);
+            app.handle_channel_editor_key(KeyCode::Left);
+            assert_eq!(app.selection_index, 1);
+            app.handle_channel_editor_key(KeyCode::Tab);
+            let pending = app.pending_channel_edit.as_ref().unwrap();
+            assert!(pending.reverse);
+            assert_eq!(pending.position, position);
+        }
     }
 
     #[test]

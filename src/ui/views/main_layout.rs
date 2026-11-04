@@ -64,3 +64,18 @@ fn responsive_sidebar_width(total_width: u16) -> u16 {
         _ => 28,
     }
 }
+
+pub fn remote_key_at_terminal(area: Rect, column: u16, row: u16) -> Option<u8> {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    let body = chunks[1];
+    let sidebar = responsive_sidebar_width(body.width).min(body.width);
+    let content = Rect::new(body.x + sidebar, body.y, body.width - sidebar, body.height);
+    crate::ui::views::remote::remote_key_at(content, column, row)
+}

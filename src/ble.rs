@@ -29,6 +29,8 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MACOS_ADAPTER_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(25);
 const DEFAULT_ADAPTER_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_GATT_WRITE_CHUNK_SIZE: usize = 20;
+const DEFAULT_GATT_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+const BLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn ble_debug_enabled() -> bool {
     env::var_os("NICTUI_BLE_DEBUG").is_some_and(|value| {
@@ -129,6 +131,7 @@ pub struct BleLink {
     notify_characteristic: Characteristic,
     write_type: WriteType,
     notifications_rx: Receiver<Vec<u8>>,
+    notification_task: tokio::task::AbortHandle,
     pending_bytes: VecDeque<u8>,
     read_timeout: Duration,
 }
@@ -138,10 +141,16 @@ impl BleLink {
         let device_id = device_id.trim().to_string();
         ble_log(format!("connect start device={}", device_id));
         let connect_device_id = device_id.clone();
-        let (peripheral, write_characteristic, notify_characteristic, write_type, notifications_rx) =
-            block_on_ble_runtime(move |state| {
-                Box::pin(async move { connect_td_h3_ble(state, &connect_device_id).await })
-            })?;
+        let (
+            peripheral,
+            write_characteristic,
+            notify_characteristic,
+            write_type,
+            notifications_rx,
+            notification_task,
+        ) = block_on_ble_runtime(move |state| {
+            Box::pin(async move { connect_td_h3_ble(state, &connect_device_id).await })
+        })?;
         ble_log(format!("connect ready device={}", device_id));
 
         Ok(Self {
@@ -150,6 +159,7 @@ impl BleLink {
             notify_characteristic,
             write_type,
             notifications_rx,
+            notification_task,
             pending_bytes: VecDeque::new(),
             read_timeout: Duration::from_millis(50),
         })
@@ -171,10 +181,12 @@ impl BleLink {
         block_on_ble_runtime(move |_| {
             Box::pin(async move {
                 for chunk in chunks {
-                    peripheral
-                        .write(&write_characteristic, &chunk, write_type)
-                        .await
-                        .map_err(map_ble_error)?;
+                    ble_operation(
+                        "Failed to write BLE characteristic",
+                        DEFAULT_GATT_OPERATION_TIMEOUT,
+                        peripheral.write(&write_characteristic, &chunk, write_type),
+                    )
+                    .await?;
                 }
                 Ok(())
             })
@@ -219,10 +231,8 @@ impl BleLink {
             }
         }
 
-        while let Ok(chunk) = self.notifications_rx.try_recv() {
-            self.pending_bytes.extend(chunk);
-        }
-
+        // Read permits short reads. Keep later notifications queued rather than
+        // draining the entire stream for a one-byte opcode read.
         let mut read = 0usize;
         while read < buffer.len() {
             let Some(byte) = self.pending_bytes.pop_front() else {
@@ -250,13 +260,26 @@ impl BleLink {
 
 impl Drop for BleLink {
     fn drop(&mut self) {
+        self.notification_task.abort();
         let peripheral = self.peripheral.clone();
         let notify_characteristic = self.notify_characteristic.clone();
         let _ = block_on_ble_runtime(move |_| {
             Box::pin(async move {
-                let _ = peripheral.unsubscribe(&notify_characteristic).await;
-                let _ = peripheral.disconnect().await;
-                Ok(())
+                let unsubscribe = ble_operation(
+                    "Failed to unsubscribe BLE notifications",
+                    BLE_CLEANUP_TIMEOUT,
+                    peripheral.unsubscribe(&notify_characteristic),
+                )
+                .await;
+                finish_ble_operation(
+                    unsubscribe,
+                    ble_operation(
+                        "Failed to disconnect BLE peripheral",
+                        BLE_CLEANUP_TIMEOUT,
+                        peripheral.disconnect(),
+                    ),
+                )
+                .await
             })
         });
     }
@@ -390,26 +413,44 @@ async fn scan_td_h3_ble_devices_async(
     let adapter = state.adapter().await?;
     ble_log("adapter discovery complete");
     ble_log("scan start");
-    adapter
-        .start_scan(ScanFilter {
+    ble_operation(
+        "Failed to start BLE scan",
+        DEFAULT_GATT_OPERATION_TIMEOUT,
+        adapter.start_scan(ScanFilter {
             services: vec![td_h3_service_uuid()?],
-        })
-        .await
-        .context("Failed to start BLE scan")?;
+        }),
+    )
+    .await?;
 
     tokio::time::sleep(timeout).await;
     ble_log("scan collecting peripherals");
+    let result = collect_td_h3_ble_devices(&adapter).await;
+    finish_ble_operation(
+        result,
+        ble_operation(
+            "Failed to stop BLE scan",
+            BLE_CLEANUP_TIMEOUT,
+            adapter.stop_scan(),
+        ),
+    )
+    .await
+}
 
+async fn collect_td_h3_ble_devices(adapter: &Adapter) -> Result<Vec<BleDevice>> {
     let mut devices = Vec::new();
-    for peripheral in adapter
-        .peripherals()
-        .await
-        .context("Failed to list BLE devices")?
+    for peripheral in ble_operation(
+        "Failed to list BLE devices",
+        DEFAULT_GATT_OPERATION_TIMEOUT,
+        adapter.peripherals(),
+    )
+    .await?
     {
-        let Some(properties) = peripheral
-            .properties()
-            .await
-            .context("Failed to read BLE device properties")?
+        let Some(properties) = ble_operation(
+            "Failed to read BLE device properties",
+            DEFAULT_GATT_OPERATION_TIMEOUT,
+            peripheral.properties(),
+        )
+        .await?
         else {
             continue;
         };
@@ -584,6 +625,7 @@ async fn connect_td_h3_ble(
     Characteristic,
     WriteType,
     Receiver<Vec<u8>>,
+    tokio::task::AbortHandle,
 )> {
     ble_log(format!(
         "connect phase adapter discovery device={}",
@@ -592,115 +634,154 @@ async fn connect_td_h3_ble(
     let adapter = state.adapter().await?;
     ble_log("connect phase adapter ready");
     ble_log("connect phase scan start");
-    adapter
-        .start_scan(ScanFilter {
+    ble_operation(
+        "Failed to start BLE scan",
+        DEFAULT_GATT_OPERATION_TIMEOUT,
+        adapter.start_scan(ScanFilter {
             services: vec![td_h3_service_uuid()?],
-        })
-        .await
-        .context("Failed to start BLE scan")?;
+        }),
+    )
+    .await?;
 
     ble_log("connect phase waiting for peripheral");
-    let peripheral = wait_for_peripheral(&adapter, device_id, DEFAULT_CONNECT_TIMEOUT).await?;
+    let found = wait_for_peripheral(&adapter, device_id, DEFAULT_CONNECT_TIMEOUT).await;
+    let peripheral = finish_ble_operation(
+        found,
+        ble_operation(
+            "Failed to stop BLE scan",
+            BLE_CLEANUP_TIMEOUT,
+            adapter.stop_scan(),
+        ),
+    )
+    .await?;
     ble_log(format!(
         "connect phase peripheral found id={}",
         peripheral.id()
     ));
-    if !peripheral
-        .is_connected()
-        .await
-        .context("Failed to check BLE connection state")?
-    {
-        ble_log("connect phase connect start");
-        peripheral
-            .connect()
-            .await
-            .context("Failed to connect over BLE")?;
-        ble_log("connect phase connect complete");
-    } else {
-        ble_log("connect phase peripheral already connected");
-    }
-    ble_log("connect phase discover services start");
-    peripheral
-        .discover_services()
-        .await
-        .context("Failed to discover BLE services")?;
-    ble_log("connect phase discover services complete");
-
-    let notify_characteristic = peripheral
-        .characteristics()
-        .into_iter()
-        .find(|characteristic| characteristic.uuid == td_h3_read_uuid().unwrap())
-        .ok_or_else(|| {
-            anyhow!(
-                "TD-H3 BLE notify characteristic {} not found",
-                TD_H3_BLE_READ_UUID
+    let was_connected = ble_operation(
+        "Failed to check BLE connection state",
+        DEFAULT_GATT_OPERATION_TIMEOUT,
+        peripheral.is_connected(),
+    )
+    .await?;
+    let result = async {
+        if !was_connected {
+            ble_log("connect phase connect start");
+            ble_operation(
+                "Failed to connect over BLE",
+                DEFAULT_CONNECT_TIMEOUT,
+                peripheral.connect(),
             )
-        })?;
-    ble_log(format!(
-        "connect phase notify characteristic {} ready",
-        notify_characteristic.uuid
-    ));
-    let write_characteristic = peripheral
-        .characteristics()
-        .into_iter()
-        .find(|characteristic| characteristic.uuid == td_h3_write_uuid().unwrap())
-        .ok_or_else(|| {
-            anyhow!(
-                "TD-H3 BLE write characteristic {} not found",
-                TD_H3_BLE_WRITE_UUID
-            )
-        })?;
-    ble_log(format!(
-        "connect phase write characteristic {} ready",
-        write_characteristic.uuid
-    ));
-
-    let write_type = if write_characteristic
-        .properties
-        .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
-    {
-        WriteType::WithoutResponse
-    } else {
-        WriteType::WithResponse
-    };
-    ble_log(format!("connect phase write mode {:?}", write_type));
-
-    ble_log("connect phase notification stream open start");
-    let mut notifications = peripheral
-        .notifications()
-        .await
-        .context("Failed to open BLE notification stream")?;
-    ble_log("connect phase notification stream open complete");
-    ble_log("connect phase subscribe start");
-    peripheral
-        .subscribe(&notify_characteristic)
-        .await
-        .context("Failed to subscribe to TD-H3 BLE notifications")?;
-    ble_log("connect phase subscribe complete");
-
-    let expected_uuid = notify_characteristic.uuid;
-    let (tx, rx) = std_mpsc::channel();
-    tokio::spawn(async move {
-        while let Some(notification) = notifications.next().await {
-            ble_debug_log(format!(
-                "notification uuid={} bytes={}",
-                notification.uuid,
-                notification.value.len()
-            ));
-            if notification.uuid == expected_uuid && tx.send(notification.value).is_err() {
-                ble_debug_log("notification receiver dropped");
-                break;
-            }
+            .await?;
+            ble_log("connect phase connect complete");
+        } else {
+            ble_log("connect phase peripheral already connected");
         }
-    });
+        ble_log("connect phase discover services start");
+        ble_operation(
+            "Failed to discover BLE services",
+            DEFAULT_GATT_OPERATION_TIMEOUT,
+            peripheral.discover_services(),
+        )
+        .await?;
+        ble_log("connect phase discover services complete");
 
-    Ok((
-        peripheral,
-        write_characteristic,
-        notify_characteristic,
-        write_type,
-        rx,
-    ))
+        let notify_characteristic = peripheral
+            .characteristics()
+            .into_iter()
+            .find(|characteristic| characteristic.uuid == td_h3_read_uuid().unwrap())
+            .ok_or_else(|| {
+                anyhow!(
+                    "TD-H3 BLE notify characteristic {} not found",
+                    TD_H3_BLE_READ_UUID
+                )
+            })?;
+        ble_log(format!(
+            "connect phase notify characteristic {} ready",
+            notify_characteristic.uuid
+        ));
+        let write_characteristic = peripheral
+            .characteristics()
+            .into_iter()
+            .find(|characteristic| characteristic.uuid == td_h3_write_uuid().unwrap())
+            .ok_or_else(|| {
+                anyhow!(
+                    "TD-H3 BLE write characteristic {} not found",
+                    TD_H3_BLE_WRITE_UUID
+                )
+            })?;
+        ble_log(format!(
+            "connect phase write characteristic {} ready",
+            write_characteristic.uuid
+        ));
+
+        let write_type = if write_characteristic
+            .properties
+            .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
+        {
+            WriteType::WithoutResponse
+        } else {
+            WriteType::WithResponse
+        };
+        ble_log(format!("connect phase write mode {:?}", write_type));
+
+        ble_log("connect phase notification stream open start");
+        let mut notifications = ble_operation(
+            "Failed to open BLE notification stream",
+            DEFAULT_GATT_OPERATION_TIMEOUT,
+            peripheral.notifications(),
+        )
+        .await?;
+        ble_log("connect phase notification stream open complete");
+        ble_log("connect phase subscribe start");
+        ble_operation(
+            "Failed to subscribe to TD-H3 BLE notifications",
+            DEFAULT_GATT_OPERATION_TIMEOUT,
+            peripheral.subscribe(&notify_characteristic),
+        )
+        .await?;
+        ble_log("connect phase subscribe complete");
+
+        let expected_uuid = notify_characteristic.uuid;
+        let (tx, rx) = std_mpsc::channel();
+        let notification_task = tokio::spawn(async move {
+            while let Some(notification) = notifications.next().await {
+                ble_debug_log(format!(
+                    "notification uuid={} bytes={}",
+                    notification.uuid,
+                    notification.value.len()
+                ));
+                if notification.uuid == expected_uuid && tx.send(notification.value).is_err() {
+                    ble_debug_log("notification receiver dropped");
+                    break;
+                }
+            }
+        });
+
+        Ok((
+            peripheral.clone(),
+            write_characteristic,
+            notify_characteristic,
+            write_type,
+            rx,
+            notification_task.abort_handle(),
+        ))
+    }
+    .await;
+    if result.is_err() && !was_connected {
+        // Only tear down the connection this attempt opened, not an existing link.
+        finish_ble_operation(
+            result,
+            ble_operation(
+                "Failed to disconnect BLE peripheral after setup failure",
+                BLE_CLEANUP_TIMEOUT,
+                peripheral.disconnect(),
+            ),
+        )
+        .await
+    } else {
+        result
+    }
 }
 
 async fn wait_for_peripheral(
@@ -716,10 +797,12 @@ async fn wait_for_peripheral(
         timeout.as_secs()
     ));
     loop {
-        for peripheral in adapter
-            .peripherals()
-            .await
-            .context("Failed to list BLE devices")?
+        for peripheral in ble_operation(
+            "Failed to list BLE devices",
+            DEFAULT_GATT_OPERATION_TIMEOUT,
+            adapter.peripherals(),
+        )
+        .await?
         {
             if peripheral.id().to_string().eq_ignore_ascii_case(normalized) {
                 ble_log(format!("wait peripheral matched device={}", normalized));
@@ -755,8 +838,28 @@ fn normalize_ble_name(value: &str) -> String {
         .collect()
 }
 
-fn map_ble_error(error: btleplug::Error) -> io::Error {
-    io::Error::other(error.to_string())
+async fn ble_operation<T>(
+    stage: &str,
+    timeout: Duration,
+    operation: impl Future<Output = btleplug::Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(timeout, operation)
+        .await
+        .with_context(|| format!("{stage}: timed out after {}ms", timeout.as_millis()))?
+        .with_context(|| stage.to_string())
+}
+
+async fn finish_ble_operation<T>(
+    result: Result<T>,
+    cleanup: impl Future<Output = Result<()>>,
+) -> Result<T> {
+    match (result, cleanup.await) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            Err(error.context(format!("BLE cleanup also failed: {cleanup_error:#}")))
+        }
+    }
 }
 
 fn chunk_gatt_write_payload(data: &[u8]) -> Vec<&[u8]> {
@@ -978,6 +1081,76 @@ mod tests {
         ble_device_uri, classify_ble_failure_kind, classify_ble_operation_failure,
         normalize_ble_name, parse_ble_device_uri,
     };
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        super::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn cleanup_runs_after_both_success_and_failure() {
+        test_runtime().block_on(async {
+            for failed in [false, true] {
+                let cleaned = std::cell::Cell::new(false);
+                let operation = if failed {
+                    Err(anyhow::anyhow!("fixture failure"))
+                } else {
+                    Ok(42)
+                };
+                let result = super::finish_ble_operation(operation, async {
+                    cleaned.set(true);
+                    Ok(())
+                })
+                .await;
+                assert!(cleaned.get());
+                assert_eq!(result.is_err(), failed);
+            }
+        });
+    }
+
+    #[test]
+    fn cleanup_failure_is_reported_without_losing_the_original_error() {
+        test_runtime().block_on(async {
+            let error =
+                super::finish_ble_operation::<()>(Err(anyhow::anyhow!("setup failed")), async {
+                    Err(anyhow::anyhow!("disconnect failed"))
+                })
+                .await
+                .unwrap_err();
+            let detail = format!("{error:#}");
+            assert!(detail.contains("setup failed"));
+            assert!(detail.contains("disconnect failed"));
+            assert!(
+                super::finish_ble_operation(Ok(()), async { Err(anyhow::anyhow!("stop failed")) })
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn ble_operation_deadline_cancels_a_stalled_future() {
+        struct OnDrop<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for OnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        test_runtime().block_on(async {
+            let dropped = std::cell::Cell::new(false);
+            let error =
+                super::ble_operation("fixture GATT write", Duration::from_millis(1), async {
+                    let _guard = OnDrop(&dropped);
+                    std::future::pending::<btleplug::Result<()>>().await
+                })
+                .await
+                .unwrap_err();
+            assert!(dropped.get());
+            assert!(error.to_string().contains("fixture GATT write: timed out"));
+        });
+    }
 
     #[test]
     fn ble_uri_round_trip() {

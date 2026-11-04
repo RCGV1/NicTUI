@@ -11,6 +11,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Gauge, Paragraph},
 };
 
+const PROGRESS_QUIT_HINT: &str = "Esc: finish safely, then quit";
+
 pub(crate) fn render_progress_overlay(
     f: &mut Frame,
     app: &App,
@@ -61,7 +63,7 @@ pub(crate) fn render_progress_overlay(
             .label(format!("{}%", progress_percent));
         f.render_widget(gauge, chunks[2]);
 
-        let help = Paragraph::new("Press Esc to abort")
+        let help = Paragraph::new(PROGRESS_QUIT_HINT)
             .alignment(ratatui::layout::Alignment::Center)
             .style(Style::default().fg(COLOR_DIM));
         f.render_widget(help, chunks[3]);
@@ -91,7 +93,7 @@ pub(crate) fn render_progress_overlay(
             .label(format!("{}%", progress_percent));
         f.render_widget(gauge, chunks[1]);
 
-        let help = Paragraph::new("Press Esc to cancel")
+        let help = Paragraph::new(PROGRESS_QUIT_HINT)
             .alignment(ratatui::layout::Alignment::Center)
             .style(Style::default().fg(COLOR_DIM));
         f.render_widget(help, chunks[2]);
@@ -156,5 +158,35 @@ pub(crate) fn render_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
                 .border_style(Style::default().fg(COLOR_WARNING)),
         );
         f.render_widget(p, popup_area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn progress_quit_hint_matches_deferred_exit_and_fits_narrow_overlays() {
+        for mode in [AppMode::Reading, AppMode::Writing, AppMode::BinFlashing] {
+            let mut app = App::new();
+            app.mode = mode;
+            app.status_message = "Working".to_string();
+            for width in [33, 40, 60, 80, 120] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                terminal
+                    .draw(|frame| crate::ui::ui(frame, &mut app))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert!(
+                    rendered.contains("Esc: finish safely, then quit"),
+                    "missing or clipped quit hint for {:?} at width {width}",
+                    app.mode
+                );
+                assert!(!rendered.contains("Esc to cancel"));
+                assert!(!rendered.contains("Esc to abort"));
+            }
+        }
     }
 }

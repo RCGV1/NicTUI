@@ -1,5 +1,6 @@
 use super::common::{DTMF_EDITOR_HEIGHT, DTMF_EDITOR_WIDTH, begin_editor};
 use crate::app::{App, AppMode};
+use crate::protocol::editor_value::dtmf_text;
 use crate::ui::theme::*;
 use ratatui::{
     Frame,
@@ -16,12 +17,18 @@ pub(crate) fn render_dtmf_editor(f: &mut Frame, app: &App) {
         DTMF_EDITOR_WIDTH,
         DTMF_EDITOR_HEIGHT,
     );
+    if inner_area.width < 2 || inner_area.height < 2 {
+        return;
+    }
 
     if let AppMode::EditDTMF(field_idx) = app.mode
-        && let Some(idx) = app.dtmf_state.selected()
-        && let Some(dtmf) = app.dtmf_presets.get(idx)
+        && let Some(idx) = app.dtmf_edit_preset_idx
+        && let Some(dtmf) = app
+            .pending_dtmf_edit
+            .as_ref()
+            .or_else(|| app.dtmf_presets.get(idx))
     {
-        let digits_str: String = dtmf.digits.iter().map(|d| format!("{:X}", d)).collect();
+        let digits_str = dtmf_text(&dtmf.digits);
         let fields = [
             ("Label", dtmf.label.clone()),
             ("Digits", digits_str.clone()),
@@ -41,7 +48,7 @@ pub(crate) fn render_dtmf_editor(f: &mut Frame, app: &App) {
         let summary = Paragraph::new(vec![
             Line::from(vec![
                 Span::styled(
-                    format!(" D{:02} ", idx),
+                    format!(" D{:02} ", dtmf.index),
                     Style::default()
                         .fg(COLOR_SELECTION_FG)
                         .bg(COLOR_SELECTION_BG)
@@ -92,10 +99,9 @@ pub(crate) fn render_dtmf_editor(f: &mut Frame, app: &App) {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(help_body),
-            Line::default(),
-            Line::from("Digits accept 0-9, A-F, *, and #."),
         ])
         .style(Style::default().fg(COLOR_TEXT))
+        .wrap(ratatui::widgets::Wrap { trim: true })
         .block(Block::default().borders(Borders::ALL).title(" Details "));
         f.render_widget(details, body[0]);
 
@@ -131,9 +137,19 @@ pub(crate) fn render_dtmf_editor(f: &mut Frame, app: &App) {
         f.render_widget(table, body[1]);
 
         f.render_widget(
-            Paragraph::new("↑/↓/Tab: Field | Enter: Save | Esc: Cancel")
-                .style(Style::default().fg(COLOR_DIM))
-                .alignment(ratatui::layout::Alignment::Center),
+            Paragraph::new(if app.status_message.starts_with("Invalid DTMF:") {
+                app.status_message.as_str()
+            } else {
+                "↑/↓/Tab: Field | Enter: Save | Esc: Cancel"
+            })
+            .style(
+                Style::default().fg(if app.status_message.starts_with("Invalid DTMF:") {
+                    COLOR_WARNING
+                } else {
+                    COLOR_DIM
+                }),
+            )
+            .alignment(ratatui::layout::Alignment::Center),
             vertical[2],
         );
     }
@@ -141,11 +157,8 @@ pub(crate) fn render_dtmf_editor(f: &mut Frame, app: &App) {
 
 fn dtmf_field_help(field_idx: usize) -> (&'static str, &'static str) {
     match field_idx {
-        0 => ("Preset Label", "Short label shown in the DTMF preset list."),
-        1 => (
-            "DTMF Digits",
-            "Enter the transmit sequence exactly as it should be sent.",
-        ),
+        0 => ("Preset Label", "Up to 7 printable ASCII characters."),
+        1 => ("DTMF Digits", "Up to 9 digits: 0-9, A-D, * and #."),
         _ => ("Field", ""),
     }
 }

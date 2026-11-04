@@ -1,5 +1,6 @@
 use super::types::{SettingMetadata, SettingType};
 
+// Numeric bounds are stored integers; setting_value handles physical-unit conversion.
 pub const SETTINGS_METADATA: &[SettingMetadata] = &[
     SettingMetadata {
         menu_num: "00",
@@ -31,25 +32,25 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
         setting_type: SettingType::Numeric {
             min: 1,
             max: 50000,
-            unit: "Hz",
+            unit: "kHz",
         },
     },
     SettingMetadata {
         menu_num: "05",
-        name: "RX Split",
+        name: "RX Filter Trans",
         setting_type: SettingType::Numeric {
-            min: 0,
-            max: 65535,
-            unit: "",
+            min: 1500,
+            max: 4000,
+            unit: "MHz",
         },
     },
     SettingMetadata {
         menu_num: "06",
-        name: "TX Split",
+        name: "TX Filter Trans",
         setting_type: SettingType::Numeric {
-            min: 0,
-            max: 65535,
-            unit: "",
+            min: 1500,
+            max: 4000,
+            unit: "MHz",
         },
     },
     SettingMetadata {
@@ -90,7 +91,7 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
         name: "Scan Range",
         setting_type: SettingType::Numeric {
             min: 1,
-            max: 600,
+            max: 60000,
             unit: "MHz",
         },
     },
@@ -100,7 +101,7 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
         setting_type: SettingType::Numeric {
             min: 0,
             max: 200,
-            unit: "0.1s",
+            unit: "s",
         },
     },
     SettingMetadata {
@@ -131,7 +132,7 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
         name: "LCD Brightness",
         setting_type: SettingType::Numeric {
             min: 0,
-            max: 28,
+            max: 35,
             unit: "",
         },
     },
@@ -147,7 +148,11 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
     SettingMetadata {
         menu_num: "19",
         name: "Breathe",
-        setting_type: SettingType::Boolean,
+        setting_type: SettingType::Numeric {
+            min: 0,
+            max: 30,
+            unit: "s",
+        },
     },
     SettingMetadata {
         menu_num: "20",
@@ -256,7 +261,7 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
         name: "RF Gain",
         setting_type: SettingType::Numeric {
             min: 0,
-            max: 42,
+            max: 41,
             unit: "",
         },
     },
@@ -269,8 +274,8 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
         menu_num: "36",
         name: "Sq Noise Lev",
         setting_type: SettingType::Numeric {
-            min: 45,
-            max: 100,
+            min: 15,
+            max: 55,
             unit: "",
         },
     },
@@ -296,9 +301,9 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
         menu_num: "39",
         name: "VOX Tail",
         setting_type: SettingType::Numeric {
-            min: 1,
+            min: 5,
             max: 50,
-            unit: "0.1s",
+            unit: "s",
         },
     },
     SettingMetadata {
@@ -339,7 +344,7 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
         setting_type: SettingType::Numeric {
             min: 0,
             max: 50,
-            unit: "",
+            unit: "s",
         },
     },
     SettingMetadata {
@@ -364,7 +369,7 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
     SettingMetadata {
         menu_num: "48",
         name: "PIN Action",
-        setting_type: SettingType::Enum(&["Off", "On", "Power On"]),
+        setting_type: SettingType::Enum(&["Off", "Unlock", "Power On"]),
     },
     SettingMetadata {
         menu_num: "49",
@@ -374,11 +379,17 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
     SettingMetadata {
         menu_num: "50",
         name: "AF Filters",
-        setting_type: SettingType::Numeric {
-            min: 0,
-            max: 8,
-            unit: "",
-        },
+        setting_type: SettingType::Enum(&[
+            "All",
+            "Hi-Pass + Lo-Pass",
+            "Hi-Pass + De-emf",
+            "Hi-Pass Only",
+            "Lo-Pass + De-emf",
+            "Lo-Pass Only",
+            "De-emphasis Only",
+            "None",
+            "FSK Mode",
+        ]),
     },
     SettingMetadata {
         menu_num: "51",
@@ -404,9 +415,9 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
         menu_num: "55",
         name: "Dual Watch Dly",
         setting_type: SettingType::Numeric {
-            min: 0,
-            max: 255,
-            unit: "ms",
+            min: 1,
+            max: 30,
+            unit: "s",
         },
     },
     SettingMetadata {
@@ -414,7 +425,7 @@ pub const SETTINGS_METADATA: &[SettingMetadata] = &[
         name: "SubTone Dev",
         setting_type: SettingType::Numeric {
             min: 0,
-            max: 255,
+            max: 127,
             unit: "",
         },
     },

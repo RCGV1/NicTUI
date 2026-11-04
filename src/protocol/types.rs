@@ -5,8 +5,9 @@ pub const BIN_FLASH_BAUD_RATE: u32 = 115200;
 pub const EEPROM_SIZE: usize = 0x2000; // 8 KiB
 pub const BLOCK_SIZE: usize = 32;
 pub const TOTAL_BLOCKS: usize = EEPROM_SIZE / BLOCK_SIZE;
-pub const GROUP_LABEL_COUNT: usize = 16;
+pub const GROUP_LABEL_COUNT: usize = 15;
 pub const GROUP_LABEL_SIZE: usize = 6;
+pub const GROUP_LABEL_TEXT_SIZE: usize = 5;
 pub const GROUP_LABELS_OFFSET: usize = 0x1C90;
 pub const GROUP_LABELS_BLOCK_START: usize = GROUP_LABELS_OFFSET / BLOCK_SIZE;
 pub const GROUP_LABELS_BLOCK_OFFSET: usize = GROUP_LABELS_OFFSET % BLOCK_SIZE;
@@ -77,10 +78,15 @@ pub struct BandPlan {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ScanPreset {
     pub index: u8,
+    /// Stored in 10 Hz units.
     pub start_freq: u32,
+    /// Stored in 0.01 MHz units.
     pub range: u16,
+    /// Stored in 10 Hz units.
     pub step: u16,
+    /// Seconds; zero disables forced resume.
     pub resume: u8,
+    /// Stored in 0.1 second units.
     pub persist: u8,
     pub modulation: u8,
     pub ultrascan: u8,
@@ -104,7 +110,7 @@ pub fn normalize_group_labels(labels: &[String]) -> Vec<String> {
         *slot = label
             .trim()
             .chars()
-            .take(GROUP_LABEL_SIZE)
+            .take(GROUP_LABEL_TEXT_SIZE)
             .collect::<String>();
     }
     normalized
@@ -152,22 +158,22 @@ pub struct SettingsBlock {
     pub auto_floor: u8,           // 0x04 (not used)
     pub active_vfo: u8,           // 0x05
     pub step: u16,                // 0x06 (10Hz units)
-    pub rx_split: u16,            // 0x08 (100kHz units)
-    pub tx_split: u16,            // 0x0a (100kHz units)
+    pub rx_split: u16,            // 0x08 (RX filter transition, 100kHz units)
+    pub tx_split: u16,            // 0x0a (TX filter transition, 100kHz units)
     pub ptt_mode: u8,             // 0x0c
     pub tx_mod_meter: u8,         // 0x0d
     pub mic_gain: u8,             // 0x0e
     pub tx_deviation: u8,         // 0x0f
     pub xtal671_defunct: i8,      // 0x10 (no longer used)
     pub batt_style: u8,           // 0x11
-    pub scan_range: u16,          // 0x12
-    pub scan_persist: u16,        // 0x14
+    pub scan_range: u16,          // 0x12 (0.01MHz units)
+    pub scan_persist: u16,        // 0x14 (0.1s units)
     pub scan_resume: u8,          // 0x16
     pub ultra_scan: u8,           // 0x17
     pub tone_monitor: u8,         // 0x18
     pub lcd_brightness: u8,       // 0x19
     pub lcd_timeout: u8,          // 0x1a
-    pub breathe: u8,              // 0x1b
+    pub breathe: u8,              // 0x1b (seconds, 0=off)
     pub dtmf_dev: u8,             // 0x1c
     pub gamma: u8,                // 0x1d
     pub repeater_tone: u16,       // 0x1e
@@ -182,12 +188,12 @@ pub struct SettingsBlock {
     pub sq_noise_lev: u8,         // 0x4d
     pub last_fmt_freq: u32,       // 0x4e
     pub vox: u8,                  // 0x52
-    pub vox_tail: u16,            // 0x53
+    pub vox_tail: u16,            // 0x53 (0.1s units)
     pub tx_timeout: u8,           // 0x55
     pub dimmer: u8,               // 0x56
     pub dtmf_speed: u8,           // 0x57
     pub noise_gate: u8,           // 0x58
-    pub scan_update: u8,          // 0x59
+    pub scan_update: u8,          // 0x59 (0.1s units)
     pub asl: u8,                  // 0x5a
     pub disable_fmt: u8,          // 0x5b
     pub pin: u16,                 // 0x5c
@@ -198,7 +204,7 @@ pub struct SettingsBlock {
     pub s_bar_always_on: u8,      // 0x62
     pub locked_vfo: u8,           // 0x63
     pub vfo_lock_active: u8,      // 0x64
-    pub dual_watch_delay: u8,     // 0x65
+    pub dual_watch_delay: u8,     // 0x65 (seconds)
     pub sub_tone_deviation: u8,   // 0x66
 }
 
@@ -213,8 +219,10 @@ pub struct VfoState {
 #[derive(Debug, Clone, Copy)]
 pub enum SettingType {
     Numeric {
+        /// Bounds in stored integer units, not display units.
         min: i32,
         max: i32,
+        /// Physical display unit; conversion is defined in setting_value.
         unit: &'static str,
     },
     Boolean,

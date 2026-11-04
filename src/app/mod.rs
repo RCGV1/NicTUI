@@ -37,7 +37,7 @@ pub use state::*;
 
 impl App {
     pub fn new() -> Self {
-        let serial_port_candidates = list_port_candidates().unwrap_or_default();
+        let serial_port_candidates = Vec::new();
         let ble_port_candidates = Vec::new();
         let port_candidates =
             Self::merge_port_candidates(&serial_port_candidates, &ble_port_candidates);
@@ -72,6 +72,7 @@ impl App {
             settings_state: TableState::default(),
             remote_screen: RemoteScreen::default(),
             protocol_port_name: None,
+            active_port_candidate: None,
             ble_scan_in_progress: false,
             ble_scan_ui_suspended: false,
             ble_reconnect_required: false,
@@ -86,19 +87,24 @@ impl App {
             remote_active: false,
             remote_stop_signal: Arc::new(AtomicBool::new(false)),
             remote_tx: None,
+            remote_input_state: Default::default(),
             last_main_tab: MainTab::Channels,
             last_non_remote_tab: MainTab::Channels,
             settings_dirty: false,
             channels_dirty: false,
             dtmf_dirty: false,
             group_labels_dirty: false,
+            scan_presets_dirty: false,
+            band_plans_dirty: false,
             codeplug_data: None,
+            codeplug_workspace_baseline: None,
             codeplug_path: None,
             bin_firmware_data: None,
             bin_file_path: None,
             dialog_open: false,
             pending_channel_edit: None,
             dtmf_edit_preset_idx: None,
+            pending_dtmf_edit: None,
             demo_mode: false,
         }
     }
@@ -126,6 +132,7 @@ impl App {
         app.ports = vec![candidate.port_name.clone()];
         app.selected_port_index = 0;
         app.protocol_port_name = Some("demo://TD-H3".to_string());
+        app.active_port_candidate = Some(candidate);
         app.status_message = "Demo radio connected · simulated data".to_string();
         app.mode = AppMode::Main(MainTab::Channels);
         app.last_main_tab = MainTab::Channels;
@@ -296,10 +303,11 @@ impl App {
         app.settings_state.select(Some(0));
 
         let now = std::time::Instant::now();
+        app.remote_screen.last_received = Some(now);
         app.remote_screen.phase = RemoteSessionPhase::Live;
-        app.remote_screen.signal_strength = 82;
+        app.remote_screen.signal_strength = 36;
         app.remote_screen.noise_level = 14;
-        app.remote_screen.leds = 4;
+        app.remote_screen.leds = 1;
         app.remote_screen.battery_level = Some(68);
         app.remote_screen.battery_text = Some("6.8V".to_string());
         app.remote_screen.last_signal_update = Some(now);
@@ -308,39 +316,70 @@ impl App {
         app.remote_screen.last_text_update = Some(now);
         app.remote_screen.last_status_update = Some(now);
         app.remote_screen.last_led_update = Some(now);
-        app.remote_screen.last_small_status = Some((0x70, 0, 0));
-        app.remote_screen.elements = VecDeque::from(vec![
+        app.remote_screen.last_small_status = Some((0x71, 0, 0));
+        let demo_packets = [
+            RemotePacket::DrawRectangle {
+                x: 0,
+                y: 0,
+                width: 128,
+                height: 128,
+                color: 0,
+            },
             RemotePacket::DisplayText {
-                font_size: 1,
-                x: 1,
+                font_size: 0,
+                x: 4,
                 y: 8,
                 fg_color: 0xFFFF,
                 bg_color: 0,
-                text: "W6SLG".to_string(),
+                text: "A  NORTH RIDGE".to_string(),
             },
             RemotePacket::DisplayText {
-                font_size: 1,
-                x: 1,
-                y: 22,
-                fg_color: 0xFFFF,
+                font_size: 2,
+                x: 4,
+                y: 24,
+                fg_color: 0x07E0,
                 bg_color: 0,
                 text: "145.33500".to_string(),
             },
+            RemotePacket::DrawRectangle {
+                x: 4,
+                y: 57,
+                width: 120,
+                height: 1,
+                color: 0x4208,
+            },
+            RemotePacket::DisplayText {
+                font_size: 0,
+                x: 4,
+                y: 65,
+                fg_color: 0xFFFF,
+                bg_color: 0,
+                text: "B  SIMPLEX".to_string(),
+            },
+            RemotePacket::DisplayText {
+                font_size: 2,
+                x: 4,
+                y: 80,
+                fg_color: 0xFFFF,
+                bg_color: 0,
+                text: "146.52000".to_string(),
+            },
+            RemotePacket::SignalBarPos { y: 104, aux: 0 },
             RemotePacket::SignalStrength {
-                strength: 82,
-                mode: 1,
+                strength: 36,
+                mode: 0,
                 battery: 68,
             },
             RemotePacket::NoiseLevel { level: 14, mode: 1 },
             RemotePacket::SmallStatus {
-                id: 0x70,
+                id: 0x71,
                 value1: 0,
                 value2: 0,
             },
             RemotePacket::DisplayText {
-                font_size: 1,
-                x: 1,
-                y: 70,
+                font_size: 0,
+                x: 99,
+                y: 117,
                 fg_color: 0xFFFF,
                 bg_color: 0,
                 text: "6.8V".to_string(),
@@ -349,8 +388,11 @@ impl App {
                 opcode: 0x7A,
                 payload: vec![0x01, 0x04],
             },
-        ]);
-        app.remote_screen.unknown_packet_count = 1;
+        ];
+        for packet in demo_packets {
+            app.event_tx.send(AppEvent::RemotePacket(packet)).unwrap();
+        }
+        app.update();
         app.remote_screen.last_delta = Some("No decoded state delta observed".to_string());
         app.remote_screen.last_control_report = Some(RemoteControlReport {
             label: "menu".to_string(),
@@ -381,6 +423,7 @@ impl App {
             app.codeplug_path = Some(std::path::PathBuf::from("demo-codeplug.nfw"));
         }
 
+        app.codeplug_workspace_baseline = app.workspace_snapshot();
         app
     }
 
@@ -396,6 +439,9 @@ impl App {
     }
 
     pub fn refresh_ports(&mut self) {
+        if !self.hardware_action_allowed() {
+            return;
+        }
         let current = self.ports.get(self.selected_port_index).cloned();
         self.serial_port_candidates = list_port_candidates().unwrap_or_default();
         self.rebuild_port_candidates(current.as_deref());
@@ -410,6 +456,9 @@ impl App {
     }
 
     pub fn start_ble_scan(&mut self, user_initiated: bool) {
+        if !self.hardware_action_allowed() {
+            return;
+        }
         if self.ble_scan_in_progress {
             if user_initiated {
                 self.status_message = "BLE scan already running...".to_string();
@@ -570,6 +619,9 @@ impl App {
     }
 
     pub fn connect_to_port_by_name(&mut self, port_name: &str) {
+        if !self.hardware_action_allowed() {
+            return;
+        }
         match self
             .ports
             .iter()
@@ -616,6 +668,11 @@ impl App {
     }
 
     pub fn selected_port_candidate(&self) -> Option<&PortCandidate> {
+        if self.mode != AppMode::PortSelection
+            && let Some(candidate) = self.active_port_candidate.as_ref()
+        {
+            return Some(candidate);
+        }
         self.port_candidates.get(self.selected_port_index)
     }
 

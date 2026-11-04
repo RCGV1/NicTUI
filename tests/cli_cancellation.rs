@@ -4,6 +4,7 @@ use std::ffi::c_int;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,6 +15,8 @@ use serialport::{SerialPort, TTYPort};
 struct Directory(PathBuf);
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+// Signal/ACK windows use production wall-clock deadlines, so isolate fixture load.
+static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
 impl Directory {
     fn new() -> Self {
@@ -39,6 +42,7 @@ impl Drop for Directory {
 
 #[test]
 fn temporary_directories_are_unique_under_parallel_creation() {
+    let _fixture = FIXTURE_LOCK.lock().unwrap();
     let workers: Vec<_> = (0..16).map(|_| thread::spawn(Directory::new)).collect();
     let directories: Vec<_> = workers
         .into_iter()
@@ -308,6 +312,7 @@ fn assert_interrupted(output: &Output) {
 
 #[test]
 fn signals_during_paused_cli_reads_resume_before_exit_without_backup() {
+    let _fixture = FIXTURE_LOCK.lock().unwrap();
     for signal in ["INT", "TERM"] {
         for fail_resume in [false, true] {
             let directory = Directory::new();
@@ -338,6 +343,7 @@ fn signals_during_paused_cli_reads_resume_before_exit_without_backup() {
 
 #[test]
 fn signal_during_resume_does_not_overwrite_existing_backup() {
+    let _fixture = FIXTURE_LOCK.lock().unwrap();
     for signal in ["INT", "TERM"] {
         let directory = Directory::new();
         let path = directory.0.join("existing.nfw");
@@ -359,6 +365,7 @@ fn signal_during_resume_does_not_overwrite_existing_backup() {
 
 #[test]
 fn radio_lab_fast_read_also_resumes_before_interrupted_exit() {
+    let _fixture = FIXTURE_LOCK.lock().unwrap();
     for signal in ["INT", "TERM"] {
         let directory = Directory::new();
         let path = directory.0.join("radio.nfw");
@@ -374,6 +381,7 @@ fn radio_lab_fast_read_also_resumes_before_interrupted_exit() {
 
 #[test]
 fn signals_do_not_interrupt_write_preservation_reads_or_writes() {
+    let _fixture = FIXTURE_LOCK.lock().unwrap();
     for signal in ["INT", "TERM"] {
         for at in [InterruptAt::PreservationRead, InterruptAt::FirstWrite] {
             let directory = Directory::new();
@@ -421,6 +429,7 @@ fn signals_do_not_interrupt_write_preservation_reads_or_writes() {
 
 #[test]
 fn signals_during_flash_wait_for_final_packet_ack() {
+    let _fixture = FIXTURE_LOCK.lock().unwrap();
     for signal in ["INT", "TERM"] {
         let directory = Directory::new();
         let path = directory.0.join("firmware.bin");
@@ -481,6 +490,7 @@ fn signals_during_flash_wait_for_final_packet_ack() {
 
 #[test]
 fn radio_lab_activity_signal_closes_port_without_backup_or_mutations() {
+    let _fixture = FIXTURE_LOCK.lock().unwrap();
     for signal in ["INT", "TERM"] {
         let directory = Directory::new();
         let path = directory.0.join("activity.csv");

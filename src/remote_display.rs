@@ -756,12 +756,10 @@ impl Widget for &RadioDisplay {
                         }
                     }
                 }
-                if total > 0 {
-                    return Color::Rgb(
-                        (rgb[0] / total) as u8,
-                        (rgb[1] / total) as u8,
-                        (rgb[2] / total) as u8,
-                    );
+                if let [Some(red), Some(green), Some(blue)] =
+                    rgb.map(|value| value.checked_div(total))
+                {
+                    return Color::Rgb(red as u8, green as u8, blue as u8);
                 }
             }
             for y in y0..y1 {

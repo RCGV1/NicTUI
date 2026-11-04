@@ -152,10 +152,8 @@ impl App {
                     self.edit_buffer.push(c);
                 }
             }
-            KeyCode::Backspace => {
-                if self.active_scan_preset_is_numeric_or_text() {
-                    self.edit_buffer.pop();
-                }
+            KeyCode::Backspace if self.active_scan_preset_is_numeric_or_text() => {
+                self.edit_buffer.pop();
             }
             _ => {}
         }
@@ -236,6 +234,22 @@ impl App {
 mod tests {
     use super::*;
     use crate::protocol::ScanPreset;
+
+    #[test]
+    fn backspace_only_changes_numeric_or_text_scan_preset_fields() {
+        for field in 0..8 {
+            let mut app = App::new();
+            app.mode = AppMode::EditScanPreset(field);
+            app.edit_buffer = "12".to_string();
+            app.selection_index = 1;
+
+            app.handle_scan_preset_editor_key(KeyCode::Backspace);
+
+            assert_eq!(app.edit_buffer, if field == 6 { "12" } else { "1" });
+            assert_eq!(app.selection_index, 1);
+            assert_eq!(app.mode, AppMode::EditScanPreset(field));
+        }
+    }
 
     #[test]
     fn scan_preset_modulation_cycles_three_values() {

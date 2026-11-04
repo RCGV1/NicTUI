@@ -480,7 +480,7 @@ async fn collect_td_h3_ble_devices(adapter: &Adapter) -> Result<Vec<BleDevice>> 
         });
     }
 
-    devices.sort_by(|left, right| right.rssi.cmp(&left.rssi));
+    devices.sort_by_key(|device| std::cmp::Reverse(device.rssi));
     devices.dedup_by(|left, right| left.device_id == right.device_id);
     Ok(devices)
 }

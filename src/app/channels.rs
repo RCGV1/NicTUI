@@ -20,10 +20,8 @@ impl App {
                     self.edit_buffer.push(c);
                 }
             }
-            KeyCode::Backspace => {
-                if self.active_channel_accepts_text_input() {
-                    self.edit_buffer.pop();
-                }
+            KeyCode::Backspace if self.active_channel_accepts_text_input() => {
+                self.edit_buffer.pop();
             }
             _ => {}
         }
@@ -91,6 +89,25 @@ impl App {
 mod tests {
     use super::*;
     use crate::protocol::Channel;
+
+    #[test]
+    fn backspace_only_changes_text_input_channel_fields() {
+        for field in 0..11 {
+            let mut app = App::new();
+            app.mode = AppMode::EditChannel(field);
+            app.edit_buffer = "12".to_string();
+            app.selection_index = 1;
+
+            app.handle_channel_editor_key(KeyCode::Backspace);
+
+            assert_eq!(
+                app.edit_buffer,
+                if matches!(field, 6..=9) { "12" } else { "1" }
+            );
+            assert_eq!(app.selection_index, 1);
+            assert_eq!(app.mode, AppMode::EditChannel(field));
+        }
+    }
 
     #[test]
     fn channel_modulation_cycles_all_modes() {

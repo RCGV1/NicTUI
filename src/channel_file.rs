@@ -176,7 +176,9 @@ fn load_channels_from_csv<R: Read>(reader: R) -> Result<ChannelFileDocument> {
                 document.group_labels = Some(
                     padded
                         .as_bytes()
-                        .chunks_exact(GROUP_LABEL_TEXT_SIZE)
+                        .as_chunks::<GROUP_LABEL_TEXT_SIZE>()
+                        .0
+                        .iter()
                         .map(|label| String::from_utf8_lossy(label).trim().to_string())
                         .collect(),
                 );

@@ -96,10 +96,8 @@ impl App {
                     self.edit_buffer.push(c);
                 }
             }
-            KeyCode::Backspace => {
-                if self.active_setting_is_numeric() {
-                    self.edit_buffer.pop();
-                }
+            KeyCode::Backspace if self.active_setting_is_numeric() => {
+                self.edit_buffer.pop();
             }
             _ => {}
         }
@@ -147,6 +145,27 @@ impl App {
 mod tests {
     use super::*;
     use crate::protocol::SettingsBlock;
+
+    #[test]
+    fn backspace_only_changes_numeric_settings() {
+        for (index, metadata) in SETTINGS_METADATA.iter().enumerate() {
+            let mut app = App::new();
+            app.mode = AppMode::EditSetting(index);
+            app.edit_buffer = "12".to_string();
+            app.selection_index = 1;
+
+            app.handle_settings_editor_key(KeyCode::Backspace);
+
+            let expected = if matches!(metadata.setting_type, SettingType::Numeric { .. }) {
+                "1"
+            } else {
+                "12"
+            };
+            assert_eq!(app.edit_buffer, expected);
+            assert_eq!(app.selection_index, 1);
+            assert_eq!(app.mode, AppMode::EditSetting(index));
+        }
+    }
 
     #[test]
     fn settings_editor_down_moves_forward_through_enum_options() {

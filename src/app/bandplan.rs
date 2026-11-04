@@ -147,10 +147,8 @@ impl App {
                     self.edit_buffer.push(c);
                 }
             }
-            KeyCode::Backspace => {
-                if self.active_bandplan_is_numeric() {
-                    self.edit_buffer.pop();
-                }
+            KeyCode::Backspace if self.active_bandplan_is_numeric() => {
+                self.edit_buffer.pop();
             }
             _ => {}
         }
@@ -226,6 +224,22 @@ impl App {
 mod tests {
     use super::*;
     use crate::protocol::BandPlan;
+
+    #[test]
+    fn backspace_only_changes_numeric_bandplan_fields() {
+        for field in 0..8 {
+            let mut app = App::new();
+            app.mode = AppMode::EditBandPlan(field);
+            app.edit_buffer = "12".to_string();
+            app.selection_index = 1;
+
+            app.handle_bandplan_editor_key(KeyCode::Backspace);
+
+            assert_eq!(app.edit_buffer, if field <= 3 { "1" } else { "12" });
+            assert_eq!(app.selection_index, 1);
+            assert_eq!(app.mode, AppMode::EditBandPlan(field));
+        }
+    }
 
     #[test]
     fn binary_bandplan_option_wraps_without_invalid_third_state() {

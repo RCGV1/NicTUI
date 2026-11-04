@@ -1,7 +1,9 @@
 use anyhow::{Result, anyhow};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+#[cfg(target_os = "macos")]
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -318,15 +320,17 @@ impl RadioProtocol {
                 .timeout(Duration::from_millis(50));
             #[cfg(unix)]
             let port: Box<dyn serialport::SerialPort> = {
-                let mut port = builder.open_native()?;
+                let port = builder.open_native()?;
                 #[cfg(target_os = "macos")]
-                {
+                let port = {
+                    let mut port = port;
                     let _ = port.set_exclusive(false);
-                }
+                    port
+                };
                 Box::new(port)
             };
             #[cfg(not(unix))]
-            let mut port = builder.open()?;
+            let port = builder.open()?;
             let _ = port.clear(serialport::ClearBuffer::All);
             PortHandle::Serial(port)
         };
@@ -666,7 +670,9 @@ impl RadioProtocol {
         let score = |endian| {
             let mut valid = 0usize;
             for chunk in raw
-                .chunks_exact(BAND_PLAN_RECORD_SIZE)
+                .as_chunks::<BAND_PLAN_RECORD_SIZE>()
+                .0
+                .iter()
                 .take(BAND_PLAN_RECORD_COUNT)
             {
                 let start = match endian {
@@ -716,7 +722,9 @@ impl RadioProtocol {
         let mut big_possible = true;
         let mut populated = false;
         for (index, chunk) in raw
-            .chunks_exact(SCAN_PRESET_RECORD_SIZE)
+            .as_chunks::<SCAN_PRESET_RECORD_SIZE>()
+            .0
+            .iter()
             .take(SCAN_PRESET_RECORD_COUNT)
             .enumerate()
         {
@@ -1882,14 +1890,17 @@ impl SettingsBlock {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn effective_baud_rate(port_name: &str, baud_rate: u32) -> u32 {
-    #[cfg(target_os = "macos")]
-    {
-        if should_use_pty_safe_baud(port_name) {
-            return 0;
-        }
+    if should_use_pty_safe_baud(port_name) {
+        return 0;
     }
 
+    baud_rate
+}
+
+#[cfg(not(target_os = "macos"))]
+fn effective_baud_rate(_port_name: &str, baud_rate: u32) -> u32 {
     baud_rate
 }
 
@@ -1908,11 +1919,6 @@ fn should_use_pty_safe_baud(port_name: &str) -> bool {
         .ok()
         .and_then(|target| target.to_str().map(str::to_owned))
         .is_some_and(|target| target.starts_with("/dev/ttys") || target.starts_with("/dev/pts/"))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn should_use_pty_safe_baud(_port_name: &str) -> bool {
-    false
 }
 
 fn parse_tone(raw: u16) -> String {
@@ -2524,6 +2530,14 @@ mod tests {
             RadioProtocol::infer_scan_preset_endianness_checked(&table).unwrap(),
             Endianness::Little
         );
+        table.truncate(SCAN_PRESET_RECORD_COUNT * SCAN_PRESET_RECORD_SIZE);
+        let preset = RadioProtocol::parse_scan_preset(&table[..20], 0, Endianness::Little);
+        table.extend(RadioProtocol::pack_scan_preset(&preset, Endianness::Big));
+        table.extend([0xFF; SCAN_PRESET_RECORD_SIZE - 1]);
+        assert_eq!(
+            RadioProtocol::infer_scan_preset_endianness_checked(&table).unwrap(),
+            Endianness::Little
+        );
     }
 
     #[test]
@@ -2936,6 +2950,32 @@ mod tests {
     }
 
     #[test]
+    fn bandplan_byte_order_ignores_partial_records_and_records_past_table() {
+        let big = [0x00, 0xA4, 0xCB, 0x80, 0x00, 0xD1, 0x0B, 0xA0, 0x00, 0x4A];
+        let mut little = big;
+        little[..4].reverse();
+        little[4..8].reverse();
+        for (record, endian) in [(big, Endianness::Big), (little, Endianness::Little)] {
+            for remainder in 0..BAND_PLAN_RECORD_SIZE {
+                let mut raw = record.to_vec();
+                raw.extend(vec![0xFF; remainder]);
+                assert_eq!(RadioProtocol::infer_bandplan_endianness(&raw), endian);
+            }
+            let mut raw = record.to_vec();
+            raw.resize(BAND_PLAN_RECORD_COUNT * BAND_PLAN_RECORD_SIZE, 0);
+            raw.extend(big);
+            raw.extend(little);
+            assert_eq!(RadioProtocol::infer_bandplan_endianness(&raw), endian);
+        }
+        for length in 0..BAND_PLAN_RECORD_SIZE {
+            assert_eq!(
+                RadioProtocol::infer_bandplan_endianness(&big[..length]),
+                Endianness::Big
+            );
+        }
+    }
+
+    #[test]
     fn parses_live_like_scan_preset_record() {
         let raw = [
             0x00, 0xB2, 0x87, 0x20, 0x07, 0x6C, 0x13, 0x88, 0x02, 0x00, 0x11, 0x61, 0x69, 0x72,
@@ -3193,9 +3233,25 @@ mod tests {
     #[test]
     fn uses_pty_safe_baud_for_real_ptys_only() {
         assert!(should_use_pty_safe_baud("/dev/ttys036"));
+        assert_eq!(effective_baud_rate("/dev/ttys036", BAUD_RATE), 0);
+        assert_eq!(effective_baud_rate("/dev/pts/1", BAUD_RATE), 0);
         assert!(!should_use_pty_safe_baud("/dev/cu.usbserial-210"));
+        assert_eq!(
+            effective_baud_rate("/dev/cu.usbserial-210", BAUD_RATE),
+            BAUD_RATE
+        );
         assert!(!should_use_pty_safe_baud(
             "ble://12345678-1234-5678-9ABC-DEF012345678"
         ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_preserves_requested_baud_for_all_port_names() {
+        for port_name in ["/dev/ttys036", "/dev/pts/1", "/dev/ttyUSB0", "COM1"] {
+            for baud_rate in [0, 9_600, BAUD_RATE] {
+                assert_eq!(effective_baud_rate(port_name, baud_rate), baud_rate);
+            }
+        }
     }
 }

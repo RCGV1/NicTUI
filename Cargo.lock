@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "nictui"
-version = "1.0.5"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "btleplug",

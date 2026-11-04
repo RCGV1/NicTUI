@@ -442,8 +442,32 @@ fn invalid_group_labels_and_firmware_fail_before_opening_a_port() {
 }
 
 #[test]
+fn firmware_rejects_both_ble_uri_forms_before_transport_access() {
+    for port in ["ble://fixture-only", "ble:fixture-only"] {
+        let mut events = Vec::new();
+        let error = flash_firmware(port, &[0x42; 32], |event| events.push(event)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Firmware flashing requires a USB serial connection"
+        );
+        assert!(
+            events.is_empty(),
+            "BLE rejection must precede opening status"
+        );
+    }
+}
+
+#[test]
 fn firmware_partial_and_aligned_images_use_final_data_packet_and_require_ack() {
-    for (length, final_ack) in [(1usize, 0xA3), (32, 0xA3), (33, 0xA3), (33, 0x00)] {
+    for (length, init_ack, final_ack) in [
+        (1usize, false, 0xA3),
+        (32, false, 0xA3),
+        (33, false, 0xA3),
+        (33, false, 0x00),
+        (32, true, 0xA3),
+        (33, true, 0xA3),
+        (33, true, 0x00),
+    ] {
         let (mut master, slave) = TTYPort::pair().unwrap();
         master.set_timeout(Duration::from_secs(3)).unwrap();
         let port = slave.name().unwrap();
@@ -453,6 +477,12 @@ fn firmware_partial_and_aligned_images_use_final_data_packet_and_require_ack() {
             let mut init = [0; 36];
             master.read_exact(&mut init).unwrap();
             assert_eq!(init[0], 0xA0);
+            if init_ack {
+                master.write_all(&[0xA3]).unwrap();
+            } else {
+                // Exercise trailing bootloader chatter before the quiet fallback.
+                master.write_all(&[0xA5, 0xA5]).unwrap();
+            }
             let mut packets = Vec::new();
             for index in 0..length.div_ceil(32) {
                 let mut packet = [0; 36];
@@ -481,5 +511,108 @@ fn firmware_partial_and_aligned_images_use_final_data_packet_and_require_ack() {
         let tail = (length - 1) % 32 + 1;
         assert!(last[4..4 + tail].iter().all(|byte| *byte == 0x42));
         assert!(last[4 + tail..].iter().all(|byte| *byte == 0));
+    }
+}
+
+#[test]
+fn firmware_retries_identical_a1_and_a2_packets_after_lost_ack() {
+    for length in [32usize, 33] {
+        let (mut master, slave) = TTYPort::pair().unwrap();
+        master.set_timeout(Duration::from_secs(3)).unwrap();
+        let port = slave.name().unwrap();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            master.write_all(&[0xA5]).unwrap();
+            let mut packet = [0; 36];
+            master.read_exact(&mut packet).unwrap();
+            assert_eq!(packet[0], 0xA0);
+            master.write_all(&[0xA3]).unwrap();
+            for block in 0..length.div_ceil(32) {
+                master.read_exact(&mut packet).unwrap();
+                assert_eq!(
+                    packet[0],
+                    if block + 1 == length.div_ceil(32) {
+                        0xA2
+                    } else {
+                        0xA1
+                    }
+                );
+                assert_eq!(&packet[1..3], &(block as u16).to_be_bytes());
+                let mut retry = [0; 36];
+                master.read_exact(&mut retry).unwrap();
+                assert_eq!(retry, packet, "Lost ACK must resend exactly the same block");
+                master.write_all(&[0xA3]).unwrap();
+            }
+            thread::sleep(Duration::from_millis(100));
+        });
+        let mut progress = Vec::new();
+        flash_firmware(&port, &vec![0x42; length], |event| {
+            if let nictui::device::ProgressEvent::Progress(value) = event {
+                progress.push(value);
+            }
+        })
+        .unwrap();
+        let blocks = length.div_ceil(32);
+        assert_eq!(
+            progress,
+            (1..=blocks)
+                .map(|block| block as f64 / blocks as f64)
+                .collect::<Vec<_>>()
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn firmware_never_advances_after_missing_or_rejected_data_ack() {
+    for (length, ack) in [
+        (32usize, None),
+        (64, None),
+        (32, Some(0x00)),
+        (64, Some(0x00)),
+    ] {
+        let (mut master, slave) = TTYPort::pair().unwrap();
+        master.set_timeout(Duration::from_secs(3)).unwrap();
+        let port = slave.name().unwrap();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            master.write_all(&[0xA5]).unwrap();
+            let mut packet = [0; 36];
+            master.read_exact(&mut packet).unwrap();
+            assert_eq!(packet[0], 0xA0);
+            master.write_all(&[0xA3]).unwrap();
+            master.read_exact(&mut packet).unwrap();
+            assert_eq!(packet[0], if length == 32 { 0xA2 } else { 0xA1 });
+            assert_eq!(&packet[1..3], &[0, 0]);
+            if let Some(ack) = ack {
+                master.write_all(&[ack]).unwrap();
+            } else {
+                for _ in 0..2 {
+                    let mut retry = [0; 36];
+                    master.read_exact(&mut retry).unwrap();
+                    assert_eq!(retry, packet);
+                }
+            }
+            master.set_timeout(Duration::from_millis(700)).unwrap();
+            let error = master.read_exact(&mut packet[..1]).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        });
+        let mut progress = Vec::new();
+        let error = flash_firmware(&port, &vec![0x42; length], |event| {
+            if let nictui::device::ProgressEvent::Progress(value) = event {
+                progress.push(value);
+            }
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(if ack.is_some() {
+                "rejected block 0"
+            } else {
+                "Missing bootloader ACK for block 0"
+            }),
+            "{error:#}"
+        );
+        assert!(progress.is_empty());
+        worker.join().unwrap();
     }
 }

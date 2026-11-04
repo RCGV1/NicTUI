@@ -865,7 +865,7 @@ impl App {
 
         let _ = crossterm::execute!(
             stdout,
-            crossterm::event::EnableMouseCapture,
+            crossterm::event::DisableMouseCapture,
             crossterm::cursor::Hide
         );
 

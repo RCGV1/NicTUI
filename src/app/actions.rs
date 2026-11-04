@@ -7,6 +7,7 @@ use std::thread;
 use super::state::{App, AppEvent, AppMode, MainTab, RemoteInputState, WriteScope};
 use crate::ble::{
     ble_scan_supported, disconnect_ble_bridge_for_device, ensure_ble_bridge_for_device,
+    parse_ble_device_uri,
 };
 use crate::channel_file::{
     ChannelFileDocument, ChannelFileFormat, infer_channel_file_format,
@@ -1329,19 +1330,23 @@ impl App {
             return;
         }
 
+        if self.ble_transport_selected()
+            || self
+                .protocol_port_name
+                .as_deref()
+                .is_some_and(|port| parse_ble_device_uri(port).is_some())
+        {
+            self.status_message = "Firmware flashing requires a USB serial connection".to_string();
+            return;
+        }
         let Some(port_name) = self.active_protocol_port() else {
             self.mode =
                 AppMode::Error("Not connected to a port. Please select a port first.".to_string());
             return;
         };
-
         let tx = self.event_tx.clone();
         self.progress = 0.0;
-        let _ = tx.send(AppEvent::Status(
-            "Waiting for radio handshake (0xA5)...".to_string(),
-        ));
         self.mode = AppMode::BinFlashing;
-
         thread::spawn(move || {
             match flash_firmware(&port_name, &firmware_data, |event| match event {
                 ProgressEvent::Status(status) => {
@@ -2295,6 +2300,28 @@ mod tests {
             assert!(app.status_message.contains("Codeplug write blocked"));
             assert_eq!(app.codeplug_data, original);
             assert_eq!(app.mode, AppMode::Main(MainTab::Codeplug));
+            assert!(app.event_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn firmware_ble_targets_are_rejected_before_connection_or_worker_start() {
+        for port in [None, Some("ble://fixture-only"), Some("ble:fixture-only")] {
+            let mut app = if port.is_none() {
+                App::demo()
+            } else {
+                App::new()
+            };
+            app.demo_mode = false;
+            app.mode = AppMode::Main(MainTab::BinFlash);
+            app.bin_firmware_data = Some(vec![0x42; 32]);
+            app.protocol_port_name = port.map(str::to_string);
+            app.start_bin_flash();
+            assert_eq!(app.mode, AppMode::Main(MainTab::BinFlash));
+            assert!(
+                app.status_message
+                    .contains("requires a USB serial connection")
+            );
             assert!(app.event_rx.try_recv().is_err());
         }
     }

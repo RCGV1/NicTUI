@@ -1238,6 +1238,9 @@ pub fn flash_firmware<F>(port_name: &str, firmware_data: &[u8], mut report: F) -
 where
     F: FnMut(ProgressEvent),
 {
+    if crate::ble::parse_ble_device_uri(port_name).is_some() {
+        bail!("Firmware flashing requires a USB serial connection");
+    }
     const INIT_SEQUENCE: [u8; 36] = [
         0xA0, 0xEE, 0x74, 0x71, 0x07, 0x74, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
@@ -1280,12 +1283,19 @@ where
         }
     }
 
-    // The bootloader repeats A5 until the initialization burst has settled.
+    // Accept the init ACK, or allow bootloaders that go quiet without one.
+    // Drain trailing A5 bytes so they cannot be mistaken for a data-block ACK.
     let settle_started = Instant::now();
+    let mut last_activity = settle_started;
     loop {
+        if settle_started.elapsed() >= Duration::from_secs(2) {
+            bail!("Timeout waiting for bootloader initialization to settle");
+        }
         match proto.read_byte()? {
-            Some(0xA5) if settle_started.elapsed() < Duration::from_secs(2) => {}
-            None => break,
+            Some(0xA3) => break,
+            Some(0xA5) => last_activity = Instant::now(),
+            None if last_activity.elapsed() >= Duration::from_millis(400) => break,
+            None => {}
             Some(byte) => bail!("Unexpected bootloader initialization response: {byte:02X}"),
         }
     }
@@ -1301,17 +1311,34 @@ where
         packet[3] = packet[4..]
             .iter()
             .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
-        proto
-            .send_bytes(&packet)
-            .with_context(|| format!("Failed to send firmware block {block}"))?;
-        let ack = proto
-            .recv(1, Duration::from_secs(1))
-            .with_context(|| format!("Missing bootloader ACK for block {block}"))?;
-        if ack[0] != 0xA3 {
-            bail!(
-                "Bootloader rejected block {block}: expected A3, got {:02X}",
-                ack[0]
-            );
+        // NicSure's firmware_flash_protocol.txt requires A3 for every data
+        // packet, including the final A2. Lost ACKs may only retry this block.
+        for attempt in 1..=3 {
+            proto
+                .send_bytes(&packet)
+                .with_context(|| format!("Failed to send firmware block {block}"))?;
+            let sent_at = Instant::now();
+            let mut acknowledged = false;
+            while sent_at.elapsed() < Duration::from_millis(500) {
+                match proto.read_byte().with_context(|| {
+                    format!("Failed to receive bootloader ACK for block {block}")
+                })? {
+                    Some(0xA3) => {
+                        acknowledged = true;
+                        break;
+                    }
+                    Some(byte) => {
+                        bail!("Bootloader rejected block {block}: expected A3, got {byte:02X}");
+                    }
+                    None => {}
+                }
+            }
+            if acknowledged {
+                break;
+            }
+            if attempt == 3 {
+                bail!("Missing bootloader ACK for block {block} after 3 attempts");
+            }
         }
         report(ProgressEvent::Progress(
             (block + 1) as f64 / block_count as f64,

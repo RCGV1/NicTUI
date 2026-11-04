@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.VERSION }}
-      should_release: ${{ steps.check_release.outputs.result != 'true' }}
+      should_release: ${{ steps.check_release.outputs.result == 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,38 +32,79 @@ jobs:
       - name: Check if release already exists
         id: check_release
         run: |
+          set -euo pipefail
           VERSION="${{ steps.version.outputs.VERSION }}"
-          REPO="${{ github.repository }}"
-          # Check for both tag and release
-          if gh api "repos/${REPO}/releases/tags/v${VERSION}" --silent 2>/dev/null; then
-            echo "Release v${VERSION} already exists"
-            echo "result=true" >> $GITHUB_OUTPUT
-          else
-            echo "Release v${VERSION} does not exist - will create release"
-            echo "result=false" >> $GITHUB_OUTPUT
+          if ! HTTP_STATUS="$(curl --silent --show-error --output /dev/null \
+            --connect-timeout 10 --max-time 30 --write-out '%{http_code}' \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/v${VERSION}")"; then
+            echo "Release lookup failed; refusing to publish." >&2
+            exit 1
           fi
+          case "${HTTP_STATUS}" in
+            200)
+              echo "Release v${VERSION} already exists"
+              echo "result=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              if git show-ref --verify --quiet "refs/tags/v${VERSION}"; then
+                TAG_COMMIT="$(git rev-parse "refs/tags/v${VERSION}^{commit}")"
+                if [[ "${TAG_COMMIT}" != "${GITHUB_SHA}" ]]; then
+                  echo "Existing version tag does not match the tested commit; refusing to publish." >&2
+                  exit 1
+                fi
+              fi
+              test -s ".github/release-notes/v${VERSION}.md"
+              echo "Release v${VERSION} does not exist - will create release"
+              echo "result=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Release lookup returned HTTP ${HTTP_STATUS}; refusing to publish." >&2
+              exit 1
+              ;;
+          esac
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Output version check result
         run: |
           echo "Version: ${{ steps.version.outputs.VERSION }}"
-          echo "Should release: ${{ steps.check_release.outputs.result != 'true' }}"
+          echo "Should release: ${{ steps.check_release.outputs.result == 'false' }}"
 
   contract-checks:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15-intel, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libudev-dev
 
-      - name: Run remote/BLE contract checks
+      - name: Install Rust quality-check components
+        run: rustup component add rustfmt clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build all targets
+        run: cargo build --locked --all-targets
+
+      - name: Run full test suite
+        run: cargo test --locked --all-targets
+
+      - name: Run terminal and simulated bootloader regressions
+        if: runner.os != 'Windows'
         run: |
-          cargo test --locked remote::tests
-          cargo test --locked ble::tests
-          cargo test --locked protocol::radio::tests
-          cargo test --locked cli::tests
+          cargo build --locked --bin nictui
+          python3 scripts/test_terminal_and_flash.py target/debug/nictui
 
   build-macos-x86_64:
     needs: [check-version, contract-checks]
@@ -288,7 +329,7 @@ jobs:
           echo "VERSION=$version" >> $env:GITHUB_OUTPUT
 
       - name: Build Release
-        run: cargo build --release --target x86_64-pc-windows-msvc --bin nictui
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin nictui
 
       - name: Rename binary
         run: mv target/x86_64-pc-windows-msvc/release/nictui.exe nictui-${{ steps.version.outputs.VERSION }}-windows-x86_64.exe
@@ -316,7 +357,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libudev-dev
 
       - name: Build Release
-        run: cargo build --release --target x86_64-unknown-linux-gnu --bin nictui
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu --bin nictui
 
       - name: Rename binary
         run: mv target/x86_64-unknown-linux-gnu/release/nictui nictui-${{ steps.version.outputs.VERSION }}-linux-x86_64
@@ -376,37 +417,7 @@ jobs:
           name: Release v${{ steps.version.outputs.VERSION }}
           files: |
             release-assets/*
-          body: |
-            ## What's New
-
-            - Native Bluetooth support for TD-H3/NicSure radios, including scan, connect, probe, channel read, and TUI startup selection without a Python bridge.
-            - A signed and notarized macOS `NicTUI.app` bundle for the recommended first-run Bluetooth permission experience.
-            - Cleaner TUI screens with compact headers/footers, safer channel/settings focus panels, better BLE signal/status display, and Remote tab layouts that hold up on smaller terminals.
-            - Safer write flows: BLE writes are chunked for common GATT limits, full settings writes support `--no-reboot`, and experimental remote live writes require explicit confirmation or validation-only mode.
-            - Remote support is now honest about what the radio proves: telemetry/status capture is first-class, while control attempts are labeled by observed radio response instead of implied success.
-            - The installer now prefers the macOS app bundle on macOS, keeps CLI install available with `--cli`, verifies checksums, and uses a managed PATH block instead of editing unrelated shell config.
-
-            ## Download Artifacts
-
-            | Platform | CLI binary | App bundle |
-            |----------|------------|------------|
-            | Linux x86_64 | `nictui-${{ steps.version.outputs.VERSION }}-linux-x86_64` | n/a |
-            | macOS x86_64 (Intel) | `nictui-${{ steps.version.outputs.VERSION }}-macos-x86_64` | `NicTUI-${{ steps.version.outputs.VERSION }}-macos-x86_64.app.zip` |
-            | macOS aarch64 (Apple Silicon) | `nictui-${{ steps.version.outputs.VERSION }}-macos-aarch64` | `NicTUI-${{ steps.version.outputs.VERSION }}-macos-aarch64.app.zip` |
-            | Windows x86_64 | `nictui-${{ steps.version.outputs.VERSION }}-windows-x86_64.exe` | n/a |
-
-            ## Note
-
-            Linux ARM builds are temporarily disabled. See GitHub Actions workflow for status.
-            On macOS, prefer the `NicTUI.app.zip` asset for the recommended app UX and Bluetooth/TCC permission attribution to NicTUI itself.
-            The macOS app bundle archives are Developer ID signed, Apple-notarized, and stapled by release CI.
-            The raw macOS `nictui-*` CLI assets are provided for shell scripting and advanced terminal workflows. They are Developer ID signed but are not the recommended first-run Bluetooth permission path.
-
-            ## Verification
-
-            From the directory containing the downloaded assets, verify checksums:
-            ```
-            sha256sum -c checksums.txt
-            ```
+          body_path: .github/release-notes/v${{ steps.version.outputs.VERSION }}.md
+          target_commitish: ${{ github.sha }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

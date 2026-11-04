@@ -54,10 +54,26 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+struct TerminalSession;
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show,
+            crossterm::style::ResetColor
+        );
+    }
+}
+
 fn launch_tui(port: Option<String>, demo: bool, demo_view: DemoView) -> Result<()> {
+    let session = TerminalSession;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, DisableMouseCapture, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -82,53 +98,63 @@ fn launch_tui(port: Option<String>, demo: bool, demo_view: DemoView) -> Result<(
     } else if let Some(port_name) = port {
         app.connect_to_port_by_name(&port_name);
     } else if should_auto_start_ble_scan() {
-        app.start_ble_scan(should_prepare_ui_for_startup_ble_scan());
+        app.start_ble_scan(false);
     }
     let res = run_app(&mut terminal, &mut app);
 
-    let restore_result = (|| -> Result<()> {
-        disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )?;
-        terminal.show_cursor()?;
-        Ok(())
-    })();
-    // Restoration may also fail on a closed TTY; retain the original loop error.
-    res.and(restore_result)?;
-
+    drop(terminal);
+    drop(session);
+    res?;
     print_post_exit_skill_hint();
 
     Ok(())
 }
 
 fn should_auto_start_ble_scan() -> bool {
-    true
-}
-
-fn should_prepare_ui_for_startup_ble_scan() -> bool {
-    cfg!(target_os = "macos")
+    !cfg!(target_os = "macos")
 }
 
 fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
 where
     <B as ratatui::backend::Backend>::Error: std::error::Error + Send + Sync + 'static,
 {
-    run_app_with_events(terminal, app, |timeout| {
-        if event::poll(timeout)? {
-            event::read().map(Some)
-        } else {
-            Ok(None)
-        }
-    })
+    run_app_with_events_and_mouse(
+        terminal,
+        app,
+        |timeout| {
+            if event::poll(timeout)? {
+                event::read().map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+        |enabled| {
+            if enabled {
+                execute!(io::stdout(), EnableMouseCapture)
+            } else {
+                execute!(io::stdout(), DisableMouseCapture)
+            }
+        },
+    )
 }
 
+#[cfg(test)]
 fn run_app_with_events<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
+    next_event: impl FnMut(Duration) -> io::Result<Option<Event>>,
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: std::error::Error + Send + Sync + 'static,
+{
+    run_app_with_events_and_mouse(terminal, app, next_event, |_| Ok(()))
+}
+
+fn run_app_with_events_and_mouse<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
     mut next_event: impl FnMut(Duration) -> io::Result<Option<Event>>,
+    mut set_mouse_capture: impl FnMut(bool) -> io::Result<()>,
 ) -> Result<()>
 where
     <B as ratatui::backend::Backend>::Error: std::error::Error + Send + Sync + 'static,
@@ -137,6 +163,7 @@ where
     let mut needs_redraw = true;
     let mut shutdown = TuiShutdown::default();
     let mut last_redraw = Instant::now();
+    let mut mouse_captured = false;
 
     loop {
         needs_redraw |= app.update();
@@ -158,6 +185,17 @@ where
             // A closed terminal must not terminate a worker that still owns the radio.
             std::thread::sleep(Duration::from_millis(50));
             continue;
+        }
+
+        let wants_mouse = app.mode == AppMode::Main(MainTab::Remote)
+            && !app.dialog_open
+            && !app.remote_screen.show_diagnostics;
+        if wants_mouse != mouse_captured {
+            if let Err(error) = set_mouse_capture(wants_mouse) {
+                shutdown.terminal_failed(app, error.into())?;
+                continue;
+            }
+            mouse_captured = wants_mouse;
         }
 
         let is_dialog_open = app.dialog_open;
@@ -231,7 +269,6 @@ where
             }
 
             needs_redraw = true;
-
             if shutdown.handle_key(app, key) {
                 continue;
             }
@@ -996,15 +1033,56 @@ mod tests {
 
     #[test]
     fn startup_ble_auto_scan_matches_platform_policy() {
-        assert!(should_auto_start_ble_scan());
+        assert_eq!(should_auto_start_ble_scan(), !cfg!(target_os = "macos"));
     }
 
     #[test]
-    fn startup_ble_scan_prepares_ui_only_when_platform_needs_it() {
-        assert_eq!(
-            should_prepare_ui_for_startup_ble_scan(),
-            cfg!(target_os = "macos")
-        );
+    fn writes_and_flashes_keep_the_ui_locked_until_completion() {
+        for mode in [AppMode::Writing, AppMode::BinFlashing] {
+            let mut app = App::demo();
+            app.mode = mode.clone();
+            let mut shutdown = TuiShutdown::default();
+            for code in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('f')] {
+                assert!(shutdown.handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE)));
+                assert_eq!(app.mode, mode);
+                assert!(!shutdown.ready(&app));
+            }
+            assert!(app.status_message.starts_with("Quit queued;"));
+        }
+        let mut app = App::demo();
+        app.mode = AppMode::Main(MainTab::BinFlash);
+        assert!(!TuiShutdown::default().handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn mouse_capture_is_limited_to_the_visible_remote_keypad() {
+        let mut app = App::demo();
+        app.mode = AppMode::Main(MainTab::Channels);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut events = [
+            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        ]
+        .into_iter()
+        .map(Event::Key);
+        let mut capture_changes = Vec::new();
+        run_app_with_events_and_mouse(
+            &mut terminal,
+            &mut app,
+            |_| Ok(Some(events.next().expect("UI must quit on q"))),
+            |enabled| {
+                capture_changes.push(enabled);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(capture_changes, [true, false, true, false]);
     }
 
     #[test]

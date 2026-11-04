@@ -414,6 +414,9 @@ fn signals_during_flash_wait_for_final_packet_ack() {
         master.set_timeout(Duration::from_secs(3)).unwrap();
         master.read_exact(&mut packet[1..]).unwrap();
         assert_eq!(packet[0], 0xA0);
+        if signal == "INT" {
+            master.write_all(&[0xA3]).unwrap();
+        }
         for index in 0..2u16 {
             master.read_exact(&mut packet).unwrap();
             assert_eq!(packet[0], if index == 0 { 0xA1 } else { 0xA2 });

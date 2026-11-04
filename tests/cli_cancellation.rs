@@ -176,6 +176,8 @@ fn drive_memory(
     let mut process = Process::spawn(command);
     let mut data = memory();
     let mut trace = Vec::new();
+    let mut resume_timing = Vec::new();
+    let mut resume_attempts = 0;
     let mut paused = false;
     let mut signalled = false;
     let started = Instant::now();
@@ -250,6 +252,14 @@ fn drive_memory(
             InterruptAt::FirstWrite => matches!(request, Request::Write(_)),
         };
         trace.push(request);
+        if request == Request::Resume {
+            resume_attempts += 1;
+            resume_timing.push(format!(
+                "resume #{resume_attempts} received at +{:?}; response={:02X}; fail_first_resume={fail_first_resume}",
+                request_received.duration_since(started),
+                response[0]
+            ));
+        }
         if should_interrupt && !signalled {
             if matches!(interrupt_at, InterruptAt::PreservationRead) {
                 let session_start = trace.iter().rposition(|&r| r == Request::Ping).unwrap();
@@ -275,21 +285,46 @@ fn drive_memory(
                 );
                 assert!(!trace.iter().any(|r| matches!(r, Request::Write(_))));
             }
-            process.interrupt(signal);
-            // Repeated signals are cooperative too, not an implicit hard-exit path.
-            process.interrupt(signal);
+            // Resume has a 500ms ACK deadline; do not stack the interrupt helper's sleeps.
+            if matches!(interrupt_at, InterruptAt::Resume) {
+                process.signal(signal);
+                process.signal(signal);
+                resume_timing.push(format!(
+                    "resume #{resume_attempts} both {signal} sends returned after {:?}",
+                    request_received.elapsed()
+                ));
+            } else {
+                process.interrupt(signal);
+                // Repeated signals are cooperative too, not an implicit hard-exit path.
+                process.interrupt(signal);
+            }
             signalled = true;
         }
         if request == Request::Resume {
             thread::sleep(Duration::from_millis(50));
+            resume_timing.push(format!(
+                "resume #{resume_attempts} before ACK write at +{:?}; held={:?}",
+                started.elapsed(),
+                request_received.elapsed()
+            ));
             process.assert_running(&format!(
-                "exit preceded resume ACK (fixture held reply for {:?}); trace: {trace:?}",
+                "exit preceded resume ACK (fixture held reply for {:?}); resume timing: {resume_timing:?}; trace: {trace:?}",
                 request_received.elapsed()
             ));
         }
-        master.write_all(&response).unwrap();
+        master.write_all(&response).unwrap_or_else(|error| {
+            panic!("PTY reply failed: {error}; resume timing: {resume_timing:?}; trace: {trace:?}")
+        });
+        if request == Request::Resume {
+            resume_timing.push(format!(
+                "resume #{resume_attempts} ACK write completed at +{:?}; held={:?}",
+                started.elapsed(),
+                request_received.elapsed()
+            ));
+        }
     }
     let output = process.output();
+    eprintln!("{signal} resume timing: {resume_timing:?}");
     assert!(
         signalled,
         "test never reached its interruption boundary: {trace:?}; {output:?}"

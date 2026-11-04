@@ -173,6 +173,23 @@ create_app_zip() {
     COPYFILE_DISABLE=1 ditto -c -k --keepParent --norsrc "${APP_DIR}" "${zip_path}"
 }
 
+run_stapler_with_retry() {
+    local attempt status delay=5
+    for attempt in 1 2 3 4 5; do
+        if xcrun stapler "$@"; then
+            return 0
+        else
+            status=$?
+        fi
+        if [[ "${status}" -ne 68 || "${attempt}" -eq 5 ]]; then
+            return "${status}"
+        fi
+        echo "stapler $1 failed with status 68 (attempt ${attempt}/5); retrying in ${delay}s..." >&2
+        sleep "${delay}"
+        delay=$((delay * 2))
+    done
+}
+
 VERSION="$(
     awk -F'"' '/^version = / { print $2; exit }' "${ROOT_DIR}/Cargo.toml"
 )"
@@ -247,8 +264,8 @@ if [[ "${NOTARIZE}" -eq 1 ]]; then
         --issuer "${NOTARY_ISSUER}" \
         --wait
     echo "Stapling notarization ticket to NicTUI.app..."
-    xcrun stapler staple "${APP_DIR}"
-    xcrun stapler validate "${APP_DIR}"
+    run_stapler_with_retry staple "${APP_DIR}"
+    run_stapler_with_retry validate "${APP_DIR}"
     create_app_zip "${ZIP_PATH}"
 fi
 

@@ -177,6 +177,14 @@ jobs:
           echo "NOTARIZATION_CONFIGURED=true" >> "${GITHUB_ENV}"
           echo "Apple notarization configured."
 
+      # Force stapler to TCP on disposable runners: https://github.com/actions/runner-images/issues/14924
+      - name: Force TCP for notarization ticket delivery
+        if: runner.environment == 'github-hosted'
+        run: |
+          set -euo pipefail
+          echo "block return out quick proto udp from any to any port 443" | sudo pfctl -f -
+          sudo pfctl -E
+
       - name: Build Release Binary and NicTUI.app
         run: |
           BUILD_ARGS=(
@@ -280,6 +288,14 @@ jobs:
           echo "NICTUI_NOTARY_ISSUER=${APPLE_NOTARY_ISSUER_ID}" >> "${GITHUB_ENV}"
           echo "NOTARIZATION_CONFIGURED=true" >> "${GITHUB_ENV}"
           echo "Apple notarization configured."
+
+      # Force stapler to TCP on disposable runners: https://github.com/actions/runner-images/issues/14924
+      - name: Force TCP for notarization ticket delivery
+        if: runner.environment == 'github-hosted'
+        run: |
+          set -euo pipefail
+          echo "block return out quick proto udp from any to any port 443" | sudo pfctl -f -
+          sudo pfctl -E
 
       - name: Build Release Binary and NicTUI.app
         run: |

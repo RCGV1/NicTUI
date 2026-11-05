@@ -1,6 +1,6 @@
 ---
 name: "nictui-radio-cli"
-description: "Use when a user wants an AI to inspect or modify a TD-H3 radio through the installed `nictui` command-line interface, monitor scan activity, or replay raw activity recordings offline. This skill must use the NicTUI CLI only, requires NicSure mod firmware for live radio work (not offline replay), prefers focused single-record updates over bulk writes, creates backups before changes, runs `--validate-only` before real writes, and verifies the result after changes."
+description: "Use when a user wants an AI to inspect or modify a TD-H3 radio through the installed `nictui` command-line interface, monitor scan activity, monitor ASL COS status with the source-only post-v1.0.8 prototype, or replay raw recordings offline. This skill must use the NicTUI CLI only, requires NicSure mod firmware for live radio work (not offline replay), prefers focused single-record updates over bulk writes, creates backups before changes, runs `--validate-only` before real writes, and verifies the result after changes."
 ---
 
 # NicTUI Radio CLI
@@ -52,9 +52,28 @@ Capture only listens apart from a connection ping; it must not configure, naviga
 
 Signal is raw, not dBm. CSV uses the original Programmer-compatible `Frequency,Count,Signal` columns: MHz to five decimal places, hit count, and mean raw signal to two decimal places. Report capture/replay results and output artifacts, not write validation or configuration changes.
 
+## Passive ASL COS Status (Source-Only Prototype)
+
+This post-v1.0.8 development prototype is **not included in v1.0.8**. Require a source build providing `nictui asl monitor --help` and `nictui asl replay --help`; if unavailable, report that limitation rather than substituting Remote commands. This first pass reports carrier-operated squelch (COS) status only, not voice audio, PTT control, or an AllStarLink voice bridge.
+
+Skip the programming startup sequence for ASL requests. Ask the user to manually set Menu 45 **ASL Support** to **USB**, per the [nicFW V2 user manual](https://github.com/nicsure/nicfw2docs/blob/main/TIDRADIO%20TD-H3%20User%20Manual%20for%20nicFW%20V2.pdf), and stop Activity capture and the radio's Activity Mode, Remote, and all other serial users first. Use an already-known explicit wired serial port; if none is supplied, ask without discovery. A metadata-only OS check accepts enumerated USB serial devices; unknown, Bluetooth, and virtual ports are rejected. Do not use BLE, `ports`, `probe`, `doctor`, handshakes, pings, or settings writes to prepare monitoring.
+
+```bash
+nictui asl monitor --port "<known-wired-serial-port>" --duration 30 --json
+nictui asl replay --input raw.bin --json
+```
+
+Monitoring sends no UART command bytes or PTT commands; it performs no handshake, ping, probe, or settings writes. Replay is offline and needs no radio. Silence, including when ASL is Off, leaves COS **Unknown** until a status event is received; never report silence as a healthy connection or closed squelch. Unexpected bytes stop decoding immediately with Unknown and retained counts. Replay timestamps reflect host processing time, not original capture time. JSON `complete` means normal capture/replay completion, not radio health. Report observed COS status only, not RF strength, voice activity, or transmission success.
+
+Use only a known handheld-radio USB programming connection, not an adapter that keys PTT from serial modem pins. USB metadata does not verify wiring. Native OS serial initialization may toggle DTR/RTS even without application pin-control calls; these are OS/driver side effects, not firmware command writes. Electrical pin preservation or prevention of RF transmission across arbitrary adapters is not guaranteed.
+
+The current programming USB connection does **not** carry audio PCM. Future voice use requires a separate audio interface/cable; audio I/O and PTT control are not implemented in this prototype.
+
 ## If `nictui` is missing
 
 For Activity requests, install v1.0.8 or later, then follow the passive scan activity guidance above rather than the programming startup sequence.
+
+For ASL COS requests, require the source-only post-v1.0.8 prototype described above; the v1.0.8 release installer does not provide these commands.
 
 1. Check for the binary:
    ```bash
@@ -73,7 +92,7 @@ For Activity requests, install v1.0.8 or later, then follow the passive scan act
 
 ## Required programming startup sequence
 
-Use this sequence for programming workflows, not Activity monitoring or offline replay.
+Use this sequence for programming workflows, not Activity or ASL monitoring or offline replay.
 
 1. Detect likely ports:
    ```bash
@@ -259,5 +278,5 @@ For programming changes:
 
 - A programming `probe` cannot complete a handshake.
 - The detected firmware is `stock/original` for a requested live operation.
-- The target is ambiguous; for programming, use `ports --json` and targeted probes, but for Activity ask the user without probing.
+- The target is ambiguous; for programming, use `ports --json` and targeted probes, but for Activity or ASL ask the user without probing.
 - The requested change would require a bulk write when the user asked for a narrow change.

@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, SyncSender, TrySendError},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -17,6 +17,11 @@ use crate::activity::{
     ActivityDecoder, ActivityEvent, ActivityLog, format_frequency_mhz, write_activity_csv,
 };
 use crate::activity_session::{ActivityMonitorEvent, ActivityMonitorOptions, monitor_activity};
+use crate::asl::{CosDecoder, CosSnapshot, CosState};
+use crate::asl_session::{
+    AslMonitorError, AslMonitorEvent, AslMonitorOptions, AslMonitorSummary, AslStopReason,
+    monitor_asl,
+};
 use crate::ble::{
     BleReadinessReport, BleTarget, assess_ble_readiness, default_scan_timeout,
     disconnect_ble_bridge_for_device, ensure_ble_bridge, parse_ble_device_uri,
@@ -110,6 +115,23 @@ Replay timestamps are host processing times, not original capture times.";
 const LEGACY_REMOTE_VM_ERROR: &str =
     "Legacy vm is disabled: use exit for orange V/M button; use explicit ptt-b for transmission";
 
+const ASL_AFTER_HELP: &str = "\
+COS monitoring only, not voice or audio capture.
+Manually select Menu 45 ASL USB on the radio before monitoring.
+Stop Activity, Remote, and other serial apps before opening the port.
+Use an explicit wired USB serial port at 38400 baud; BLE and automatic discovery
+are not supported. NicTUI sends zero UART command bytes, no PTT commands, and
+performs no handshake or radio settings changes. OS/driver port opening may
+change DTR/RTS; electrical pin preservation is not guaranteed.
+A silent stream remains Unknown, not evidence of health.
+Unexpected bytes stop capture immediately with state Unknown; no resynchronization.
+
+Examples:
+  nictui asl monitor --port <serial> --duration 30 --json
+  nictui asl replay --input raw.bin --json
+
+Replay timestamps are host replay processing times, not original capture times.";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "nictui",
@@ -196,6 +218,12 @@ pub enum Commands {
     Activity {
         #[command(subcommand)]
         command: ActivityCommand,
+    },
+    /// Monitor ASL USB COS state or replay raw COS bytes, not voice/audio
+    #[command(after_help = ASL_AFTER_HELP)]
+    Asl {
+        #[command(subcommand)]
+        command: AslCommand,
     },
     /// Inspect or install the bundled AI radio-control skill
     Skill {
@@ -473,6 +501,52 @@ pub struct ActivityReplayArgs {
     /// Emit one final JSON object instead of text hits
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AslCommand {
+    /// Receive COS state from an explicit wired USB port, with zero UART command bytes
+    #[command(after_help = ASL_AFTER_HELP)]
+    Monitor(AslMonitorArgs),
+    /// Decode raw COS bytes offline; stop on the first unexpected byte
+    #[command(after_help = ASL_AFTER_HELP)]
+    Replay(AslReplayArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct AslMonitorArgs {
+    /// Explicit wired USB serial port; no BLE, discovery, or probing
+    #[arg(long, value_parser = parse_asl_port)]
+    pub port: String,
+    /// Monitor duration in seconds (at least 1)
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    pub duration: u64,
+    /// Emit one final JSON object instead of live COS changes
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct AslReplayArgs {
+    /// Raw COS bytes to decode without opening any serial port
+    #[arg(long)]
+    pub input: PathBuf,
+    /// Emit one final JSON object with host replay timestamps
+    #[arg(long)]
+    pub json: bool,
+}
+
+fn parse_asl_port(port: &str) -> std::result::Result<String, String> {
+    if port.trim().is_empty()
+        || port.trim() != port
+        || port.contains("://")
+        || port.to_ascii_lowercase().starts_with("ble:")
+    {
+        return Err(
+            "ASL requires an explicit wired USB serial port, not a URI or BLE target".into(),
+        );
+    }
+    Ok(port.into())
 }
 
 #[derive(Subcommand, Debug)]
@@ -1259,6 +1333,13 @@ pub fn dispatch(cli: Cli) -> Result<Dispatch> {
             match command {
                 ActivityCommand::Monitor(args) => run_activity_monitor(args)?,
                 ActivityCommand::Replay(args) => run_activity_replay(args)?,
+            }
+            Ok(Dispatch::Exit)
+        }
+        Some(Commands::Asl { command }) => {
+            match command {
+                AslCommand::Monitor(args) => run_asl_monitor(args)?,
+                AslCommand::Replay(args) => run_asl_replay(args)?,
             }
             Ok(Dispatch::Exit)
         }
@@ -2638,6 +2719,254 @@ fn run_activity_replay(args: ActivityReplayArgs) -> Result<()> {
         write_activity_csv(path, &capture.log)?;
     }
     print_activity_capture(&capture, args.json, true)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AslCaptureStop {
+    DurationElapsed,
+    Cancelled,
+    Fault,
+    EndOfInput,
+}
+
+#[derive(Serialize)]
+struct AslCaptureView {
+    source: &'static str,
+    timestamp_source: &'static str,
+    complete: bool,
+    state: CosState,
+    open_reports: u64,
+    closed_reports: u64,
+    transitions: u64,
+    last_report_at: Option<String>,
+    last_transition_at: Option<String>,
+    port_opened_at: Option<String>,
+    elapsed_seconds: f64,
+    stop_reason: AslCaptureStop,
+    error: Option<String>,
+}
+
+fn asl_timestamp(at: SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339()
+}
+
+impl AslCaptureView {
+    fn new(cos: CosSnapshot, elapsed: Duration, stop_reason: AslCaptureStop, replay: bool) -> Self {
+        Self {
+            source: if replay { "replay" } else { "monitor" },
+            timestamp_source: if replay {
+                "host_replay"
+            } else {
+                "host_receive"
+            },
+            complete: matches!(
+                stop_reason,
+                AslCaptureStop::DurationElapsed | AslCaptureStop::EndOfInput
+            ),
+            state: cos.state,
+            open_reports: cos.open_reports,
+            closed_reports: cos.closed_reports,
+            transitions: cos.transitions,
+            last_report_at: cos.last_report_at.map(asl_timestamp),
+            last_transition_at: cos.last_transition_at.map(asl_timestamp),
+            port_opened_at: None,
+            elapsed_seconds: elapsed.as_secs_f64(),
+            stop_reason,
+            error: None,
+        }
+    }
+
+    fn fault(&mut self, error: &anyhow::Error) {
+        self.complete = false;
+        self.state = CosState::Unknown;
+        self.stop_reason = AslCaptureStop::Fault;
+        self.error = Some(format!("{error:#}"));
+    }
+
+    fn bytes(&self, json: bool) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        if json {
+            serde_json::to_writer(&mut bytes, self)?;
+            writeln!(bytes)?;
+        } else {
+            writeln!(
+                bytes,
+                "ASL summary: {} open reports, {} closed reports, {} transitions; final COS {:?}; stop {}{}",
+                self.open_reports,
+                self.closed_reports,
+                self.transitions,
+                self.state,
+                serde_json::to_value(&self.stop_reason)?
+                    .as_str()
+                    .unwrap_or("fault"),
+                if self.state == CosState::Unknown {
+                    "; Unknown is not evidence of health"
+                } else {
+                    ""
+                },
+            )?;
+        }
+        Ok(bytes)
+    }
+}
+
+fn enqueue_asl_state(output: &ActivityOutput, at: SystemTime, state: CosState) -> Result<()> {
+    output.enqueue(format!("{} | COS {state:?}\n", asl_timestamp(at)).into_bytes())
+}
+
+fn finish_asl_capture(
+    output: ActivityOutput,
+    mut capture: AslCaptureView,
+    json: bool,
+    failure: Option<anyhow::Error>,
+    cancelled: impl Fn() -> bool,
+) -> Result<()> {
+    // EOF or duration expiry can race a signal after the receive loop's last poll.
+    if cancelled() {
+        capture.complete = false;
+        capture.stop_reason = AslCaptureStop::Cancelled;
+    }
+    output.enqueue(capture.bytes(json)?)?;
+    output.finish().context("ASL output incomplete")?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if cancelled() || matches!(capture.stop_reason, AslCaptureStop::Cancelled) {
+        bail!("Interrupted: ASL capture cancelled; partial summary retained");
+    }
+    Ok(())
+}
+
+fn run_asl_monitor(args: AslMonitorArgs) -> Result<()> {
+    // Setup guidance stays outside the receive callback, which must never block on I/O.
+    eprintln!(
+        "Manually select Menu 45 ASL USB; stop Activity, Remote, and other serial apps. COS only, not voice/audio. Wired USB 38400 baud; zero UART command bytes, no PTT commands, no handshake or automatic radio changes. OS/driver opening may change DTR/RTS."
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let output = ActivityOutput::new(Some(Arc::clone(&stop)))?;
+    run_asl_monitor_with(args, stop, output, |port, options, report| {
+        monitor_asl(port, options, report)
+    })
+}
+
+fn run_asl_monitor_with(
+    args: AslMonitorArgs,
+    stop: Arc<AtomicBool>,
+    output: ActivityOutput,
+    monitor: impl FnOnce(
+        &str,
+        &AslMonitorOptions,
+        &mut dyn FnMut(AslMonitorEvent),
+    ) -> std::result::Result<AslMonitorSummary, AslMonitorError>,
+) -> Result<()> {
+    let options = AslMonitorOptions {
+        duration: Duration::from_secs(args.duration),
+        stop_signal: Some(Arc::clone(&stop)),
+    };
+    let mut port_opened_at = None;
+    let mut output_error = None;
+    let result = monitor(&args.port, &options, &mut |event| {
+        let state = match event {
+            AslMonitorEvent::PortOpened { at } => {
+                port_opened_at = Some(asl_timestamp(at));
+                Some((at, CosState::Unknown))
+            }
+            AslMonitorEvent::Cos(report) => (report.previous == CosState::Unknown
+                || report.transitioned)
+                .then_some((report.at, report.state)),
+        };
+        if !args.json
+            && output_error.is_none()
+            && let Some((at, state)) = state
+            && let Err(error) = enqueue_asl_state(&output, at, state)
+        {
+            output_error = Some(error);
+            stop.store(true, Ordering::Relaxed);
+        }
+    });
+    let (summary, mut failure) = match result {
+        Ok(summary) => (summary, None),
+        Err(error) => {
+            let failure = anyhow!("{error}");
+            (error.partial, Some(failure))
+        }
+    };
+    let reason = match summary.reason {
+        AslStopReason::DurationElapsed => AslCaptureStop::DurationElapsed,
+        AslStopReason::Cancelled => AslCaptureStop::Cancelled,
+        AslStopReason::Fault => AslCaptureStop::Fault,
+    };
+    let mut capture = AslCaptureView::new(summary.cos, summary.elapsed, reason, false);
+    capture.port_opened_at = port_opened_at;
+    if let Some(error) = output_error {
+        failure = Some(error.context("ASL capture stopped because output is incomplete"));
+    }
+    if let Some(error) = &failure {
+        capture.fault(error);
+    }
+    finish_asl_capture(output, capture, args.json, failure, || {
+        crate::cancellation::is_requested() || stop.load(Ordering::Relaxed)
+    })
+}
+
+fn run_asl_replay(args: AslReplayArgs) -> Result<()> {
+    let output = ActivityOutput::new(None)?;
+    let input = File::open(&args.input)
+        .map(BufReader::new)
+        .with_context(|| format!("Failed to open ASL recording {}", args.input.display()));
+    run_asl_replay_from_reader(input, args.json, output, crate::cancellation::is_requested)
+}
+
+fn run_asl_replay_from_reader(
+    input: Result<impl Read>,
+    json: bool,
+    output: ActivityOutput,
+    cancelled: impl Fn() -> bool,
+) -> Result<()> {
+    let mut decoder = CosDecoder::new();
+    let started = Instant::now();
+    let mut output_error = None;
+    let result = (|| -> Result<()> {
+        if !json {
+            enqueue_asl_state(&output, SystemTime::now(), CosState::Unknown)?;
+        }
+        let mut input = input?;
+        let mut bytes = [0; 8192];
+        loop {
+            if cancelled() {
+                break;
+            }
+            let length = input
+                .read(&mut bytes)
+                .context("Failed to read ASL recording")?;
+            if length == 0 {
+                break;
+            }
+            for byte in &bytes[..length] {
+                if let Some(report) = decoder.feed(*byte, SystemTime::now())?
+                    && !json
+                    && (report.previous == CosState::Unknown || report.transitioned)
+                    && let Err(error) = enqueue_asl_state(&output, report.at, report.state)
+                {
+                    output_error = Some(error);
+                    bail!("ASL replay stopped because output is incomplete");
+                }
+            }
+        }
+        Ok(())
+    })();
+    let mut capture = AslCaptureView::new(
+        decoder.snapshot(),
+        started.elapsed(),
+        AslCaptureStop::EndOfInput,
+        true,
+    );
+    let failure = output_error.or_else(|| result.err());
+    if let Some(error) = &failure {
+        capture.fault(error);
+    }
+    finish_asl_capture(output, capture, json, failure, cancelled)
 }
 
 fn run_remote_capture(args: RemoteMonitorArgs) -> Result<()> {
@@ -5279,6 +5608,290 @@ mod activity_output_tests {
             io::ErrorKind::BrokenPipe
         );
         assert!(stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn asl_monitor_backpressure_cancels_without_blocking_its_callback() {
+        let (output, entered, release) = blocked_output();
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        let result = run_asl_monitor_with(
+            AslMonitorArgs {
+                port: "mock-usb".into(),
+                duration: 30,
+                json: false,
+            },
+            Arc::clone(&stop),
+            output,
+            |port, options, report| {
+                assert_eq!(port, "mock-usb");
+                assert_eq!(options.duration, Duration::from_secs(30));
+                report(AslMonitorEvent::PortOpened {
+                    at: SystemTime::UNIX_EPOCH,
+                });
+                entered.recv_timeout(Duration::from_secs(2)).unwrap();
+                let mut decoder = CosDecoder::new();
+                for byte in [0x10, 0x11].into_iter().cycle().take(1000) {
+                    let event = decoder.feed(byte, SystemTime::UNIX_EPOCH).unwrap().unwrap();
+                    report(AslMonitorEvent::Cos(event));
+                    if options
+                        .stop_signal
+                        .as_ref()
+                        .unwrap()
+                        .load(Ordering::Relaxed)
+                    {
+                        break;
+                    }
+                }
+                assert!(stop.load(Ordering::Relaxed));
+                Ok(AslMonitorSummary {
+                    cos: decoder.snapshot(),
+                    elapsed: started.elapsed(),
+                    reason: AslStopReason::Cancelled,
+                })
+            },
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        release.send(()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod asl_cli_tests {
+    use super::*;
+    use crate::asl_session::AslFailureKind;
+    use std::sync::Mutex;
+
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn output() -> (ActivityOutput, Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>) {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let output = ActivityOutput::with_writer(
+            RecordingWriter(Arc::clone(&bytes)),
+            Some(Arc::clone(&stop)),
+        )
+        .unwrap();
+        (output, bytes, stop)
+    }
+
+    fn args(json: bool) -> AslMonitorArgs {
+        AslMonitorArgs {
+            port: "mock-usb".into(),
+            duration: 1,
+            json,
+        }
+    }
+
+    #[test]
+    fn monitor_prints_initial_and_changed_states_without_duplicate_spam() {
+        let (output, bytes, stop) = output();
+        run_asl_monitor_with(args(false), stop, output, |_, _, report| {
+            let at = SystemTime::UNIX_EPOCH;
+            report(AslMonitorEvent::PortOpened { at });
+            let mut decoder = CosDecoder::new();
+            for byte in [0, 0x10, 0x10, 0x11, 0x11, 0x10] {
+                if let Some(cos) = decoder.feed(byte, at).unwrap() {
+                    report(AslMonitorEvent::Cos(cos));
+                }
+            }
+            Ok(AslMonitorSummary {
+                cos: decoder.snapshot(),
+                elapsed: Duration::from_secs(1),
+                reason: AslStopReason::DurationElapsed,
+            })
+        })
+        .unwrap();
+        let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let states: Vec<_> = text
+            .lines()
+            .filter_map(|line| line.split_once(" | COS ").map(|(_, state)| state))
+            .collect();
+        assert_eq!(states, ["Unknown", "Closed", "Open", "Closed"]);
+        assert!(text.contains("3 closed reports"));
+    }
+
+    #[test]
+    fn monitor_json_is_one_final_object_and_port_open_is_not_health() {
+        let (output, bytes, stop) = output();
+        run_asl_monitor_with(args(true), stop, output, |_, _, report| {
+            report(AslMonitorEvent::PortOpened {
+                at: SystemTime::UNIX_EPOCH,
+            });
+            assert!(bytes.lock().unwrap().is_empty());
+            Ok(AslMonitorSummary {
+                cos: CosDecoder::new().snapshot(),
+                elapsed: Duration::from_secs(1),
+                reason: AslStopReason::DurationElapsed,
+            })
+        })
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
+        assert_eq!(json["state"], "unknown");
+        assert_eq!(json["stop_reason"], "duration_elapsed");
+        assert_eq!(json["timestamp_source"], "host_receive");
+        assert!(json["port_opened_at"].is_string());
+        assert!(json["last_report_at"].is_null());
+        assert!(json.get("healthy").is_none());
+    }
+
+    #[test]
+    fn monitor_fault_returns_nonzero_with_unknown_partial_json() {
+        for setup in [false, true] {
+            let (output, bytes, stop) = output();
+            let result = run_asl_monitor_with(args(true), stop, output, |_, _, report| {
+                let mut decoder = CosDecoder::new();
+                let kind = if setup {
+                    AslFailureKind::Setup("mock USB validation failed".into())
+                } else {
+                    report(AslMonitorEvent::PortOpened {
+                        at: SystemTime::UNIX_EPOCH,
+                    });
+                    report(AslMonitorEvent::Cos(
+                        decoder.feed(0x11, SystemTime::UNIX_EPOCH).unwrap().unwrap(),
+                    ));
+                    AslFailureKind::Read(io::Error::other("mock disconnect"))
+                };
+                Err(AslMonitorError {
+                    kind,
+                    partial: AslMonitorSummary {
+                        cos: decoder.snapshot(),
+                        elapsed: Duration::ZERO,
+                        reason: AslStopReason::Fault,
+                    },
+                })
+            });
+            assert!(result.is_err());
+            let json: serde_json::Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
+            assert_eq!(json["state"], "unknown");
+            assert_eq!(json["open_reports"], u64::from(!setup));
+            assert_eq!(json["stop_reason"], "fault");
+            assert_eq!(json["complete"], false);
+            assert!(json["error"].is_string());
+        }
+    }
+
+    #[test]
+    fn monitor_cancellation_returns_nonzero_with_partial_json() {
+        let (output, bytes, stop) = output();
+        let result = run_asl_monitor_with(args(true), stop, output, |_, _, _| {
+            Ok(AslMonitorSummary {
+                cos: CosDecoder::new().snapshot(),
+                elapsed: Duration::ZERO,
+                reason: AslStopReason::Cancelled,
+            })
+        });
+        assert!(result.unwrap_err().to_string().contains("Interrupted"));
+        let json: serde_json::Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
+        assert_eq!(json["stop_reason"], "cancelled");
+        assert_eq!(json["complete"], false);
+    }
+
+    #[test]
+    fn replay_cancellation_at_eof_or_read_error_cannot_claim_completion() {
+        struct CancelAtBoundary {
+            input: io::Cursor<Vec<u8>>,
+            stop: Arc<AtomicBool>,
+            fail_at_boundary: bool,
+        }
+
+        impl Read for CancelAtBoundary {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                let length = self.input.read(bytes)?;
+                if length == 0 {
+                    self.stop.store(true, Ordering::Relaxed);
+                    if self.fail_at_boundary {
+                        return Err(io::Error::other("mock boundary read failure"));
+                    }
+                }
+                Ok(length)
+            }
+        }
+
+        for fail_at_boundary in [false, true] {
+            let (output, bytes, stop) = output();
+            let input = CancelAtBoundary {
+                input: io::Cursor::new(vec![0x11, 0x11]),
+                stop: Arc::clone(&stop),
+                fail_at_boundary,
+            };
+            let result = run_asl_replay_from_reader(Ok(input), true, output, || {
+                stop.load(Ordering::Relaxed)
+            });
+            assert!(result.is_err());
+            let json: serde_json::Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
+            assert_eq!(json["stop_reason"], "cancelled");
+            assert_eq!(json["complete"], false);
+            assert_eq!(json["open_reports"], 2);
+            assert_eq!(
+                json["state"],
+                if fail_at_boundary { "unknown" } else { "open" }
+            );
+            if fail_at_boundary {
+                assert!(
+                    json["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("mock boundary read failure")
+                );
+            } else {
+                assert!(result.unwrap_err().to_string().contains("Interrupted"));
+            }
+        }
+    }
+
+    #[test]
+    fn monitor_late_cancellation_overrides_expiry_even_with_a_fault() {
+        for fault in [false, true] {
+            let (output, bytes, stop) = output();
+            let result = run_asl_monitor_with(args(true), stop, output, |_, options, report| {
+                let mut decoder = CosDecoder::new();
+                report(AslMonitorEvent::Cos(
+                    decoder.feed(0x11, SystemTime::UNIX_EPOCH).unwrap().unwrap(),
+                ));
+                let summary = AslMonitorSummary {
+                    cos: decoder.snapshot(),
+                    elapsed: Duration::from_secs(1),
+                    reason: if fault {
+                        AslStopReason::Fault
+                    } else {
+                        AslStopReason::DurationElapsed
+                    },
+                };
+                // Signal arrives after the session's last receive-loop cancellation poll.
+                options
+                    .stop_signal
+                    .as_ref()
+                    .unwrap()
+                    .store(true, Ordering::Relaxed);
+                if fault {
+                    Err(AslMonitorError {
+                        kind: AslFailureKind::Read(io::Error::other("mock late fault")),
+                        partial: summary,
+                    })
+                } else {
+                    Ok(summary)
+                }
+            });
+            assert!(result.is_err());
+            let json: serde_json::Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
+            assert_eq!(json["stop_reason"], "cancelled");
+            assert_eq!(json["complete"], false);
+            assert_eq!(json["open_reports"], 1);
+            assert_eq!(json["state"], if fault { "unknown" } else { "open" });
+        }
     }
 }
 

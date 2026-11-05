@@ -17,6 +17,8 @@
 pub mod activity;
 pub mod activity_session;
 pub mod app;
+pub mod asl;
+pub mod asl_session;
 pub mod ble;
 pub mod cancellation;
 pub mod channel_file;

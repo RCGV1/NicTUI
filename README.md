@@ -445,6 +445,23 @@ Signal readings are **raw radio values, not dBm**. CSV export is compatible with
 
 The TUI has a separate **Activity** tab, not the Remote control view. With the explicit-port command above, the target is selected passively until you start an action. Press uppercase `A` outside Remote or cycle tabs with `Tab`, then `s` to start or stop local capture. It shows frequency in MHz, hit count, mean raw signal, last-seen time on wider terminals, plus connection status and heartbeat count. Stop capture and wait for cleanup before other radio operations. Starting a new capture begins a fresh log; export previous results first if needed.
 
+### ASL COS Status (Source-Only Prototype)
+
+This post-v1.0.8 development prototype is **not included in v1.0.8**. Use a source build that provides `nictui asl monitor --help` and `nictui asl replay --help`. This first pass reports carrier-operated squelch (COS) status only, not voice audio, PTT control, or an AllStarLink voice bridge.
+
+Before monitoring, manually set Menu 45 **ASL Support** to **USB**, as described in the [nicFW V2 user manual](https://github.com/nicsure/nicfw2docs/blob/main/TIDRADIO%20TD-H3%20User%20Manual%20for%20nicFW%20V2.pdf). Stop Activity capture and the radio's Activity Mode, Remote, and all other serial users first. Use an already-known explicit wired serial port; no BLE or automatic target discovery. A metadata-only OS check accepts enumerated USB serial devices; unknown, Bluetooth, and virtual ports are rejected. Do not run `ports`, `probe`, `doctor`, or settings writes to prepare this passive workflow.
+
+```bash
+nictui asl monitor --port "<known-wired-serial-port>" --duration 30 --json
+nictui asl replay --input raw.bin --json
+```
+
+Monitoring sends no UART command bytes or PTT commands: no handshake, ping, probe, or settings writes. Replay is offline and needs no radio. Silence, including when ASL is Off, leaves COS **Unknown** until a status event is received; it is not evidence of a healthy connection or closed squelch. Unexpected bytes stop decoding immediately with Unknown and retained counts. Replay timestamps reflect host processing time, not original capture time. JSON `complete` means normal capture/replay completion, not radio health.
+
+Use only a known handheld-radio USB programming connection, not an adapter that keys PTT from serial modem pins. USB metadata does not verify wiring. Native OS serial initialization may toggle DTR/RTS even without application pin-control calls; these are OS/driver side effects, not firmware command writes. Electrical pin preservation or prevention of RF transmission across arbitrary adapters is not guaranteed.
+
+The current programming USB connection does **not** carry audio PCM. Future voice use requires a separate audio interface/cable; audio I/O is not implemented in this prototype.
+
 ### Remote CLI
 
 ```bash

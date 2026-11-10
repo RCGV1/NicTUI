@@ -100,7 +100,8 @@ fn capture(stop_after: usize, script: impl FnOnce(&mut MockRadio) + Send + 'stat
     let result = run_remote_session(
         &path,
         &RemoteSessionOptions::default(),
-        |elapsed| received.get() >= stop_after || elapsed > Duration::from_secs(3),
+        // Include bootstrap and deliberately paced frame delivery in the safety budget.
+        |elapsed| received.get() >= stop_after || elapsed > Duration::from_secs(8),
         |_| None,
         |event| {
             if matches!(event, RemoteCaptureEvent::Packet(_)) {

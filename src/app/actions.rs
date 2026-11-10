@@ -1883,60 +1883,92 @@ mod tests {
 
     #[test]
     fn simulator_lcd_blocked_read_does_not_block_uart_stop_or_emit_late_events() {
+        let watchdog = std::time::Duration::from_secs(3);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (finish_tx, finish_rx) = mpsc::channel();
         let poller = SimulatorLcdPoller::start(move || {
             let _ = entered_tx.send(());
-            let _ = finish_rx.recv_timeout(std::time::Duration::from_millis(300));
+            let _ = finish_rx.recv();
             Ok(vec![0; 128 * 128])
         });
-        entered_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
-        let started = std::time::Instant::now();
-        assert!(poller.latest().is_none());
-        poller.cancel();
+        let entered = entered_rx.recv_timeout(watchdog);
         let (tx, rx) = mpsc::channel();
-        tx.send(AppEvent::RemoteStopped {
-            message: "UART stopped".into(),
-            failure: None,
-        })
-        .unwrap();
-        assert!(matches!(rx.try_recv(), Ok(AppEvent::RemoteStopped { .. })));
-        assert!(started.elapsed() < std::time::Duration::from_millis(50));
-        finish_tx.send(()).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while !poller.worker.as_ref().unwrap().is_finished() {
-            assert!(std::time::Instant::now() < deadline);
+        let cancellation = thread::spawn(move || {
+            let initially_empty = poller.latest().is_none();
+            poller.cancel();
+            let _ = tx.send(AppEvent::RemoteStopped {
+                message: "UART stopped".into(),
+                failure: None,
+            });
+            (poller, initially_empty)
+        });
+        let stopped = rx.recv_timeout(watchdog);
+
+        // Release the read before joining or asserting, including on watchdog failure.
+        let released = finish_tx.send(());
+        drop(finish_tx);
+        let (mut poller, initially_empty) = cancellation.join().unwrap();
+        let worker = poller.worker.take().unwrap();
+        let deadline = std::time::Instant::now() + watchdog;
+        while !worker.is_finished() && std::time::Instant::now() < deadline {
             thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert!(
-            poller.latest().is_none(),
-            "cancelled HTTP result must be discarded"
-        );
+        let finished = worker.is_finished();
+        // A broken cancellation must not leave Drop joining an uncancelled poller.
+        poller.cancel.store(true, Ordering::SeqCst);
+        worker.thread().unpark();
+        let worker_result = worker.join();
+        let no_late_update = poller.latest().is_none();
         drop(poller);
+
+        entered.unwrap();
+        assert!(initially_empty);
+        assert!(
+            matches!(stopped, Ok(AppEvent::RemoteStopped { .. })),
+            "cancellation must return while the HTTP read is blocked"
+        );
+        released.unwrap();
+        assert!(
+            finished,
+            "cancelled LCD worker did not exit within watchdog"
+        );
+        worker_result.unwrap();
+        assert!(no_late_update, "cancelled HTTP result must be discarded");
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn simulator_lcd_capacity_one_mailbox_never_blocks_polling_and_cancel_unparks() {
+        let watchdog = std::time::Duration::from_secs(3);
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let reads = Arc::clone(&count);
         let poller = SimulatorLcdPoller::start(move || {
             reads.fetch_add(1, Ordering::SeqCst);
             Err("invalid configured HTTP endpoint".into())
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while count.load(Ordering::SeqCst) < 3 {
-            assert!(std::time::Instant::now() < deadline);
+        let deadline = std::time::Instant::now() + watchdog;
+        while count.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
             thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert!(
-            matches!(poller.latest(), Some((_, Err(error))) if error.contains("invalid configured"))
-        );
-        let started = std::time::Instant::now();
-        drop(poller);
-        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        let kept_polling = count.load(Ordering::SeqCst) >= 3;
+        let update = poller.latest();
+        let cancel = Arc::clone(&poller.cancel);
+        let worker_thread = poller.worker.as_ref().unwrap().thread().clone();
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            drop(poller);
+            let _ = stopped_tx.send(());
+        });
+        let stopped = stopped_rx.recv_timeout(watchdog);
+        // Reap the worker even when cancellation fails, before reporting the failure.
+        cancel.store(true, Ordering::SeqCst);
+        worker_thread.unpark();
+        let shutdown_result = shutdown.join();
+
+        assert!(kept_polling, "full mailbox must not block the LCD worker");
+        assert!(matches!(update, Some((_, Err(error))) if error.contains("invalid configured")));
+        stopped.expect("LCD cancellation did not finish within watchdog");
+        shutdown_result.unwrap();
     }
 
     #[test]

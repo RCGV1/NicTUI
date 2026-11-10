@@ -697,7 +697,7 @@ fn nine_full_source_scenes_match_independent_c_glyph_composition() {
                     .unwrap();
                 assert!(output.status.success());
                 assert_eq!(output.stdout.len(), 128 * 128 * 2);
-                for (i, bytes) in output.stdout.chunks_exact(2).enumerate() {
+                for (i, bytes) in output.stdout.as_chunks::<2>().0.iter().enumerate() {
                     let color = u16::from_le_bytes([bytes[0], bytes[1]]);
                     if color != 0x1234 {
                         expected[i] = color;

@@ -40,9 +40,14 @@ fi
 if [[ ${#ARGS[@]} -eq 0 ]] || [[ "${ARGS[0]}" == "tui" ]]; then
     SESSION_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nictui-session.XXXXXX")"
     COMMAND_FILE="${SESSION_DIR}/NicTUI.command"
+    PROFILE_FILE="${SESSION_DIR}/NicTUI.terminal"
+    PROFILE_TEMPLATE="${SELF_DIR}/../Resources/NicTUI.terminal"
     {
         printf '#!/bin/bash\n'
-        printf 'trap '\''rm -f -- "$0"; rmdir -- "$(dirname "$0")"'\'' EXIT\n'
+        printf 'trap '\''rm -f -- "$0" "${0%%.command}.terminal"; rmdir -- "$(dirname "$0")"'\'' EXIT\n'
+        # The GUI handoff must not inherit a headless caller's color policy.
+        printf 'unset NO_COLOR\n'
+        printf 'if [[ -z "${TERM:-}" || "$TERM" == dumb ]]; then export TERM=xterm-256color; fi\n'
         printf '%q ' "$APP_BINARY"
         if [[ ${#ARGS[@]} -gt 0 ]]; then
             printf '%q ' "${ARGS[@]}"
@@ -50,8 +55,19 @@ if [[ ${#ARGS[@]} -eq 0 ]] || [[ "${ARGS[0]}" == "tui" ]]; then
         printf '\n'
     } > "$COMMAND_FILE"
     chmod +x "$COMMAND_FILE"
-    if ! open -a Terminal "$COMMAND_FILE"; then
-        rm -f -- "$COMMAND_FILE"
+    LAUNCH_FILE="$COMMAND_FILE"
+    if [[ -f "$PROFILE_TEMPLATE" ]]; then
+        printf -v COMMAND_STRING '/bin/bash %q' "$COMMAND_FILE"
+        if ! cp "$PROFILE_TEMPLATE" "$PROFILE_FILE" \
+            || ! /usr/bin/plutil -insert CommandString -string "$COMMAND_STRING" "$PROFILE_FILE"; then
+            rm -f -- "$COMMAND_FILE" "$PROFILE_FILE"
+            rmdir -- "$SESSION_DIR"
+            exit 1
+        fi
+        LAUNCH_FILE="$PROFILE_FILE"
+    fi
+    if ! open -a Terminal "$LAUNCH_FILE"; then
+        rm -f -- "$COMMAND_FILE" "$PROFILE_FILE"
         rmdir -- "$SESSION_DIR"
         exit 1
     fi

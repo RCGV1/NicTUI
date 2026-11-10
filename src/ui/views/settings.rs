@@ -6,7 +6,7 @@ use crate::ui::theme::{
     COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_PRIMARY, COLOR_SELECTION_BG, COLOR_SELECTION_FG,
     COLOR_SURFACE_1, COLOR_SURFACE_2, COLOR_TEXT, COLOR_WARNING,
 };
-use crate::ui::views::ready_state::{ReadyStateAction, ReadyStateContent, render_ready_state};
+use crate::ui::views::ready_state::{ReadyStateContent, render_ready_state};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -29,20 +29,20 @@ pub fn render_settings_table(f: &mut Frame, app: &mut App, area: Rect) {
                     outer_title: "Settings",
                     card_title: "Ready To Load",
                     heading: "No Settings Loaded",
-                    description: "Read the radio to load settings into the workspace.".to_string(),
+                    description: "r: read settings | Shift+R: read all sections | 8: import .nfw"
+                        .into(),
                     note: None,
                 },
-                &[ReadyStateAction {
-                    key: "r",
-                    label: "read radio",
-                }],
+                &[],
             );
             return;
         }
     };
 
     let summary_height = if area.width < 90 { 3 } else { 2 };
-    let detail_height = if area.width < 90 { 6 } else { 5 };
+    let selected_bluetooth = app.settings_state.selected() == Some(BLUETOOTH_SETTING_INDEX);
+    let detail_height = if selected_bluetooth { 8 } else { 6 };
+    let compact_columns = area.width < 76;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -56,7 +56,7 @@ pub fn render_settings_table(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .enumerate()
         .filter(|(index, meta)| {
-            matches!(meta.setting_type, SettingType::Boolean) && settings.get_value(*index) != 0
+            matches!(meta.setting_type, SettingType::Boolean) && settings.get_value(*index) == 1
         })
         .count();
     let numeric_count = SETTINGS_METADATA
@@ -70,12 +70,13 @@ pub fn render_settings_table(f: &mut Frame, app: &mut App, area: Rect) {
     let selected_label = app
         .settings_state
         .selected()
-        .map(|index| format!("M{}", SETTINGS_METADATA[index].menu_num))
+        .and_then(|index| SETTINGS_METADATA.get(index))
+        .map(|meta| format!("M{}", meta.menu_num))
         .unwrap_or_else(|| "--".to_string());
-    let bluetooth_summary = if settings.get_value(BLUETOOTH_SETTING_INDEX) == 0 {
-        "BLE disabled"
-    } else {
-        "BLE enabled"
+    let bluetooth_summary = match settings.get_value(BLUETOOTH_SETTING_INDEX) {
+        0 => "BLE disabled",
+        1 => "BLE enabled",
+        _ => "BLE unknown",
     };
 
     let summary_text = if area.width < 90 {
@@ -123,18 +124,23 @@ pub fn render_settings_table(f: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(COLOR_TEXT)
         };
 
-        Row::new(vec![
+        let mut cells = vec![
             Cell::from(meta.menu_num),
-            Cell::from(meta.name),
-            Cell::from(setting_kind(meta)),
-            Cell::from(display_val),
-        ])
-        .style(style)
+            Cell::from(truncate_line(
+                meta.name,
+                if compact_columns { 22 } else { 24 },
+            )),
+        ];
+        if !compact_columns {
+            cells.push(Cell::from(setting_kind(meta)));
+        }
+        cells.push(Cell::from(display_val));
+        Row::new(cells).style(style)
     });
 
     let (title, border_style) = if app.settings_dirty {
         (
-            " RADIO SETTINGS (UNSAVED) ",
+            " SETTINGS (UNSAVED local; w writes + reboots) ",
             Style::default().fg(COLOR_WARNING),
         )
     } else {
@@ -143,20 +149,36 @@ pub fn render_settings_table(f: &mut Frame, app: &mut App, area: Rect) {
 
     let table = Table::new(
         rows,
-        [
-            Constraint::Length(4),
-            Constraint::Length(24),
-            Constraint::Length(10),
-            Constraint::Min(18),
-        ],
+        if compact_columns {
+            vec![
+                Constraint::Length(3),
+                Constraint::Length(22),
+                Constraint::Min(14),
+            ]
+        } else {
+            vec![
+                Constraint::Length(4),
+                Constraint::Length(24),
+                Constraint::Length(10),
+                Constraint::Min(18),
+            ]
+        },
     )
     .header(
-        Row::new(vec![
-            Cell::from("M#").style(Style::default().fg(COLOR_ACCENT)),
-            Cell::from("Setting").style(Style::default().fg(COLOR_ACCENT)),
-            Cell::from("Type").style(Style::default().fg(COLOR_ACCENT)),
-            Cell::from("Value").style(Style::default().fg(COLOR_ACCENT)),
-        ])
+        Row::new(if compact_columns {
+            vec![
+                Cell::from("M#").style(Style::default().fg(COLOR_ACCENT)),
+                Cell::from("Setting").style(Style::default().fg(COLOR_ACCENT)),
+                Cell::from("Value").style(Style::default().fg(COLOR_ACCENT)),
+            ]
+        } else {
+            vec![
+                Cell::from("M#").style(Style::default().fg(COLOR_ACCENT)),
+                Cell::from("Setting").style(Style::default().fg(COLOR_ACCENT)),
+                Cell::from("Type").style(Style::default().fg(COLOR_ACCENT)),
+                Cell::from("Value").style(Style::default().fg(COLOR_ACCENT)),
+            ]
+        })
         .style(Style::default().bg(COLOR_SURFACE_2))
         .height(1),
     )
@@ -177,7 +199,7 @@ pub fn render_settings_table(f: &mut Frame, app: &mut App, area: Rect) {
 
     f.render_stateful_widget(table, chunks[1], &mut app.settings_state);
 
-    let detail = Paragraph::new(selected_setting_lines(app, settings, area.width < 90))
+    let detail = Paragraph::new(selected_setting_lines(app, settings, area.width))
         .style(Style::default().fg(COLOR_TEXT).bg(COLOR_SURFACE_1))
         .wrap(ratatui::widgets::Wrap { trim: true })
         .block(
@@ -198,11 +220,7 @@ fn setting_kind(meta: &SettingMetadata) -> &'static str {
     }
 }
 
-fn selected_setting_lines(
-    app: &App,
-    settings: &SettingsBlock,
-    compact: bool,
-) -> Vec<Line<'static>> {
+fn selected_setting_lines(app: &App, settings: &SettingsBlock, width: u16) -> Vec<Line<'static>> {
     let Some(index) = app.settings_state.selected() else {
         return vec![
             Line::from("No setting selected"),
@@ -219,15 +237,19 @@ fn selected_setting_lines(
         ];
     };
 
-    let meta = &SETTINGS_METADATA[index];
+    let Some(meta) = SETTINGS_METADATA.get(index) else {
+        return vec![Line::from("No setting selected")];
+    };
     let display_value = settings.get_display_value(index);
     let raw_value = settings.get_value(index);
     let detail = format!("Allowed: {}", allowed_values(index));
     let bluetooth_hint = if index == BLUETOOTH_SETTING_INDEX {
         Some(if raw_value == 0 {
-            "BLE is disabled. Turn this on before using a phone app or NicTUI over BLE."
+            "Workspace BLE: Off. Set On, then w writes and reboots the radio."
+        } else if raw_value == 1 {
+            "Workspace BLE: On; radio state unverified."
         } else {
-            "BLE is enabled. You can scan from the connection screen."
+            "BLE state is unknown. Choose Off or On to replace the stored code."
         })
     } else {
         None
@@ -252,7 +274,7 @@ fn selected_setting_lines(
             ),
             Span::raw(setting_storage_hint(meta, raw_value, &display_value)),
         ]),
-        Line::from(if compact {
+        Line::from(if width < 90 {
             vec![
                 Span::styled(
                     setting_kind(meta),
@@ -262,7 +284,7 @@ fn selected_setting_lines(
                 ),
                 Span::raw(format!(
                     " | {}",
-                    truncate_line(&compact_detail(&detail), 56)
+                    truncate_line(&compact_detail(&detail), width.saturating_sub(12) as usize)
                 )),
             ]
         } else {
@@ -284,7 +306,7 @@ fn selected_setting_lines(
             render_shortcut("r"),
             Span::raw(": Read | "),
             render_shortcut("w"),
-            Span::raw(": Write"),
+            Span::raw(": Write + reboot"),
         ]),
     ];
 

@@ -15,11 +15,11 @@ pub(crate) fn render_group_label_editor(f: &mut Frame, app: &App) {
     };
 
     let title = format!(" Group {} Name ", (b'A' + index as u8) as char);
-    let (_area, inner_area) = begin_editor(f, title, CHANNEL_EDITOR_WIDTH.saturating_sub(6), 11);
+    let (_area, inner_area) = begin_editor(f, title, CHANNEL_EDITOR_WIDTH.saturating_sub(6), 13);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Length(3)])
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(inner_area);
 
     let details = Paragraph::new(vec![

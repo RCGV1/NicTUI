@@ -46,7 +46,17 @@ pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                if compact { "" } else { " Live Radio Workbench" },
+                if app.simulator_mode {
+                    if compact {
+                        ""
+                    } else {
+                        " Radio Simulator | no RF"
+                    }
+                } else if compact {
+                    ""
+                } else {
+                    " Live Radio Workbench"
+                },
                 Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
             ),
         ])),
@@ -76,7 +86,25 @@ pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let selected_port = app.selected_port_short_label();
     let state_summary = dirty_summary(app);
     let status_message = header_message(app, active_tab);
-    let detail_text = if compact {
+    let action_notice = status_message.to_ascii_lowercase();
+    let detail_text = if [
+        "disabled",
+        "unsupported",
+        "blocked",
+        "failed",
+        "invalid",
+        "not applied",
+        "not refreshed",
+    ]
+    .iter()
+    .any(|word| action_notice.contains(word))
+    {
+        if compact {
+            format!(" {tab_label} | {status_message}")
+        } else {
+            format!(" {tab_label} | {status_message} | {state_summary}")
+        }
+    } else if compact {
         format!(" {tab_label} | {tab_summary} | {state_summary}")
     } else if has_unsaved_state(app) {
         if status_message.trim().is_empty() {
@@ -150,6 +178,9 @@ fn tab_label(tab: MainTab, compact: bool) -> &'static str {
 }
 
 fn header_status(app: &App) -> (&'static str, ratatui::style::Color) {
+    if app.simulator_mode {
+        return ("SIMULATOR", COLOR_WARNING);
+    }
     match app.mode {
         AppMode::Reading => ("READING", COLOR_ACCENT),
         AppMode::Writing => ("WRITING", COLOR_WARNING),
@@ -206,15 +237,19 @@ fn tab_summary(app: &App, tab: MainTab, compact: bool) -> String {
             let populated = app
                 .channels
                 .iter()
+                .filter(|channel| !app.deleted_channels.contains(&channel.channel_num))
                 .enumerate()
-                .fold([false; 16], |mut used, (_, channel)| {
-                    for group in channel.groups {
-                        if (1..=16).contains(&group) {
-                            used[(group - 1) as usize] = true;
+                .fold(
+                    [false; crate::protocol::GROUP_LABEL_COUNT],
+                    |mut used, (_, channel)| {
+                        for group in channel.groups {
+                            if (1..=crate::protocol::GROUP_LABEL_COUNT as u8).contains(&group) {
+                                used[(group - 1) as usize] = true;
+                            }
                         }
-                    }
-                    used
-                })
+                        used
+                    },
+                )
                 .into_iter()
                 .filter(|used| *used)
                 .count();
@@ -245,7 +280,9 @@ fn tab_summary(app: &App, tab: MainTab, compact: bool) -> String {
             }
         }
         MainTab::Remote => {
-            if app.remote_active {
+            if app.simulator_mode {
+                "local model | no RF".to_string()
+            } else if app.remote_active {
                 if compact {
                     "open".to_string()
                 } else {
@@ -345,6 +382,33 @@ mod tests {
         (0..width)
             .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
             .collect::<String>()
+    }
+
+    #[test]
+    fn simulator_banner_survives_tabs_dirty_state_and_errors() {
+        let mut app = App::demo();
+        app.simulator_mode = true;
+        app.channels_dirty = true;
+        for mode in [
+            AppMode::Main(MainTab::Remote),
+            AppMode::Main(MainTab::Activity),
+            AppMode::Reading,
+            AppMode::Error("test failure".into()),
+        ] {
+            app.mode = mode;
+            assert_eq!(header_status(&app).0, "SIMULATOR");
+            for width in [40, 80, 160] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 3)).unwrap();
+                terminal
+                    .draw(|frame| render_header(frame, &app, frame.area()))
+                    .unwrap();
+                let top = (0..width)
+                    .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+                    .collect::<String>();
+                assert!(top.contains("SIMULATOR"), "{top}");
+                assert!(!top.contains("Live Radio"), "{top}");
+            }
+        }
     }
 
     #[test]

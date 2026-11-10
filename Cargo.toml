@@ -1,6 +1,6 @@
 [package]
 name = "nictui"
-version = "1.0.8"
+version = "1.1.0"
 edition = "2024"
 description = "Professional TDH3 Radio Programmer"
 license = "GPL-3.0-only"
@@ -28,6 +28,7 @@ crossterm = "0.29.0"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 csv = "1.4.0"
 futures = "0.3.31"
+plist = { version = "1", default-features = false }
 ratatui = "0.30.0"
 rfd = { version = "0.15.4", default-features = false, features = ["gtk3"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -35,3 +36,6 @@ serde_json = "1.0.142"
 serialport = "4.8.1"
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "sync", "time"] }
 uuid = "1.18.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

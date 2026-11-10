@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>name</key><string>NicTUI LCD</string>
+    <key>type</key><string>Window Settings</string>
+    <key>ProfileCurrentVersion</key><real>2.07</real>
+    <key>Font</key>
+    <data>YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5ZWRBcmNoaXZlctEICVRyb290gAGkCwwVFlUkbnVsbNQNDg8QERITFFZOU1NpemVYTlNmRmxhZ3NWTlNOYW1lViRjbGFzcyNAJguS4e9zwRAQgAKAA1pBbmRhbGVNb25v0hcYGRpaJGNsYXNzbmFtZVgkY2xhc3Nlc1ZOU0ZvbnSiGRtYTlNPYmplY3QIERokKTI3SUxRU1heZ253foWOkJKUn6SvuL/CAAAAAAAAAQEAAAAAAAAAHAAAAAAAAAAAAAAAAAAAAMs=</data>
+    <key>FontAntialias</key><false/>
+    <key>FontHeightSpacing</key><real>0.9677083290807088</real>
+    <key>FontWidthSpacing</key><real>0.9070789219698752</real>
+    <key>UseBoldFonts</key><false/>
+    <key>BackgroundColor</key>
+    <data>YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5ZWRBcmNoaXZlctEICVRyb290gAGjCwwTVSRudWxs0w0ODxARElVOU1JHQlxOU0NvbG9yU3BhY2VWJGNsYXNzRjAgMCAwABACgALSFBUWF1okY2xhc3NuYW1lWCRjbGFzc2VzV05TQ29sb3KiFhhYTlNPYmplY3QIERokKTI3SUxRU1ddZGp3foWHiY6ZoqqtAAAAAAAAAQEAAAAAAAAAGQAAAAAAAAAAAAAAAAAAALY=</data>
+    <key>columnCount</key><integer>190</integer>
+    <key>rowCount</key><integer>80</integer>
+    <key>RunCommandAsShell</key><false/>
+</dict>
+</plist>

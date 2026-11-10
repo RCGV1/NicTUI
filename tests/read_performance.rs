@@ -3,7 +3,7 @@
 use std::io::{self, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -60,7 +60,13 @@ struct Radio {
 
 impl Radio {
     fn new(memory: Vec<u8>, options: Options) -> Self {
-        let (mut master, slave) = TTYPort::pair().unwrap();
+        static PAIR_LOCK: Mutex<()> = Mutex::new(());
+        let (mut master, slave) = {
+            // On macOS, pair() uses non-thread-safe ptsname(); exclude other calls
+            // until its shared buffer has been copied. Radio lifetimes stay parallel.
+            let _guard = PAIR_LOCK.lock().unwrap();
+            TTYPort::pair().unwrap()
+        };
         master.set_timeout(Duration::from_millis(50)).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);

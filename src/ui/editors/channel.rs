@@ -1,5 +1,6 @@
 use super::common::{
-    CHANNEL_EDITOR_HEIGHT, CHANNEL_EDITOR_WIDTH, begin_editor, render_option_popup,
+    CHANNEL_EDITOR_HEIGHT, CHANNEL_EDITOR_WIDTH, begin_editor, editor_footer, field_body,
+    render_option_popup,
 };
 use crate::app::{App, AppMode};
 use crate::protocol::{Channel, GROUP_LABEL_COUNT, group_label, group_letter};
@@ -9,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
 
 pub(crate) fn render_channel_editor(f: &mut Frame, app: &App) {
@@ -63,20 +64,17 @@ pub(crate) fn render_channel_editor(f: &mut Frame, app: &App) {
 
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(2)])
+        .constraints([
+            Constraint::Min(4),
+            Constraint::Length(if app.status_message.starts_with("Invalid ") {
+                3
+            } else {
+                2
+            }),
+        ])
         .split(inner_area);
 
-    let body = if use_stacked_channel_editor(vertical[0].width) {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(7), Constraint::Min(10)])
-            .split(vertical[0])
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(31), Constraint::Min(28)])
-            .split(vertical[0])
-    };
+    let body = field_body(vertical[0], 31, 37);
 
     let mut detail_lines = vec![
         Line::from(vec![
@@ -139,7 +137,8 @@ pub(crate) fn render_channel_editor(f: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(" ");
-    f.render_widget(table, body[1]);
+    let mut state = TableState::default().with_selected(Some(current_field_idx));
+    f.render_stateful_widget(table, body[1], &mut state);
 
     if fields[current_field_idx].2 {
         let group_options = group_option_labels(&app.group_labels);
@@ -158,15 +157,8 @@ pub(crate) fn render_channel_editor(f: &mut Frame, app: &App) {
         render_option_popup(f, area, &options, app.selection_index);
     }
 
-    let footer = Paragraph::new("↑/↓/Tab: Field | ←/→: Option | Enter: Save | Esc: Cancel")
-        .style(Style::default().fg(COLOR_DIM))
-        .alignment(ratatui::layout::Alignment::Center)
-        .wrap(ratatui::widgets::Wrap { trim: true });
+    let footer = editor_footer(&app.status_message, "Invalid ");
     f.render_widget(footer, vertical[1]);
-}
-
-fn use_stacked_channel_editor(width: u16) -> bool {
-    width < 68
 }
 
 fn channel_field_help_lines(_ch: &Channel, field_idx: usize) -> (&'static str, Vec<Line<'static>>) {
@@ -276,21 +268,21 @@ fn primary_group_label(ch: &Channel, labels: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        group_option_labels, group_slot_label, primary_group, primary_group_label,
-        use_stacked_channel_editor,
-    };
+    use super::{group_option_labels, group_slot_label, primary_group, primary_group_label};
     use crate::protocol::{Channel, GROUP_LABEL_COUNT};
 
     #[test]
     fn desktop_channel_editor_stays_side_by_side() {
-        assert!(!use_stacked_channel_editor(70));
-        assert!(!use_stacked_channel_editor(82));
+        for width in [70, 82] {
+            let body = super::field_body(ratatui::layout::Rect::new(0, 0, width, 16), 31, 37);
+            assert_eq!(body[0].y, body[1].y);
+        }
     }
 
     #[test]
     fn narrow_channel_editor_stacks() {
-        assert!(use_stacked_channel_editor(60));
+        let body = super::field_body(ratatui::layout::Rect::new(0, 0, 60, 16), 31, 37);
+        assert_eq!(body[0].bottom(), body[1].y);
     }
 
     #[test]

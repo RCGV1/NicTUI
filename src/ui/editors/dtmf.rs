@@ -1,4 +1,6 @@
-use super::common::{DTMF_EDITOR_HEIGHT, DTMF_EDITOR_WIDTH, begin_editor};
+use super::common::{
+    DTMF_EDITOR_HEIGHT, DTMF_EDITOR_WIDTH, begin_editor, editor_footer, field_body,
+};
 use crate::app::{App, AppMode};
 use crate::protocol::editor_value::dtmf_text;
 use crate::ui::theme::*;
@@ -40,8 +42,12 @@ pub(crate) fn render_dtmf_editor(f: &mut Frame, app: &App) {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(4),
-                Constraint::Min(8),
-                Constraint::Length(1),
+                Constraint::Min(4),
+                Constraint::Length(if app.status_message.starts_with("Invalid DTMF:") {
+                    3
+                } else {
+                    2
+                }),
             ])
             .split(inner_area);
 
@@ -77,10 +83,7 @@ pub(crate) fn render_dtmf_editor(f: &mut Frame, app: &App) {
         .block(Block::default().borders(Borders::BOTTOM).title(" Summary "));
         f.render_widget(summary, vertical[0]);
 
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(29), Constraint::Min(30)])
-            .split(vertical[1]);
+        let body = field_body(vertical[1], 29, 30);
 
         let details = Paragraph::new(vec![
             Line::from(vec![
@@ -137,19 +140,7 @@ pub(crate) fn render_dtmf_editor(f: &mut Frame, app: &App) {
         f.render_widget(table, body[1]);
 
         f.render_widget(
-            Paragraph::new(if app.status_message.starts_with("Invalid DTMF:") {
-                app.status_message.as_str()
-            } else {
-                "↑/↓/Tab: Field | Enter: Save | Esc: Cancel"
-            })
-            .style(
-                Style::default().fg(if app.status_message.starts_with("Invalid DTMF:") {
-                    COLOR_WARNING
-                } else {
-                    COLOR_DIM
-                }),
-            )
-            .alignment(ratatui::layout::Alignment::Center),
+            editor_footer(&app.status_message, "Invalid DTMF:"),
             vertical[2],
         );
     }

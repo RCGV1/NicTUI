@@ -375,33 +375,69 @@ mod tests {
 
     #[test]
     fn silent_timeout_and_nop_streams_expire_unknown_with_bounded_reads() {
+        for limit in [Duration::from_millis(20), Duration::from_millis(65)] {
+            for nop in [false, true] {
+                let mut events = Vec::new();
+                let mut completed_read_budget = Duration::ZERO;
+                let summary = receive_asl(
+                    |timeout| {
+                        assert!(timeout >= Duration::from_millis(1) && timeout <= READ_TIMEOUT);
+                        assert!(timeout <= limit.saturating_sub(completed_read_budget));
+                        // Each sleep consumes at least its requested budget, but
+                        // scheduling can legitimately leave no time for another read.
+                        std::thread::sleep(timeout);
+                        completed_read_budget += timeout;
+                        if nop {
+                            Ok(0)
+                        } else {
+                            Err(io::ErrorKind::TimedOut.into())
+                        }
+                    },
+                    &options(limit),
+                    |event| events.push(event),
+                )
+                .unwrap();
+                assert_eq!(summary.reason, AslStopReason::DurationElapsed);
+                assert_eq!(summary.cos, CosSnapshot::default());
+                assert!(summary.elapsed >= limit);
+                assert!(completed_read_budget <= limit);
+                assert_eq!(events.len(), 1);
+                assert!(matches!(events[0], AslMonitorEvent::PortOpened { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn idle_read_poll_is_bounded_and_cancellation_prevents_another_read() {
         for nop in [false, true] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let options = AslMonitorOptions {
+                // Cancellation, not scheduler timing, ends this test after one read.
+                duration: Duration::MAX,
+                stop_signal: Some(stop.clone()),
+            };
+            let mut reads = 0;
             let mut events = Vec::new();
-            let mut timeouts = Vec::new();
-            let limit = Duration::from_millis(65);
             let summary = receive_asl(
                 |timeout| {
-                    assert!(timeout >= Duration::from_millis(1) && timeout <= READ_TIMEOUT);
-                    assert!(timeout <= limit);
-                    timeouts.push(timeout);
-                    std::thread::sleep(timeout);
+                    reads += 1;
+                    assert_eq!(timeout, READ_TIMEOUT);
+                    stop.store(true, Ordering::SeqCst);
                     if nop {
                         Ok(0)
                     } else {
                         Err(io::ErrorKind::TimedOut.into())
                     }
                 },
-                &options(limit),
+                &options,
                 |event| events.push(event),
             )
             .unwrap();
-            assert_eq!(summary.reason, AslStopReason::DurationElapsed);
+            assert_eq!(reads, 1);
+            assert_eq!(summary.reason, AslStopReason::Cancelled);
             assert_eq!(summary.cos, CosSnapshot::default());
-            assert!(summary.elapsed >= limit && summary.elapsed < Duration::from_secs(1));
             assert_eq!(events.len(), 1);
             assert!(matches!(events[0], AslMonitorEvent::PortOpened { .. }));
-            assert!(timeouts.len() >= 2);
-            assert!(timeouts[1] < READ_TIMEOUT);
         }
     }
 

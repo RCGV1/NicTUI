@@ -5,7 +5,7 @@ use crate::ui::theme::{
     COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_PRIMARY, COLOR_SELECTION_BG, COLOR_SELECTION_FG,
     COLOR_SURFACE_1, COLOR_SURFACE_2, COLOR_TEXT, COLOR_WARNING,
 };
-use crate::ui::views::ready_state::{ReadyStateAction, ReadyStateContent, render_ready_state};
+use crate::ui::views::ready_state::{ReadyStateContent, render_ready_state};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -16,8 +16,24 @@ use ratatui::{
 };
 
 pub fn render_scanning_page(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.scan_presets.is_empty() {
+        render_ready_state(
+            f,
+            area,
+            ReadyStateContent {
+                outer_title: "Scan Presets",
+                card_title: "Ready To Load",
+                heading: "No Scan Presets Loaded",
+                description: "r: read scan presets | Shift+R: read all sections | 8: import .nfw"
+                    .into(),
+                note: None,
+            },
+            &[],
+        );
+        return;
+    }
     let summary_height = if area.width < 90 { 3 } else { 2 };
-    let detail_height = 6;
+    let detail_height = if area.width < 90 { 7 } else { 6 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -29,7 +45,7 @@ pub fn render_scanning_page(f: &mut Frame, app: &mut App, area: Rect) {
 
     let summary_text = if app.scan_presets_dirty {
         format!(
-            "Unsaved | w write | {} presets | Enter edit",
+            "Unsaved local | w write radio | {} presets",
             app.scan_presets.len()
         )
     } else if area.width < 90 {
@@ -75,25 +91,6 @@ fn render_preset_table(f: &mut Frame, app: &mut App, area: Rect, compact: bool) 
     } else {
         COLOR_PRIMARY
     });
-
-    if app.scan_presets.is_empty() {
-        render_ready_state(
-            f,
-            area,
-            ReadyStateContent {
-                outer_title: "Scan Presets",
-                card_title: "Ready To Load",
-                heading: "No Scan Presets Loaded",
-                description: "Read the radio to load the current scan preset bank.".to_string(),
-                note: None,
-            },
-            &[ReadyStateAction {
-                key: "r",
-                label: "read radio",
-            }],
-        );
-        return;
-    }
 
     let header = if compact {
         Row::new(vec![
@@ -161,7 +158,7 @@ fn render_preset_table(f: &mut Frame, app: &mut App, area: Rect, compact: bool) 
                 Constraint::Length(10),
                 Constraint::Length(6),
                 Constraint::Length(7),
-                Constraint::Length(4),
+                Constraint::Min(9),
             ]
         } else {
             vec![
@@ -171,7 +168,7 @@ fn render_preset_table(f: &mut Frame, app: &mut App, area: Rect, compact: bool) 
                 Constraint::Length(10),
                 Constraint::Length(10),
                 Constraint::Length(8),
-                Constraint::Length(6),
+                Constraint::Min(9),
             ]
         },
     )
@@ -375,9 +372,11 @@ mod tests {
                 }
                 assert_eq!(app.scan_presets_dirty, dirty && tab == MainTab::Scanning);
                 assert_eq!(app.band_plans_dirty, dirty && tab == MainTab::BandPlan);
-                for (width, height, sidebar) in
-                    [(80, 24, 20), (100, 30, 22), (160, 45, 28), (180, 50, 28)]
-                {
+                for (width, height) in [(80, 24), (100, 30), (160, 45), (180, 50)] {
+                    let content = crate::ui::views::main_layout::main_content_area(Rect::new(
+                        0, 0, width, height,
+                    ));
+                    let sidebar = content.x;
                     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                     terminal
                         .draw(|frame| {
@@ -417,8 +416,10 @@ mod tests {
                             }),
                             "{text}"
                         );
-                        assert!(nav.contains("1*"), "{nav}");
-                        assert!(nav.contains("1 dirty"), "{nav}");
+                        if sidebar > 0 {
+                            assert!(nav.contains("1*"), "{nav}");
+                            assert!(nav.contains("1 dirty"), "{nav}");
+                        }
                         let footer = (0..width)
                             .map(|x| buffer[(x, height - 1)].symbol())
                             .collect::<String>()

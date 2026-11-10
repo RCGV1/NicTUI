@@ -5,7 +5,7 @@ use crate::ui::theme::{
     COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_SELECTION_BG, COLOR_SELECTION_FG, COLOR_SURFACE_1,
     COLOR_SURFACE_2, COLOR_TEXT, COLOR_WARNING,
 };
-use crate::ui::views::ready_state::{ReadyStateAction, ReadyStateContent, render_ready_state};
+use crate::ui::views::ready_state::{ReadyStateContent, render_ready_state};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -17,7 +17,6 @@ use ratatui::{
 
 pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
     if app.channels.is_empty() && app.deleted_channels.is_empty() {
-        let port_label = app.selected_port_short_label();
         render_ready_state(
             f,
             area,
@@ -25,30 +24,18 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
                 outer_title: "Channels",
                 card_title: "Ready To Load",
                 heading: "No Channels Loaded",
-                description: format!(
-                    "Selected {port_label}. Read the radio or import a file to populate the workspace."
-                ),
-                note: Some(
-                    "Read the radio first for live changes, or import a file to edit offline.",
-                ),
+                description: "r: read channels | i: import CSV/CHIRP | Shift+R: read all sections"
+                    .into(),
+                note: None,
             },
-            &[
-                ReadyStateAction {
-                    key: "r",
-                    label: "read radio",
-                },
-                ReadyStateAction {
-                    key: "i",
-                    label: "import file",
-                },
-            ],
+            &[],
         );
         return;
     }
 
     let compact = area.width < 100;
     let summary_height = if compact { 3 } else { 2 };
-    let detail_height = if area.width < 90 { 5 } else { 6 };
+    let detail_height = 6;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -74,20 +61,29 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .filter(|ch| ch.bandwidth == "Wide")
         .count();
-    let narrow_count = active_loaded.len().saturating_sub(wide_count);
+    let narrow_count = active_loaded
+        .iter()
+        .filter(|ch| ch.bandwidth == "Narrow")
+        .count();
+    let unknown_count = active_count.saturating_sub(wide_count + narrow_count);
     let fm_count = active_loaded
         .iter()
         .filter(|ch| ch.modulation == "FM")
         .count();
 
     let summary = Paragraph::new(format!(
-        "{} loaded | {} active | {} empty | {} wide | {} narrow | {} FM",
+        "{} loaded | {} active | {} empty | {} wide | {} narrow | {} FM{}",
         app.channels.len(),
         active_count,
         empty_count,
         wide_count,
         narrow_count,
-        fm_count
+        fm_count,
+        if unknown_count > 0 {
+            format!(" | {unknown_count} unknown BW")
+        } else {
+            String::new()
+        }
     ))
     .style(Style::default().fg(COLOR_DIM))
     .wrap(ratatui::widgets::Wrap { trim: true })
@@ -260,9 +256,9 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
     let deleted_count = app.deleted_channels.len();
     let title = if has_changes {
         if deleted_count > 0 {
-            format!(" Channels ({} pending delete) ", deleted_count)
+            format!(" Channels ({} local deletes; w writes) ", deleted_count)
         } else {
-            " Channels (Unsaved) ".to_string()
+            " Channels (Unsaved local; w writes) ".to_string()
         }
     } else {
         " Channels ".to_string()
@@ -274,8 +270,8 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
             vec![
                 Constraint::Length(4),
                 Constraint::Length(8),
-                Constraint::Length(9),
-                Constraint::Length(9),
+                Constraint::Length(10),
+                Constraint::Length(10),
                 Constraint::Length(7),
                 Constraint::Length(6),
                 Constraint::Min(4),
@@ -345,7 +341,6 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
         };
         if compact {
             let header_width = detail_inner.width.saturating_sub(9) as usize;
-            let freq_width = detail_inner.width as usize;
             let tone_width = detail_inner.width as usize;
             let detail_lines = vec![
                 Line::from(vec![
@@ -361,21 +356,18 @@ pub fn render_channels_table(f: &mut Frame, app: &mut App, area: Rect) {
                         Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
                     ),
                 ]),
+                Line::from(format!("RX {} | TX {}", channel.rx_freq, channel.tx_freq)),
                 Line::from(truncate_line(
                     &format!(
-                        "{} {} | RX {} | TX {}",
-                        channel.bandwidth, channel.modulation, channel.rx_freq, channel.tx_freq
-                    ),
-                    freq_width,
-                )),
-                Line::from(truncate_line(
-                    &format!(
-                        "Tone {} | Pwr raw {} | Group {}",
+                        "Tone {} | Pwr raw {}",
                         compact_tone(&channel.rx_tone, &channel.tx_tone),
-                        power,
-                        groups
+                        power
                     ),
                     tone_width,
+                )),
+                Line::from(format!(
+                    "{} {} | Group {}",
+                    channel.bandwidth, channel.modulation, groups
                 )),
             ];
             let detail_view = Paragraph::new(detail_lines)
@@ -496,7 +488,21 @@ fn compact_mode(bandwidth: &str, modulation: &str) -> String {
     match (bandwidth, modulation) {
         ("Wide", "FM") => "WFM".to_string(),
         ("Narrow", "FM") => "NFM".to_string(),
-        _ => format!("{}{}", bandwidth.chars().next().unwrap_or('-'), modulation),
+        _ => format!(
+            "{} {}",
+            match bandwidth {
+                "Wide" => "W",
+                "Narrow" => "N",
+                _ => "?",
+            },
+            match modulation {
+                "FM" => "FM",
+                "AM" => "AM",
+                "USB" => "USB",
+                "Auto" => "Auto",
+                _ => "?",
+            }
+        ),
     }
 }
 
@@ -645,18 +651,17 @@ mod tests {
         app.group_labels = vec!["Local".to_string()];
         app.channel_state.select(Some(0));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let area = crate::ui::views::main_layout::main_content_area(Rect::new(0, 0, 80, 24));
         terminal
-            .draw(|frame| render_channels_table(frame, &mut app, Rect::new(20, 3, 60, 19)))
+            .draw(|frame| render_channels_table(frame, &mut app, area))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let text = (17..22)
-            .flat_map(|y| (20..80).map(move |x| buffer[(x, y)].symbol()))
+        let text = (area.bottom() - 5..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
         assert!(text.contains("RX 146.52000 | TX 146.52000"), "{text}");
-        assert!(
-            text.contains("Tone Off | Pwr raw 7 | Group Local"),
-            "{text}"
-        );
+        assert!(text.contains("Tone Off | Pwr raw 7"), "{text}");
+        assert!(text.contains("Group Local"), "{text}");
     }
 
     #[test]
@@ -669,21 +674,16 @@ mod tests {
             ..Channel::default()
         }];
         app.channel_state.select(Some(0));
-        for (width, height, sidebar) in [(80, 24, 20), (100, 30, 22), (160, 45, 28), (180, 50, 28)]
-        {
+        for (width, height) in [(80, 24), (100, 30), (160, 45), (180, 50)] {
+            let area =
+                crate::ui::views::main_layout::main_content_area(Rect::new(0, 0, width, height));
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|frame| {
-                    render_channels_table(
-                        frame,
-                        &mut app,
-                        Rect::new(sidebar, 3, width - sidebar, height - 5),
-                    )
-                })
+                .draw(|frame| render_channels_table(frame, &mut app, area))
                 .unwrap();
             let buffer = terminal.backend().buffer();
-            let text = (3..height - 2)
-                .flat_map(|y| (sidebar..width).map(move |x| buffer[(x, y)].symbol()))
+            let text = (area.y..area.bottom())
+                .flat_map(|y| (area.x..area.right()).map(move |x| buffer[(x, y)].symbol()))
                 .collect::<String>();
             assert!(text.contains("Pwr raw 255"), "{width}x{height}: {text}");
             assert!(

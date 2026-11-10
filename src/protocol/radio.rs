@@ -81,6 +81,20 @@ pub enum RemotePacket {
 }
 
 impl RemotePacket {
+    /// The independently refreshed native voltage label; colors vary by skin.
+    pub fn is_battery_voltage_label(&self) -> bool {
+        matches!(
+            self,
+            Self::DisplayText {
+                font_size: 0,
+                x: 103,
+                y: 70,
+                text,
+                ..
+            } if looks_like_voltage_text(text)
+        )
+    }
+
     pub fn summary(&self) -> String {
         match self {
             RemotePacket::DisplayText { x, y, text, .. } => {
@@ -148,7 +162,7 @@ impl RemotePacket {
             RemotePacket::SignalStrength { .. } => "signal_strength".to_string(),
             RemotePacket::NoiseLevel { .. } => "noise_level".to_string(),
             RemotePacket::SignalBarPos { .. } => "signal_bar".to_string(),
-            RemotePacket::SmallStatus { id, .. } => format!("status:{id:02X}"),
+            RemotePacket::SmallStatus { .. } => "led_status".to_string(),
             RemotePacket::UnknownFrame { opcode, .. } => format!("unknown:{opcode:02X}"),
         }
     }
@@ -288,6 +302,7 @@ fn parse_live_read_response(address: u16, response: &[u8]) -> Result<Vec<u8>> {
 enum PortHandle {
     Serial(Box<dyn serialport::SerialPort>),
     Ble(Box<BleLink>),
+    Simulator(Box<crate::simulator_link::SimulatorLink>),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -311,7 +326,11 @@ impl RadioProtocol {
     }
 
     pub fn new_with_baud(port_name: &str, baud_rate: u32) -> Result<Self> {
-        let port = if let Some(device_id) = parse_ble_device_uri(port_name) {
+        let port = if port_name.starts_with(crate::simulator_link::PREFIX) {
+            PortHandle::Simulator(Box::new(crate::simulator_link::SimulatorLink::connect(
+                port_name,
+            )?))
+        } else if let Some(device_id) = parse_ble_device_uri(port_name) {
             let mut port = BleLink::connect(device_id)?;
             port.set_timeout(Duration::from_millis(50));
             PortHandle::Ble(Box::new(port))
@@ -475,6 +494,7 @@ impl RadioProtocol {
         match &mut self.port {
             PortHandle::Serial(port) => port.write_all(data),
             PortHandle::Ble(port) => port.write_all(data),
+            PortHandle::Simulator(port) => port.write_all(data),
         }
     }
 
@@ -482,6 +502,7 @@ impl RadioProtocol {
         match &mut self.port {
             PortHandle::Serial(port) => port.flush(),
             PortHandle::Ble(port) => port.flush(),
+            PortHandle::Simulator(port) => port.flush(),
         }
     }
 
@@ -489,6 +510,7 @@ impl RadioProtocol {
         match &mut self.port {
             PortHandle::Serial(port) => port.read(buffer),
             PortHandle::Ble(port) => port.read(buffer),
+            PortHandle::Simulator(port) => port.read(buffer),
         }
     }
 
@@ -498,6 +520,7 @@ impl RadioProtocol {
                 .clear(clear)
                 .map_err(|error| std::io::Error::other(error.to_string())),
             PortHandle::Ble(port) => port.clear(clear),
+            PortHandle::Simulator(port) => port.clear(clear),
         }
     }
 
@@ -2361,6 +2384,37 @@ mod read_timing_tests {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn battery_voltage_label_matches_native_context_independent_of_skin() {
+        for (font_size, x, y, text, fg_color, bg_color, expected) in [
+            (0, 103, 70, "7.4V", 0xfe9a, 0, true),
+            (0, 103, 70, " 7.5V ", 0x001f, 0x8000, true),
+            (1, 103, 70, "7.4V", 0xfe9a, 0, false),
+            (0, 102, 70, "7.4V", 0xfe9a, 0, false),
+            (0, 103, 69, "7.4V", 0xfe9a, 0, false),
+            (0, 103, 70, "MENU", 0xfe9a, 0, false),
+            (0, 103, 70, "7.4", 0xfe9a, 0, false),
+        ] {
+            let packet = RemotePacket::DisplayText {
+                font_size,
+                x,
+                y,
+                fg_color,
+                bg_color,
+                text: text.to_string(),
+            };
+            assert_eq!(packet.is_battery_voltage_label(), expected, "{packet:?}");
+        }
+        assert!(
+            !RemotePacket::SmallStatus {
+                id: 0x70,
+                value1: 0,
+                value2: 0,
+            }
+            .is_battery_voltage_label()
+        );
+    }
 
     #[test]
     fn interrupted_receive_preserves_partial_frame_until_completion() {

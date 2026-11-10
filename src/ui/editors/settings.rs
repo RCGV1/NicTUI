@@ -1,4 +1,4 @@
-use super::common::{SETTINGS_EDITOR_HEIGHT, SETTINGS_EDITOR_WIDTH, begin_editor};
+use super::common::{SETTINGS_EDITOR_HEIGHT, SETTINGS_EDITOR_WIDTH, begin_editor, editor_footer};
 use crate::app::{App, AppMode};
 use crate::protocol::setting_value::allowed_values;
 use crate::protocol::{SETTINGS_METADATA, SettingType};
@@ -33,7 +33,14 @@ pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(13), Constraint::Length(1)])
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(if app.status_message.starts_with("Invalid setting:") {
+                    3
+                } else {
+                    2
+                }),
+            ])
             .split(inner_area);
 
         match meta.setting_type {
@@ -49,6 +56,7 @@ pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
                 let help_text = format!("Range {}", allowed_values(idx));
                 f.render_widget(
                     Paragraph::new(format!("Current: {}\n{}", current_value, help_text))
+                        .wrap(ratatui::widgets::Wrap { trim: true })
                         .style(Style::default().fg(COLOR_TEXT))
                         .block(
                             Block::default()
@@ -95,11 +103,15 @@ pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
                 };
                 let option_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(3), Constraint::Min(1)])
+                    .constraints([
+                        Constraint::Length(if idx == BLUETOOTH_SETTING_INDEX { 5 } else { 4 }),
+                        Constraint::Min(1),
+                    ])
                     .split(chunks[0]);
 
                 f.render_widget(
                     Paragraph::new(detail_text)
+                        .wrap(ratatui::widgets::Wrap { trim: true })
                         .style(Style::default().fg(COLOR_DIM))
                         .block(
                             Block::default()
@@ -147,15 +159,8 @@ pub(crate) fn render_settings_editor(f: &mut Frame, app: &App) {
             }
         }
 
-        let error = app.status_message.starts_with("Invalid setting:");
         f.render_widget(
-            Paragraph::new(if error {
-                app.status_message.as_str()
-            } else {
-                "↑/↓ change | Enter save | Esc cancel"
-            })
-            .style(Style::default().fg(if error { COLOR_WARNING } else { COLOR_DIM }))
-            .alignment(ratatui::layout::Alignment::Center),
+            editor_footer(&app.status_message, "Invalid setting:"),
             chunks[1],
         );
     }

@@ -35,18 +35,18 @@ use crate::device::{
     FirmwareVariant, PortCandidate, PortKind, ProgressEvent, RemoteMonitorEvent,
     RemoteMonitorOptions, flash_firmware, inspect_codeplug, list_port_candidates,
     live_mode_capability, live_mode_hint, monitor_remote, monitor_remote_with_summary, probe_port,
-    read_band_plans, read_channels, read_codeplug, read_dtmf_presets, read_group_labels,
-    read_scan_presets, read_settings, resolve_port, send_remote_key_with_report,
+    read_band_plans, read_channel, read_channels, read_codeplug, read_dtmf_presets,
+    read_group_labels, read_scan_presets, read_settings, resolve_port, send_remote_key_with_report,
     update_dtmf_preset, update_scan_preset, validate_band_plans_payload, validate_channels,
     validate_dtmf_presets_payload, validate_scan_presets, write_band_plans, write_channels,
     write_codeplug, write_dtmf_presets, write_group_labels, write_scan_presets, write_settings,
 };
 use crate::protocol::codeplug::{load_codeplug, save_codeplug};
 use crate::protocol::{
-    BandPlan, Channel, DTMFPreset, Endianness, RadioProtocol, SETTINGS_METADATA, ScanPreset,
-    SettingType, SettingsBlock,
+    BandPlan, Channel, DTMFPreset, Endianness, RadioProtocol, RemotePacket, SETTINGS_METADATA,
+    ScanPreset, SettingType, SettingsBlock,
 };
-use crate::remote::RemoteControlCommand;
+use crate::remote::{RemoteControlCommand, RemoteSessionPhase};
 use crate::skill::{
     SkillInstallTarget, SupportedAgent, bundled_skill_dir, bundled_skill_markdown, detected_agents,
     install_bundled_skill,
@@ -236,11 +236,20 @@ pub enum Commands {
 pub struct TuiArgs {
     #[command(flatten)]
     pub port: PortArgs,
-    /// Launch a populated simulated radio without connecting to hardware
-    #[arg(long)]
+    /// Launch a populated static demo without connecting to hardware
+    #[arg(long, conflicts_with = "simulate")]
     pub demo: bool,
-    /// Initial view for demo mode: channels, settings, remote, or activity
-    #[arg(long, value_enum, default_value = "channels")]
+    /// Run an interactive source-based radio simulator, with no hardware or RF
+    #[arg(long, alias = "sim", conflicts_with_all = ["demo", "port", "ble_device", "ble_name"])]
+    pub simulate: bool,
+    /// Local NicFWSim UART endpoint (requires the separately installed add-on)
+    #[arg(long, default_value = "127.0.0.1:8788", requires = "simulate")]
+    pub simulator_endpoint: String,
+    /// Optional read-only native LCD endpoint: HOST:PORT or http://HOST:PORT
+    #[arg(long, value_name = "HOST:PORT", requires = "simulate", conflicts_with_all = ["demo", "port", "ble_device", "ble_name"], value_parser = parse_simulator_http_endpoint)]
+    pub simulator_http_endpoint: Option<String>,
+    /// Initial view for demo or simulation: channels, settings, remote, or activity
+    #[arg(long, alias = "view", value_enum, default_value = "channels")]
     pub demo_view: DemoView,
 }
 
@@ -250,6 +259,12 @@ pub enum DemoView {
     Settings,
     Remote,
     Activity,
+}
+
+fn parse_simulator_http_endpoint(value: &str) -> std::result::Result<String, String> {
+    crate::simulator_lcd::Endpoint::parse(value)
+        .map(|endpoint| endpoint.to_string())
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1201,7 +1216,9 @@ pub enum Dispatch {
     LaunchTui {
         port: Option<String>,
         demo: bool,
+        simulate: bool,
         demo_view: DemoView,
+        simulator_http_endpoint: Option<String>,
     },
     Exit,
 }
@@ -1212,13 +1229,52 @@ pub fn dispatch(cli: Cli) -> Result<Dispatch> {
         None => Ok(Dispatch::LaunchTui {
             port: None,
             demo: false,
+            simulate: false,
             demo_view: DemoView::Channels,
+            simulator_http_endpoint: None,
         }),
-        Some(Commands::Tui(args)) => Ok(Dispatch::LaunchTui {
-            port: resolve_optional_port_for_args(&args.port)?,
-            demo: args.demo,
-            demo_view: args.demo_view,
-        }),
+        Some(Commands::Tui(args)) => {
+            let simulator_http_endpoint = if let Some(endpoint) = &args.simulator_http_endpoint {
+                anyhow::ensure!(
+                    args.simulate && !args.demo,
+                    "--simulator-http-endpoint requires --simulate and cannot be used with --demo"
+                );
+                Some(parse_simulator_http_endpoint(endpoint).map_err(anyhow::Error::msg)?)
+            } else {
+                None
+            };
+            let simulate = args.simulate
+                || args
+                    .port
+                    .port
+                    .as_deref()
+                    .is_some_and(|port| port.starts_with(crate::simulator_link::PREFIX));
+            let port = if args.simulate {
+                anyhow::ensure!(
+                    args.port.port.is_none()
+                        && args.port.ble_device.is_none()
+                        && args.port.ble_name.is_none(),
+                    "Simulation cannot be combined with a physical radio target"
+                );
+                crate::simulator_link::parse_endpoint(&format!(
+                    "sim://{}",
+                    args.simulator_endpoint
+                ))?;
+                Some(format!("sim://{}", args.simulator_endpoint))
+            } else {
+                if simulate {
+                    crate::simulator_link::parse_endpoint(args.port.port.as_deref().unwrap())?;
+                }
+                resolve_optional_port_for_args(&args.port)?
+            };
+            Ok(Dispatch::LaunchTui {
+                port,
+                demo: args.demo,
+                simulate,
+                demo_view: args.demo_view,
+                simulator_http_endpoint,
+            })
+        }
         Some(Commands::Version) => {
             println!("NicTUI {}", env!("CARGO_PKG_VERSION"));
             Ok(Dispatch::Exit)
@@ -1647,10 +1703,7 @@ fn run_get_channel(args: ReadChannelArgs) -> Result<()> {
 
     let port = resolve_port_for_args(&args.port)?;
     let mut progress = ProgressPrinter::default();
-    let (channels, _) = read_channels(&port, |event| progress.handle(event))?;
-    let channel = channels
-        .into_iter()
-        .find(|channel| channel.channel_num == args.channel)
+    let channel = read_channel(&port, args.channel, |event| progress.handle(event))?
         .with_context(|| format!("Channel {} is empty or not programmed", args.channel))?;
 
     write_single_channel_output(&channel, args.output.as_deref(), args.format)?;
@@ -2595,10 +2648,16 @@ fn run_activity_monitor(args: ActivityMonitorArgs) -> Result<()> {
             "Activity monitor requires --port, --ble-device, or --ble-name; automatic probing is disabled for receive-only capture"
         );
     }
-    eprintln!(
-        "Start a VFO preset scan, then enable Activity Mode on the radio. Capture is receive-only apart from the 0x02 connection ping; signal is raw, not dBm."
-    );
     let port = resolve_port_for_args(&args.port)?;
+    if port.starts_with(crate::simulator_link::PREFIX) {
+        eprintln!(
+            "Receiving synthetic Activity from NicFWSim; no physical radio or RF is involved."
+        );
+    } else {
+        eprintln!(
+            "Start a VFO preset scan, then enable Activity Mode on the radio. Capture is receive-only apart from the 0x02 connection ping; signal is raw, not dBm."
+        );
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let options = ActivityMonitorOptions {
         duration: Some(Duration::from_secs(args.duration)),
@@ -2969,6 +3028,41 @@ fn run_asl_replay_from_reader(
     finish_asl_capture(output, capture, json, failure, cancelled)
 }
 
+#[derive(Default)]
+struct RemoteCaptureDisplaySummary {
+    saw_battery_text: bool,
+    saw_other_content: bool,
+}
+
+impl RemoteCaptureDisplaySummary {
+    fn observe_phase(&mut self, phase: RemoteSessionPhase) {
+        if matches!(
+            phase,
+            RemoteSessionPhase::Opening | RemoteSessionPhase::Recovering
+        ) {
+            *self = Self::default();
+        }
+    }
+
+    fn observe(&mut self, packet: &RemotePacket) {
+        match packet {
+            RemotePacket::DisplayText { .. } if packet.is_battery_voltage_label() => {
+                self.saw_battery_text = true;
+            }
+            RemotePacket::SmallStatus { .. }
+            | RemotePacket::SignalStrength { .. }
+            | RemotePacket::NoiseLevel { .. }
+            | RemotePacket::SignalBarPos { .. } => {}
+            _ => self.saw_other_content = true,
+        }
+    }
+
+    fn notice(&self, successful: bool, passive: bool) -> Option<&'static str> {
+        (successful && passive && self.saw_battery_text && !self.saw_other_content)
+            .then_some("Only battery updates received; the radio has not redrawn its screen.")
+    }
+}
+
 fn run_remote_capture(args: RemoteMonitorArgs) -> Result<()> {
     let scripted_commands = args
         .send
@@ -2998,7 +3092,8 @@ fn run_remote_capture(args: RemoteMonitorArgs) -> Result<()> {
         port, args.duration
     );
 
-    let packet_count = monitor_remote(&port, &options, |event| {
+    let mut display_summary = RemoteCaptureDisplaySummary::default();
+    let result = monitor_remote(&port, &options, |event| {
         let timestamp = chrono::Local::now().format("%H:%M:%S");
         match event {
             RemoteMonitorEvent::Status(message) => {
@@ -3008,6 +3103,7 @@ fn run_remote_capture(args: RemoteMonitorArgs) -> Result<()> {
                 println!("[{timestamp}] {message}");
             }
             RemoteMonitorEvent::Phase(phase) => {
+                display_summary.observe_phase(phase);
                 eprintln!("[{timestamp}] PHASE {phase}");
             }
             RemoteMonitorEvent::Control(report) => {
@@ -3021,12 +3117,19 @@ fn run_remote_capture(args: RemoteMonitorArgs) -> Result<()> {
                 println!("[{timestamp}] DELTA {delta}");
             }
             RemoteMonitorEvent::Packet(packet) => {
+                display_summary.observe(&packet);
                 println!("[{timestamp}] REMOTE {}", packet.summary());
             }
         }
-    })?;
+    });
 
+    let notice =
+        display_summary.notice(result.is_ok(), args.send.is_empty() && !args.disable_radio);
+    let packet_count = result?;
     eprintln!("Captured {} remote packets from {}", packet_count, port);
+    if let Some(notice) = notice {
+        eprintln!("{notice}");
+    }
     Ok(())
 }
 
@@ -6064,6 +6167,199 @@ mod tests {
     fn control_transport_labels_do_not_claim_radio_acceptance() {
         assert_eq!(control_transport_outcome(true), "SENT");
         assert_eq!(control_transport_outcome(false), "FAILED");
+    }
+
+    fn remote_capture_text(text: &str, y: u8) -> crate::protocol::RemotePacket {
+        crate::protocol::RemotePacket::DisplayText {
+            font_size: 0,
+            x: 103,
+            y,
+            fg_color: 0xffff,
+            bg_color: 0,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn remote_capture_battery_notice_allows_status_and_meters() {
+        use crate::protocol::RemotePacket;
+
+        let mut summary = super::RemoteCaptureDisplaySummary::default();
+        for packet in [
+            RemotePacket::SmallStatus {
+                id: 0x73,
+                value1: 3,
+                value2: 0,
+            },
+            RemotePacket::SignalStrength {
+                strength: 20,
+                mode: 0,
+                battery: 0,
+            },
+            RemotePacket::NoiseLevel { level: 30, mode: 0 },
+            RemotePacket::SignalBarPos { y: 60, aux: 0 },
+            remote_capture_text("8.1V", 70),
+            remote_capture_text(" 8.0V ", 70),
+        ] {
+            let original = packet.summary();
+            summary.observe(&packet);
+            assert_eq!(packet.summary(), original);
+        }
+        assert_eq!(
+            summary.notice(true, true),
+            Some("Only battery updates received; the radio has not redrawn its screen.")
+        );
+        assert_eq!(summary.notice(true, false), None);
+        assert_eq!(summary.notice(false, true), None);
+        assert_eq!(summary.notice(false, false), None);
+    }
+
+    #[test]
+    fn remote_capture_battery_notice_requires_battery_text() {
+        use crate::protocol::RemotePacket;
+
+        let mut summary = super::RemoteCaptureDisplaySummary::default();
+        assert_eq!(summary.notice(true, true), None);
+        for packet in [
+            RemotePacket::SmallStatus {
+                id: 0x70,
+                value1: 0,
+                value2: 0,
+            },
+            RemotePacket::SignalStrength {
+                strength: 20,
+                mode: 0,
+                battery: 0,
+            },
+            RemotePacket::NoiseLevel { level: 30, mode: 0 },
+            RemotePacket::SignalBarPos { y: 60, aux: 0 },
+        ] {
+            summary.observe(&packet);
+            assert_eq!(summary.notice(true, true), None);
+        }
+    }
+
+    #[test]
+    fn remote_capture_battery_notice_reuses_battery_recognition() {
+        for packet in [
+            remote_capture_text("8.1V", 59),
+            remote_capture_text("147.58500", 70),
+            remote_capture_text("VFO A", 70),
+        ] {
+            let mut summary = super::RemoteCaptureDisplaySummary::default();
+            summary.observe(&remote_capture_text("8.1V", 70));
+            assert!(summary.notice(true, true).is_some());
+            summary.observe(&packet);
+            assert_eq!(summary.notice(true, true), None);
+        }
+    }
+
+    #[test]
+    fn remote_capture_battery_notice_requires_known_label_position_and_font() {
+        use crate::protocol::RemotePacket;
+
+        for (font_size, x, y) in [(0, 4, 100), (0, 4, 70), (1, 103, 70), (0, 103, 71)] {
+            let other = RemotePacket::DisplayText {
+                font_size,
+                x,
+                y,
+                fg_color: 0xfe9a,
+                bg_color: 0,
+                text: "8.1V".to_string(),
+            };
+            let mut summary = super::RemoteCaptureDisplaySummary::default();
+            summary.observe(&other);
+            assert_eq!(summary.notice(true, true), None);
+
+            let battery = remote_capture_text("8.1V", 70);
+            for packets in [[&battery, &other], [&other, &battery]] {
+                let mut summary = super::RemoteCaptureDisplaySummary::default();
+                for packet in packets {
+                    summary.observe(packet);
+                }
+                assert_eq!(summary.notice(true, true), None);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_capture_battery_notice_ignores_skin_colors() {
+        use crate::protocol::RemotePacket;
+
+        for (fg_color, bg_color) in [(0xffff, 0), (0xfe9a, 0), (0, 0xffff)] {
+            let mut summary = super::RemoteCaptureDisplaySummary::default();
+            summary.observe(&RemotePacket::DisplayText {
+                font_size: 0,
+                x: 103,
+                y: 70,
+                fg_color,
+                bg_color,
+                text: "8.1V".to_string(),
+            });
+            assert!(summary.notice(true, true).is_some());
+        }
+    }
+
+    #[test]
+    fn remote_capture_battery_notice_excludes_other_content_in_either_order() {
+        use crate::protocol::RemotePacket;
+
+        for other in [
+            remote_capture_text("147.58500", 20),
+            RemotePacket::DrawRectangle {
+                x: 0,
+                y: 0,
+                width: 128,
+                height: 128,
+                color: 0,
+            },
+            RemotePacket::DrawSymbol {
+                symbol_id: 0,
+                x: 0,
+                y: 0,
+                fg_color: 0xffff,
+                bg_color: 0,
+            },
+            RemotePacket::UnknownFrame {
+                opcode: 0xee,
+                payload: vec![],
+            },
+        ] {
+            let battery = remote_capture_text("8.1V", 70);
+            for packets in [[&battery, &other], [&other, &battery]] {
+                let mut summary = super::RemoteCaptureDisplaySummary::default();
+                for packet in packets {
+                    summary.observe(packet);
+                }
+                assert_eq!(summary.notice(true, true), None);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_capture_battery_notice_resets_on_opening_and_recovering() {
+        use crate::remote::RemoteSessionPhase;
+
+        for phase in [RemoteSessionPhase::Opening, RemoteSessionPhase::Recovering] {
+            let mut summary = super::RemoteCaptureDisplaySummary::default();
+            summary.observe(&remote_capture_text("147.58500", 20));
+            summary.observe(&remote_capture_text("8.1V", 70));
+            assert_eq!(summary.notice(true, true), None);
+
+            summary.observe_phase(phase);
+            assert_eq!(summary.notice(true, true), None);
+            summary.observe_phase(RemoteSessionPhase::Armed);
+            summary.observe(&remote_capture_text("8.0V", 70));
+            summary.observe_phase(RemoteSessionPhase::Live);
+            summary.observe_phase(RemoteSessionPhase::Stopped);
+            assert!(summary.notice(true, true).is_some());
+            assert_eq!(summary.notice(false, true), None);
+
+            summary.observe_phase(phase);
+            assert_eq!(summary.notice(true, true), None);
+            summary.observe(&remote_capture_text("VFO B", 20));
+            assert_eq!(summary.notice(true, true), None);
+        }
     }
 
     #[test]

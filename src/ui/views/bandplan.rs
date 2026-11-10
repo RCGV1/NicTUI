@@ -7,7 +7,7 @@ use crate::ui::theme::{
     COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_SELECTION_BG, COLOR_SELECTION_FG, COLOR_SURFACE_1,
     COLOR_SURFACE_2, COLOR_TEXT, COLOR_WARNING,
 };
-use crate::ui::views::ready_state::{ReadyStateAction, ReadyStateContent, render_ready_state};
+use crate::ui::views::ready_state::{ReadyStateContent, render_ready_state};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -26,13 +26,11 @@ pub fn render_bandplan(f: &mut Frame, app: &mut App, area: Rect) {
                 outer_title: "Band Plan",
                 card_title: "Ready To Load",
                 heading: "No Band Plan Loaded",
-                description: "Read the radio to load the current band plan ranges.".to_string(),
+                description: "r: read band plan | Shift+R: read all sections | 8: import .nfw"
+                    .into(),
                 note: None,
             },
-            &[ReadyStateAction {
-                key: "r",
-                label: "read radio",
-            }],
+            &[],
         );
         return;
     }
@@ -58,7 +56,7 @@ pub fn render_bandplan(f: &mut Frame, app: &mut App, area: Rect) {
 
     let summary_text = if app.band_plans_dirty {
         format!(
-            "Unsaved | w write | {} plans | {} TX",
+            "Unsaved local | w write radio | {} plans | {} TX",
             app.band_plans.len(),
             tx_enabled
         )

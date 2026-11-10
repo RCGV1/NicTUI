@@ -1,6 +1,5 @@
 use crate::app::{App, AppMode, MainTab};
 use crate::ui::render_shortcut;
-use crate::ui::theme::VERSION;
 use crate::ui::theme::{
     COLOR_BORDER, COLOR_DIM, COLOR_PRIMARY, COLOR_SURFACE_0, COLOR_SURFACE_2, COLOR_TEXT,
     COLOR_WARNING,
@@ -14,45 +13,30 @@ use ratatui::{
 };
 
 pub fn render_footer(f: &mut Frame, app: &App, area: Rect) {
-    let target_left_width = if area.width < 56 {
-        14
-    } else if area.width < 90 {
-        18
-    } else {
-        24
-    };
+    let target_left_width = if area.width < 56 { 14 } else { 24 };
     let left_width = target_left_width.min(area.width);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(left_width), Constraint::Min(0)])
         .split(area);
 
-    let compact = chunks[0].width < 18;
-    let nav = if matches!(app.mode, AppMode::Main(MainTab::Remote)) && app.remote_active {
-        Line::from(vec![render_shortcut("Tab"), Span::raw(" leave")])
-    } else if compact {
-        Line::from(Span::styled(
-            " Tab / A views ",
-            Style::default().fg(COLOR_PRIMARY),
-        ))
+    let key_style = Style::default()
+        .fg(COLOR_PRIMARY)
+        .add_modifier(Modifier::BOLD);
+    let nav = if chunks[0].width < 24 {
+        Line::from(vec![
+            Span::styled("F1", key_style),
+            Span::raw(" help | Tab"),
+        ])
     } else {
-        let mut spans = vec![
-            render_shortcut("Tab"),
-            Span::styled(
-                if area.width < 90 {
-                    " / A activity"
-                } else {
-                    " / 0-9 / A views"
-                },
-                Style::default().fg(COLOR_DIM),
-            ),
-        ];
-        let version = format!(" {VERSION}");
-        let nav_width: usize = spans.iter().map(Span::width).sum();
-        if nav_width + version.len() <= chunks[0].width as usize {
-            spans.push(Span::styled(version, Style::default().fg(COLOR_DIM)));
-        }
-        Line::from(spans)
+        Line::from(vec![
+            Span::styled("Tab", key_style),
+            Span::raw(" / "),
+            Span::styled("a", key_style),
+            Span::raw(" activity "),
+            Span::styled("F1", key_style),
+            Span::raw(" help"),
+        ])
     };
 
     let status = Paragraph::new(nav)
@@ -81,6 +65,26 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
     let tight = width < 44;
     let mut hints = Vec::new();
 
+    if matches!(app.mode, AppMode::Main(tab) if !matches!(tab,MainTab::Codeplug | MainTab::Debug))
+        && !app.configuration_has_unsaved_edits()
+        && !app.remote_active
+        && app.remote_tx.is_none()
+        && !app.activity_active()
+        && !app.ble_scan_in_progress
+    {
+        push_hint(
+            &mut hints,
+            if tight {
+                "R"
+            } else if compact {
+                "Shift+R"
+            } else {
+                "Shift+R/Ctrl+R"
+            },
+            "read all",
+        );
+    }
+
     match app.mode {
         AppMode::Main(MainTab::Activity) => {
             push_hint(
@@ -104,7 +108,7 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
             let has_changes = app.channels_dirty || !app.deleted_channels.is_empty();
             let channels_empty = app.channels.is_empty() && app.deleted_channels.is_empty();
             if has_changes {
-                push_warning_hint(&mut hints, "w", if tight { "save" } else { "save changes" });
+                push_write_hint(app, &mut hints, if tight { "save" } else { "save changes" });
                 push_hint(&mut hints, "Enter", "edit");
                 push_hint(&mut hints, "n", "new");
                 if !tight {
@@ -126,7 +130,7 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
                 push_hint(&mut hints, "n", "new");
                 push_hint(&mut hints, "d", "del");
                 if !tight {
-                    push_hint(&mut hints, "w", "write");
+                    push_write_hint(app, &mut hints, "write");
                 }
                 if !compact {
                     push_hint(&mut hints, "i", "import");
@@ -136,9 +140,9 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
         }
         AppMode::Main(MainTab::Settings) => {
             if app.settings_dirty {
-                push_warning_hint(
+                push_write_hint(
+                    app,
                     &mut hints,
-                    "w",
                     if tight { "save" } else { "save + reboot" },
                 );
                 push_hint(&mut hints, "Enter", "edit");
@@ -149,50 +153,58 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
                 push_hint(&mut hints, "Enter", "edit");
                 push_hint(&mut hints, "r", "read");
                 if !tight {
-                    push_hint(&mut hints, "w", "write");
+                    push_write_hint(app, &mut hints, "write");
                 }
             }
         }
         AppMode::Main(MainTab::Scanning) => {
             if app.scan_presets_dirty {
-                push_warning_hint(&mut hints, "w", "write");
+                push_write_hint(app, &mut hints, "write");
             }
             push_hint(&mut hints, "Enter", "edit");
             push_hint(&mut hints, "r", "read");
         }
         AppMode::Main(MainTab::MemoryGroups) => {
             if app.group_labels_dirty {
-                push_warning_hint(&mut hints, "w", if tight { "save" } else { "save names" });
+                push_write_hint(app, &mut hints, if tight { "save" } else { "save names" });
             }
             push_hint(&mut hints, "Enter", "rename");
             push_hint(&mut hints, "r", "read");
         }
         AppMode::Main(MainTab::BandPlan) => {
             if app.band_plans_dirty {
-                push_warning_hint(&mut hints, "w", "write");
+                push_write_hint(app, &mut hints, "write");
             }
             push_hint(&mut hints, "Enter", "edit");
             push_hint(&mut hints, "r", "read");
         }
         AppMode::Main(MainTab::DTMF) => {
             if app.dtmf_dirty {
-                push_warning_hint(&mut hints, "w", "save");
+                push_write_hint(app, &mut hints, "save");
             }
             push_hint(&mut hints, "Enter", "edit");
             push_hint(&mut hints, "r", "read");
             if !app.dtmf_dirty && !tight {
-                push_hint(&mut hints, "w", "write");
+                push_write_hint(app, &mut hints, "write");
             }
         }
         AppMode::Main(MainTab::Remote) if app.remote_active => {
             push_warning_hint(&mut hints, "p", "stop");
+            push_warning_hint(
+                &mut hints,
+                "Space",
+                if app.remote_keyboard_release_supported {
+                    "hold PTT"
+                } else {
+                    "tap PTT"
+                },
+            );
             push_hint(&mut hints, "D", "details");
             push_hint(&mut hints, "Tab", "leave");
             push_hint(&mut hints, "Up/Down", "move");
             push_hint(&mut hints, "Enter", "menu");
             if !compact {
                 push_hint(&mut hints, "Esc", "exit menu");
-                push_hint(&mut hints, "a", "PTT");
                 push_hint(&mut hints, "f/v", "F/B");
             }
         }
@@ -216,10 +228,18 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
         }
         AppMode::Main(MainTab::BinFlash) => {
             push_hint(&mut hints, "i", "import");
-            push_warning_hint(&mut hints, "f", "flash");
+            if !app.simulator_mode {
+                push_warning_hint(&mut hints, "f", "flash");
+            }
         }
         AppMode::Main(MainTab::Debug) => {
-            push_hint(&mut hints, "q", "quit");
+            push_hint(&mut hints, "Up/Down", "browse");
+            push_hint(&mut hints, "End", "live");
+            push_hint(&mut hints, "f", "filter");
+            push_hint(&mut hints, "c", "clear");
+            if !tight {
+                push_hint(&mut hints, "q", "quit");
+            }
         }
         AppMode::EditChannel(_)
         | AppMode::EditSetting(_)
@@ -275,6 +295,18 @@ fn push_warning_hint(spans: &mut Vec<Span<'static>>, key: &'static str, label: &
     ));
 }
 
+fn push_write_hint(app: &App, spans: &mut Vec<Span<'static>>, label: &'static str) {
+    push_warning_hint(
+        spans,
+        "w",
+        if app.simulator_mode {
+            "writes disabled"
+        } else {
+            label
+        },
+    );
+}
+
 fn push_separator(spans: &mut Vec<Span<'static>>) {
     if !spans.is_empty() {
         spans.push(Span::styled("  | ", Style::default().fg(COLOR_DIM)));
@@ -291,6 +323,28 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    #[test]
+    fn read_all_footer_is_discoverable_and_hidden_for_unsafe_workspace() {
+        let mut app = App::new();
+        app.mode = AppMode::Main(MainTab::Channels);
+        for width in [36, 62, 100] {
+            let text = hint_text(&app, width);
+            assert!(text.contains(if width < 44 { " R " } else { "Shift+R" }));
+            assert!(text.contains("read all"));
+            if width >= 72 {
+                assert!(text.contains("Ctrl+R"));
+            }
+        }
+        app.settings_dirty = true;
+        assert!(!hint_text(&app, 100).contains("read all"));
+        app.settings_dirty = false;
+        app.remote_active = true;
+        assert!(!hint_text(&app, 100).contains("read all"));
+        app.remote_active = false;
+        app.ble_scan_in_progress = true;
+        assert!(!hint_text(&app, 100).contains("read all"));
     }
 
     #[test]
@@ -324,7 +378,45 @@ mod tests {
         let mut app = App::new();
         app.mode = AppMode::Main(MainTab::Debug);
 
-        assert!(hint_text(&app, 60).contains(" quit"));
+        let text = hint_text(&app, 60);
+        assert!(text.contains(" browse"));
+        assert!(text.contains(" filter"));
+    }
+
+    #[test]
+    fn help_is_visible_on_every_main_view_and_tight_channels_keep_editing() {
+        use ratatui::{Terminal, backend::TestBackend};
+        for tab in [
+            MainTab::Channels,
+            MainTab::Settings,
+            MainTab::Scanning,
+            MainTab::MemoryGroups,
+            MainTab::BandPlan,
+            MainTab::DTMF,
+            MainTab::Remote,
+            MainTab::Activity,
+            MainTab::Codeplug,
+            MainTab::BinFlash,
+            MainTab::Debug,
+        ] {
+            let mut app = App::demo();
+            app.mode = AppMode::Main(tab);
+            for (width, height) in [(60, 20), (80, 24), (120, 36), (190, 80)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| crate::ui::ui(frame, &mut app))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let text: String = (0..width)
+                    .map(|x| buffer[(x, height - 1)].symbol())
+                    .collect();
+                assert!(text.contains("F1 help"), "{tab:?}/{width}: {text}");
+                if tab == MainTab::Channels && width == 60 {
+                    assert!(text.contains("read all"), "{text}");
+                    assert!(text.contains("edit"), "{text}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -381,8 +473,36 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(text.contains("Tab leave"));
+        assert!(text.to_ascii_lowercase().contains("a activity"));
+        assert!(text.contains("F1 help"));
+        assert!(text.contains("Space tap PTT"));
         assert!(!text.contains("0-9 views"));
-        assert!(text.contains("f/v F/B"));
+        let left = (0..24).map(|x| buffer[(x, 1)].symbol()).collect::<String>();
+        assert!(
+            !left.contains("lea"),
+            "navigation label must not be clipped: {left}"
+        );
+    }
+
+    #[test]
+    fn remote_footer_prioritizes_and_labels_ptt_by_keyboard_capability() {
+        let mut app = App::new();
+        app.mode = AppMode::Main(MainTab::Remote);
+        app.remote_active = true;
+        for supported in [false, true] {
+            app.remote_keyboard_release_supported = supported;
+            let text = hint_text(&app, 56)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let expected = if supported {
+                "Space hold PTT"
+            } else {
+                "Space tap PTT"
+            };
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains("a PTT"));
+        }
     }
 
     #[test]

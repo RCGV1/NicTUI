@@ -33,8 +33,13 @@ pub enum AppMode {
 #[derive(Clone, Default)]
 pub struct RemoteScreen {
     pub display: crate::remote_display::RadioDisplay,
+    pub simulator_lcd_error: Option<String>,
+    /// Ordered UART reconstruction retained while the native simulator LCD is shown.
+    pub simulator_uart_display: Option<crate::remote_display::RadioDisplay>,
     /// Drawing observed this session, not evidence of a complete screen snapshot.
     pub has_display_updates: bool,
+    /// Non-battery drawing observed this session, not proof of a full snapshot.
+    pub has_non_battery_drawings: bool,
     pub show_diagnostics: bool,
     pub elements: VecDeque<RemotePacket>,
     pub signal_strength: u8,
@@ -60,6 +65,7 @@ pub struct RemoteScreen {
 impl RemoteScreen {
     pub(crate) fn reset_session(&mut self) {
         *self = Self {
+            display: self.display.blank_with_configuration(),
             show_diagnostics: self.show_diagnostics,
             ..Self::default()
         };
@@ -70,6 +76,7 @@ impl RemoteScreen {
 pub(crate) struct RemoteInputState {
     pub ready: bool,
     pub pending: bool,
+    pub held_key: Option<u8>,
 }
 
 #[derive(PartialEq, Clone, Debug, Copy)]
@@ -95,15 +102,19 @@ pub enum AppEvent {
     BleScanFailed(String),
     ReadChannelsComplete(Vec<Channel>, Endianness),
     ReadGroupLabelsComplete(Vec<String>),
+    ReadGroupLabelsOnlyComplete(Vec<String>),
     ReadPresetsComplete(Vec<ScanPreset>),
     ReadBandPlanComplete(Vec<BandPlan>),
     ReadDTMFComplete(Vec<DTMFPreset>),
     ReadSettingsComplete(SettingsBlock, Endianness),
+    ReadAllFailed(String),
     RemotePhase(RemoteSessionPhase),
     RemoteControl(RemoteControlReport),
     RemoteDelta(String),
     RemoteReceived(std::time::Instant),
     RemotePacket(RemotePacket),
+    SimulatorLcdFrame(Vec<u16>),
+    SimulatorLcdUnavailable(String),
     RemoteStopped {
         message: String,
         failure: Option<RemoteSessionFailure>,
@@ -150,6 +161,11 @@ pub enum WriteScope {
     None,
 }
 
+pub(crate) struct ReadAllRequest {
+    pub return_tab: MainTab,
+    pub workspace: Vec<u8>,
+}
+
 pub struct App {
     pub serial_port_candidates: Vec<PortCandidate>,
     pub ble_port_candidates: Vec<PortCandidate>,
@@ -185,12 +201,15 @@ pub struct App {
     pub progress: f64,
     pub status_message: String,
     pub logs: VecDeque<String>,
+    pub help: crate::app::help::HelpState,
+    pub log_view: crate::app::logs::LogView,
     pub endian: Endianness,
     pub edit_buffer: String,
     pub selection_index: usize,
     pub event_tx: Sender<AppEvent>,
     pub event_rx: Receiver<AppEvent>,
     pub remote_active: bool,
+    pub remote_keyboard_release_supported: bool,
     pub remote_stop_signal: Arc<AtomicBool>,
     pub remote_tx: Option<Sender<RemoteControlCommand>>,
     pub(crate) remote_input_state: Arc<Mutex<RemoteInputState>>,
@@ -204,6 +223,7 @@ pub struct App {
     pub band_plans_dirty: bool,
     pub codeplug_data: Option<Vec<u8>>,
     pub codeplug_workspace_baseline: Option<Vec<u8>>,
+    pub(crate) read_all_request: Option<ReadAllRequest>,
     pub codeplug_path: Option<PathBuf>,
     pub bin_firmware_data: Option<Vec<u8>>,
     pub bin_file_path: Option<PathBuf>,
@@ -212,4 +232,6 @@ pub struct App {
     pub dtmf_edit_preset_idx: Option<usize>,
     pub pending_dtmf_edit: Option<DTMFPreset>,
     pub demo_mode: bool,
+    pub simulator_mode: bool,
+    pub simulator_http_endpoint: Option<String>,
 }

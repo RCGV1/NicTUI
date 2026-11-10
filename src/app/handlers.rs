@@ -3,6 +3,71 @@ use super::state::{App, AppEvent, AppMode, MainTab, WriteScope};
 use crate::protocol::*;
 
 impl App {
+    fn channel_read_has_edits(&self) -> bool {
+        self.channels_dirty
+            || !self.deleted_channels.is_empty()
+            || self.pending_channel_edit.is_some()
+    }
+
+    fn preset_read_has_edits(&self) -> bool {
+        self.scan_presets_dirty || self.editing_scan_preset.is_some()
+    }
+
+    fn group_read_has_edits(&self) -> bool {
+        self.group_labels_dirty || self.editing_group_label_idx.is_some()
+    }
+
+    fn reconcile_bundled_read_status(&self, status: String) -> String {
+        // Only bundled completion summaries need reconciliation. Ordinary worker
+        // statuses must not inherit a previous read's edit-preservation warning.
+        for (section, edit_name, primary_has_edits) in [
+            ("Channels", "channel", self.channel_read_has_edits()),
+            ("Scan presets", "scan preset", self.preset_read_has_edits()),
+        ] {
+            let Some(outcome) = status.strip_prefix(section) else {
+                continue;
+            };
+            let labels_loaded = outcome == " and group names loaded";
+            let labels_error =
+                outcome.strip_prefix(" loaded, but group names could not be refreshed: ");
+            if !labels_loaded && labels_error.is_none() {
+                continue;
+            }
+            let group_has_edits = self.group_read_has_edits();
+            if !primary_has_edits && !group_has_edits {
+                return status;
+            }
+            let primary = if primary_has_edits {
+                format!("Read not applied: unsaved {edit_name} edits preserved")
+            } else {
+                format!("{section} loaded")
+            };
+            let group = if let Some(error) = labels_error {
+                format!(
+                    "group names could not be refreshed: {error}{}",
+                    if group_has_edits {
+                        "; unsaved group edits preserved"
+                    } else {
+                        ""
+                    }
+                )
+            } else if group_has_edits {
+                "Group names not refreshed: unsaved group edits preserved".into()
+            } else {
+                "group names loaded".into()
+            };
+            return format!("{primary}; {group}");
+        }
+        status
+    }
+
+    fn preserve_section_edits(&mut self, tab: MainTab, section: &str) {
+        if self.mode == AppMode::Reading {
+            self.mode = AppMode::Main(tab);
+        }
+        self.status_message = format!("Read not applied: unsaved {section} edits preserved");
+    }
+
     fn finish_ble_scan_ui_handoff(&mut self) {
         if self.ble_scan_ui_suspended {
             self.resume_ui();
@@ -23,9 +88,25 @@ impl App {
         let mut updated = self.poll_activity();
         while let Ok(event) = self.event_rx.try_recv() {
             updated = true;
+            if self.read_all_request.is_some()
+                && !matches!(
+                    &event,
+                    AppEvent::Progress(_)
+                        | AppEvent::Status(_)
+                        | AppEvent::Log(_)
+                        | AppEvent::CodeplugDataLoaded { .. }
+                        | AppEvent::ReadAllFailed(_)
+                )
+            {
+                // Late dialog/section events must not release ownership or mutate the workspace.
+                self.log("Ignored conflicting event while Read All owns the workspace");
+                continue;
+            }
             match event {
                 AppEvent::Progress(p) => self.progress = p,
-                AppEvent::Status(s) => self.status_message = s,
+                AppEvent::Status(s) => {
+                    self.status_message = self.reconcile_bundled_read_status(s);
+                }
                 AppEvent::Log(l) => self.log(&l),
                 AppEvent::BleScanComplete(candidates) => {
                     self.finish_ble_scan_ui_handoff();
@@ -88,6 +169,10 @@ impl App {
                     );
                 }
                 AppEvent::ReadChannelsComplete(channels, endian) => {
+                    if self.channel_read_has_edits() {
+                        self.preserve_section_edits(self.last_main_tab, "channel");
+                        continue;
+                    }
                     self.channels = channels;
                     self.endian = endian;
                     self.channel_state.select(if self.channels.is_empty() {
@@ -103,27 +188,64 @@ impl App {
                         format!("Channels read complete: {} loaded", self.channels.len());
                 }
                 AppEvent::ReadGroupLabelsComplete(labels) => {
+                    if self.group_read_has_edits() {
+                        self.status_message =
+                            "Group names not refreshed: unsaved group edits preserved".into();
+                        continue;
+                    }
                     self.group_labels = normalize_group_labels(&labels);
                     self.group_labels_dirty = false;
-                    if self.scanning_group_state.selected().is_none() {
-                        self.scanning_group_state.select(Some(0));
+                    self.ensure_group_selection();
+                }
+                AppEvent::ReadGroupLabelsOnlyComplete(labels) => {
+                    if self.group_read_has_edits() {
+                        self.preserve_section_edits(MainTab::MemoryGroups, "group name");
+                        continue;
                     }
+                    self.group_labels = normalize_group_labels(&labels);
+                    self.group_labels_dirty = false;
+                    self.ensure_group_selection();
+                    self.mode = AppMode::Main(MainTab::MemoryGroups);
+                    self.last_main_tab = MainTab::MemoryGroups;
+                    self.last_non_remote_tab = MainTab::MemoryGroups;
+                    self.progress = 1.0;
+                    self.status_message = "Memory group names read complete".into();
                 }
                 AppEvent::ReadPresetsComplete(presets) => {
+                    if self.preset_read_has_edits() {
+                        self.preserve_section_edits(MainTab::Scanning, "scan preset");
+                        continue;
+                    }
                     self.scan_presets = presets;
                     self.scan_presets_dirty = false;
-                    self.preset_state.select(Some(0));
+                    self.preset_state.select(if self.scan_presets.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    });
                     self.mode = AppMode::Main(MainTab::Scanning);
                     self.status_message = "Presets read complete".to_string();
                 }
                 AppEvent::ReadBandPlanComplete(plans) => {
+                    if self.band_plans_dirty || self.editing_band_plan.is_some() {
+                        self.preserve_section_edits(MainTab::BandPlan, "band plan");
+                        continue;
+                    }
                     self.band_plans = plans;
                     self.band_plans_dirty = false;
-                    self.bandplan_state.select(Some(0));
+                    self.bandplan_state.select(if self.band_plans.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    });
                     self.mode = AppMode::Main(MainTab::BandPlan);
                     self.status_message = "BandPlan read complete".to_string();
                 }
                 AppEvent::ReadDTMFComplete(presets) => {
+                    if self.dtmf_dirty || self.pending_dtmf_edit.is_some() {
+                        self.preserve_section_edits(MainTab::DTMF, "DTMF");
+                        continue;
+                    }
                     self.dtmf_presets = presets;
                     self.dtmf_state.select(if self.dtmf_presets.is_empty() {
                         None
@@ -135,12 +257,25 @@ impl App {
                     self.status_message = "DTMF read complete".to_string();
                 }
                 AppEvent::ReadSettingsComplete(settings, endian) => {
+                    if self.settings_dirty || matches!(self.mode, AppMode::EditSetting(_)) {
+                        self.preserve_section_edits(MainTab::Settings, "settings");
+                        continue;
+                    }
                     self.settings = Some(settings);
                     self.endian = endian;
                     self.settings_dirty = false;
                     self.settings_state.select(Some(0));
                     self.mode = AppMode::Main(MainTab::Settings);
                     self.status_message = "Settings read complete".to_string();
+                }
+                AppEvent::ReadAllFailed(error) => {
+                    if self.read_all_request.take().is_some() {
+                        if self.ble_transport_selected() {
+                            self.ble_reconnect_required = true;
+                        }
+                        self.status_message = error.clone();
+                        self.mode = AppMode::Error(error);
+                    }
                 }
                 AppEvent::RemotePhase(phase) => {
                     if matches!(
@@ -188,9 +323,43 @@ impl App {
                             .map_or(received_at, |last| last.max(received_at)),
                     );
                 }
+                AppEvent::SimulatorLcdFrame(pixels) => {
+                    if self.simulator_mode && self.remote_active {
+                        let uart_display = (!self.remote_screen.display.has_native_frame())
+                            .then(|| self.remote_screen.display.clone());
+                        match self.remote_screen.display.set_native_frame(&pixels) {
+                            Ok(()) => {
+                                if let Some(display) = uart_display {
+                                    self.remote_screen.simulator_uart_display = Some(display);
+                                }
+                                self.remote_screen.simulator_lcd_error = None;
+                                self.remote_screen.has_display_updates = true;
+                                self.remote_screen.has_non_battery_drawings = true;
+                            }
+                            Err(error) => self.log(&format!("Simulator LCD: {error}")),
+                        }
+                    }
+                }
+                AppEvent::SimulatorLcdUnavailable(error) => {
+                    if self.simulator_mode && self.remote_active {
+                        if let Some(display) = self.remote_screen.simulator_uart_display.take() {
+                            self.remote_screen.display = display;
+                        } else {
+                            self.remote_screen.display.release_native_frame();
+                        }
+                        self.remote_screen.simulator_lcd_error = Some(error.clone());
+                        self.log(&format!("Simulator LCD: {error}"));
+                    }
+                }
                 AppEvent::RemotePacket(pkt) => {
                     let now = std::time::Instant::now();
-                    self.remote_screen.display.apply(&pkt);
+                    if self.simulator_mode
+                        && let Some(display) = &mut self.remote_screen.simulator_uart_display
+                    {
+                        display.apply(&pkt);
+                    } else {
+                        self.remote_screen.display.apply(&pkt);
+                    }
                     if matches!(
                         &pkt,
                         RemotePacket::DisplayText { .. }
@@ -198,6 +367,8 @@ impl App {
                             | RemotePacket::DrawSymbol { .. }
                     ) {
                         self.remote_screen.has_display_updates = true;
+                        self.remote_screen.has_non_battery_drawings |=
+                            !pkt.is_battery_voltage_label();
                     }
                     match &pkt {
                         RemotePacket::SignalStrength { strength, .. } => {
@@ -304,6 +475,16 @@ impl App {
                     scan_presets,
                     group_labels,
                 } => {
+                    let read_all = self.read_all_request.take();
+                    if let Some(request) = &read_all
+                        && (self.configuration_has_unsaved_edits()
+                            || self.workspace_snapshot().as_deref()
+                                != Some(request.workspace.as_slice()))
+                    {
+                        self.mode = AppMode::Main(request.return_tab);
+                        self.status_message = "Read All not applied: workspace changed during the read; edits preserved".into();
+                        continue;
+                    }
                     self.endian =
                         crate::protocol::codeplug::infer_channel_endianness_from_codeplug(&data);
                     self.band_plans = crate::protocol::codeplug::extract_band_plans_from_codeplug(
@@ -345,6 +526,9 @@ impl App {
                     } else {
                         Some(0)
                     });
+                    self.settings_state
+                        .select(self.settings.as_ref().map(|_| 0));
+                    self.scanning_group_state.select(Some(0));
                     self.codeplug_workspace_baseline = self.workspace_snapshot();
                     self.status_message = format!(
                         "Codeplug loaded: {} channels, {} scan presets, {} named groups",
@@ -356,6 +540,16 @@ impl App {
                             .count()
                     );
                     self.mode = AppMode::Main(MainTab::Codeplug);
+                    if let Some(request) = read_all {
+                        self.progress = 1.0;
+                        self.mode = AppMode::Main(request.return_tab);
+                        self.status_message = if self.demo_mode {
+                            "Demo: all radio configuration loaded (no hardware I/O)"
+                        } else {
+                            "All radio configuration loaded"
+                        }
+                        .into();
+                    }
                 }
                 AppEvent::ShowBinFirmwareDialog => self.show_bin_firmware_dialog(),
                 AppEvent::LoadBinFirmware(path) => self.start_load_bin_firmware(path),
@@ -388,15 +582,11 @@ impl App {
     }
 
     pub fn next_channel(&mut self) {
-        if !self.channels.is_empty() {
-            next_item(self.channels.len(), &mut self.channel_state);
-        }
+        next_item(self.channels.len(), &mut self.channel_state);
     }
 
     pub fn prev_channel(&mut self) {
-        if !self.channels.is_empty() {
-            prev_item(self.channels.len(), &mut self.channel_state);
-        }
+        prev_item(self.channels.len(), &mut self.channel_state);
     }
 
     pub fn next_dtmf(&mut self) {
@@ -416,15 +606,11 @@ impl App {
     }
 
     pub fn next_scanning_item(&mut self) {
-        if !self.scan_presets.is_empty() {
-            next_item(self.scan_presets.len(), &mut self.preset_state);
-        }
+        next_item(self.scan_presets.len(), &mut self.preset_state);
     }
 
     pub fn prev_scanning_item(&mut self) {
-        if !self.scan_presets.is_empty() {
-            prev_item(self.scan_presets.len(), &mut self.preset_state);
-        }
+        prev_item(self.scan_presets.len(), &mut self.preset_state);
     }
 
     pub fn next_group_item(&mut self) {
@@ -436,7 +622,11 @@ impl App {
     }
 
     pub fn ensure_group_selection(&mut self) {
-        if self.scanning_group_state.selected().is_none() {
+        if self
+            .scanning_group_state
+            .selected()
+            .is_none_or(|index| index >= GROUP_LABEL_COUNT)
+        {
             self.scanning_group_state.select(Some(0));
         }
     }
@@ -446,7 +636,9 @@ impl App {
             self.hardware_action_allowed();
             return;
         }
-        if !self.ports.is_empty() {
+        if self.selected_port_index >= self.ports.len() {
+            self.selected_port_index = 0;
+        } else if !self.ports.is_empty() {
             self.selected_port_index = (self.selected_port_index + 1) % self.ports.len();
         }
     }
@@ -456,7 +648,9 @@ impl App {
             self.hardware_action_allowed();
             return;
         }
-        if !self.ports.is_empty() {
+        if self.selected_port_index >= self.ports.len() {
+            self.selected_port_index = 0;
+        } else if !self.ports.is_empty() {
             self.selected_port_index = if self.selected_port_index == 0 {
                 self.ports.len() - 1
             } else {
@@ -790,13 +984,16 @@ impl App {
     }
 
     pub fn add_new_channel(&mut self, _at_index: Option<usize>) {
-        if self.channels.len() >= 200 {
-            self.status_message = "Cannot add more than 200 channels".to_string();
+        let Some(channel_num) = (1..=198).find(|number| {
+            !self.channels.iter().any(|ch| ch.channel_num == *number)
+                && !self.deleted_channels.contains(number)
+        }) else {
+            self.status_message = "No free channel slots (1-198); undo or write pending deletions before reusing their slots".to_string();
             return;
-        }
+        };
 
         let new_channel = Channel {
-            channel_num: (self.channels.len() + 1) as u16,
+            channel_num,
             name: "New Channel".to_string(),
             rx_freq: "0".to_string(),
             tx_freq: "0".to_string(),
@@ -815,7 +1012,7 @@ impl App {
         self.channels.push(new_channel);
         self.channels_dirty = true;
         update_selection_after_add(&mut self.channel_state, self.channels.len() - 1);
-        self.status_message = format!("Channel {} added (Unsaved)", self.channels.len());
+        self.status_message = format!("Channel {} added (Unsaved)", channel_num);
     }
 
     pub fn start_write_dirty_channels(&mut self) {
@@ -897,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_and_band_reads_reset_only_their_own_dirty_flags() {
+    fn scan_and_band_reads_do_not_discard_unsaved_edits() {
         let mut app = App::new();
         app.scan_presets_dirty = true;
         app.band_plans_dirty = true;
@@ -905,7 +1102,7 @@ mod tests {
             .send(AppEvent::ReadPresetsComplete(Vec::new()))
             .unwrap();
         app.update();
-        assert!(!app.scan_presets_dirty);
+        assert!(app.scan_presets_dirty);
         assert!(app.band_plans_dirty);
         app.scan_presets_dirty = true;
         app.event_tx
@@ -913,7 +1110,7 @@ mod tests {
             .unwrap();
         app.update();
         assert!(app.scan_presets_dirty);
-        assert!(!app.band_plans_dirty);
+        assert!(app.band_plans_dirty);
     }
 
     #[test]
@@ -1329,6 +1526,136 @@ mod tests {
 
         assert!(app.channels_dirty);
         assert_eq!(app.channels[0].name, "NEW");
+    }
+
+    #[test]
+    fn native_simulator_frame_owns_pixels_but_preserves_uart_status_and_fallback() {
+        let mut app = App::new();
+        app.simulator_mode = true;
+        app.remote_active = true;
+        app.event_tx
+            .send(AppEvent::SimulatorLcdFrame(vec![0xffff; 128 * 128]))
+            .unwrap();
+        app.update();
+        assert!(app.remote_screen.display.has_native_frame());
+        let native = app.remote_screen.display.pixel(0, 0);
+        let rectangle = RemotePacket::DrawRectangle {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            color: 0x001f,
+        };
+        app.event_tx
+            .send(AppEvent::RemotePacket(rectangle.clone()))
+            .unwrap();
+        app.event_tx
+            .send(AppEvent::RemotePacket(RemotePacket::SmallStatus {
+                id: 0x72,
+                value1: 0,
+                value2: 0,
+            }))
+            .unwrap();
+        app.update();
+        assert_eq!(app.remote_screen.display.pixel(0, 0), native);
+        assert_eq!(app.remote_screen.leds, 2);
+
+        app.event_tx
+            .send(AppEvent::SimulatorLcdUnavailable(
+                "temporarily unavailable".into(),
+            ))
+            .unwrap();
+        app.update();
+        assert!(!app.remote_screen.display.has_native_frame());
+        assert!(app.remote_screen.simulator_lcd_error.is_some());
+        assert_ne!(app.remote_screen.display.pixel(0, 0), native);
+        assert_eq!(
+            app.remote_screen.display.pixel(0, 0),
+            ratatui::style::Color::Rgb(248, 0, 0)
+        );
+
+        app.event_tx
+            .send(AppEvent::SimulatorLcdFrame(vec![0; 128 * 128]))
+            .unwrap();
+        app.update();
+        assert!(app.remote_screen.display.has_native_frame());
+        assert!(app.remote_screen.simulator_lcd_error.is_none());
+        app.event_tx
+            .send(AppEvent::RemoteStopped {
+                message: "stopped".into(),
+                failure: None,
+            })
+            .unwrap();
+        app.event_tx
+            .send(AppEvent::SimulatorLcdFrame(vec![0xffff; 128 * 128]))
+            .unwrap();
+        app.update();
+        assert_eq!(
+            app.remote_screen.display.pixel(0, 0),
+            ratatui::style::Color::Rgb(0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn native_lcd_failure_restores_all_uart_pixels_and_meter_coordinates() {
+        let mut app = App::new();
+        app.simulator_mode = true;
+        app.remote_active = true;
+        app.remote_screen.display.set_meter_context(0, false, 0);
+        let mut expected = app.remote_screen.display.clone();
+        app.event_tx
+            .send(AppEvent::SimulatorLcdFrame(vec![0xffff; 128 * 128]))
+            .unwrap();
+        app.update();
+        for packet in [
+            RemotePacket::SignalBarPos { y: 40, aux: 0 },
+            RemotePacket::DrawRectangle {
+                x: 7,
+                y: 80,
+                width: 9,
+                height: 5,
+                color: 0x001f,
+            },
+        ] {
+            expected.apply(&packet);
+            app.event_tx.send(AppEvent::RemotePacket(packet)).unwrap();
+        }
+        app.event_tx
+            .send(AppEvent::SimulatorLcdFrame(vec![0; 128 * 128]))
+            .unwrap();
+        let signal = RemotePacket::SignalStrength {
+            strength: 42,
+            mode: 0,
+            battery: 0,
+        };
+        expected.apply(&signal);
+        app.event_tx.send(AppEvent::RemotePacket(signal)).unwrap();
+        app.event_tx
+            .send(AppEvent::SimulatorLcdUnavailable("offline".into()))
+            .unwrap();
+        app.update();
+        assert!(!app.remote_screen.display.has_native_frame());
+        assert!(app.remote_screen.simulator_uart_display.is_none());
+        for y in 0..128 {
+            for x in 0..128 {
+                assert_eq!(app.remote_screen.display.pixel(x, y), expected.pixel(x, y));
+            }
+        }
+    }
+
+    #[test]
+    fn native_simulator_frames_are_never_applied_to_a_physical_radio_session() {
+        let mut app = App::new();
+        app.remote_active = true;
+        app.event_tx
+            .send(AppEvent::SimulatorLcdFrame(vec![0xffff; 128 * 128]))
+            .unwrap();
+        app.update();
+        assert!(!app.remote_screen.display.has_native_frame());
+        assert_eq!(
+            app.remote_screen.display.pixel(0, 0),
+            ratatui::style::Color::Rgb(0, 0, 0)
+        );
     }
 
     #[test]

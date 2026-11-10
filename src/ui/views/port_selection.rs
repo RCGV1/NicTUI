@@ -14,46 +14,76 @@ use ratatui::{
 };
 
 pub fn render_port_selection(f: &mut Frame, app: &App, area: Rect) {
+    if app.simulator_mode {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from("SIMULATOR | no physical radio I/O"),
+                Line::from(""),
+                Line::from(app.status_message.clone()),
+                Line::from(""),
+                Line::from("USB discovery and BLE scanning are disabled."),
+                Line::from("Start the separately installed simulator add-on, then restart with:"),
+                Line::from("nictui tui --simulate --simulator-endpoint ADDRESS:PORT"),
+                Line::from(""),
+                Line::from(vec![render_shortcut("q"), Span::raw(" quit")]),
+            ])
+            .style(Style::default().fg(COLOR_TEXT))
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Simulator Target ")
+                    .border_style(Style::default().fg(COLOR_BORDER)),
+            ),
+            area,
+        );
+        return;
+    }
+    let compact = area.height < 28;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),
-            Constraint::Length(10),
-            Constraint::Min(0),
+            Constraint::Length(if compact { 3 } else { 8 }),
+            Constraint::Length(if compact { 8 } else { 10 }),
+            Constraint::Min(4),
             Constraint::Length(3),
         ])
         .split(area);
 
-    let welcome = Paragraph::new(vec![
-        Line::from(Span::styled(
-            "NicTUI",
-            Style::default()
-                .fg(COLOR_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("USB: ", Style::default().fg(COLOR_TEXT)),
-            Span::styled(
-                "best for first setup and dependable reads/writes.",
-                Style::default().fg(COLOR_DIM),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("BLE: ", Style::default().fg(COLOR_TEXT)),
-            Span::styled(
-                "NicTUI scans automatically; keep the radio nearby with Bluetooth on.",
-                Style::default().fg(COLOR_DIM),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Need help: ", Style::default().fg(COLOR_TEXT)),
-            Span::styled(
-                "press b to scan again, or use USB if wireless setup is not ready.",
-                Style::default().fg(COLOR_DIM),
-            ),
-        ]),
-    ])
+    let welcome = Paragraph::new(if compact {
+        vec![Line::from("USB: first setup | BLE: keep Bluetooth on")]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "NicTUI",
+                Style::default()
+                    .fg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("USB: ", Style::default().fg(COLOR_TEXT)),
+                Span::styled(
+                    "best for first setup and dependable reads/writes.",
+                    Style::default().fg(COLOR_DIM),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("BLE: ", Style::default().fg(COLOR_TEXT)),
+                Span::styled(
+                    "NicTUI scans automatically; keep the radio nearby with Bluetooth on.",
+                    Style::default().fg(COLOR_DIM),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Need help: ", Style::default().fg(COLOR_TEXT)),
+                Span::styled(
+                    "press b to scan again, or use USB if wireless setup is not ready.",
+                    Style::default().fg(COLOR_DIM),
+                ),
+            ]),
+        ]
+    })
     .alignment(ratatui::layout::Alignment::Center)
     .wrap(ratatui::widgets::Wrap { trim: true })
     .block(
@@ -85,7 +115,7 @@ pub fn render_port_selection(f: &mut Frame, app: &App, area: Rect) {
     let ble_count = app.ble_target_count();
     let (ble_readiness_summary, ble_readiness_hint) = port_picker_ble_overview(app);
     let scan_status = port_picker_scan_status(app, serial_count, ble_count);
-    let status = Paragraph::new(vec![
+    let mut status_lines = vec![
         Line::from(vec![
             Span::styled("Found: ", Style::default().fg(COLOR_DIM)),
             Span::styled(
@@ -140,7 +170,10 @@ pub fn render_port_selection(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(scan_status, Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                if compact { String::new() } else { scan_status },
+                Style::default().fg(COLOR_DIM),
+            ),
         ]),
         Line::from(vec![
             Span::styled("BLE: ", Style::default().fg(COLOR_DIM)),
@@ -155,20 +188,28 @@ pub fn render_port_selection(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("Next: ", Style::default().fg(COLOR_DIM)),
             Span::styled(ble_readiness_hint, Style::default().fg(COLOR_DIM)),
         ]),
-    ])
-    .wrap(ratatui::widgets::Wrap { trim: true })
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Connection Readiness ")
-            .border_style(Style::default().fg(COLOR_BORDER)),
-    );
+    ];
+    if compact {
+        status_lines.remove(2);
+    }
+    let status = Paragraph::new(status_lines)
+        .wrap(ratatui::widgets::Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Connection Readiness ")
+                .border_style(Style::default().fg(COLOR_BORDER)),
+        );
     f.render_widget(status, chunks[1]);
 
     let ports: Vec<ListItem> = if app.port_candidates.is_empty() {
         vec![
-            ListItem::new(" No targets yet. Connect USB and press r, or press b to scan BLE. ")
-                .style(Style::default().fg(COLOR_DIM)),
+            ListItem::new(if compact {
+                "No targets. USB: r refresh | BLE: b scan"
+            } else {
+                " No targets yet. Connect USB and press r, or press b to scan BLE. "
+            })
+            .style(Style::default().fg(COLOR_DIM)),
         ]
     } else {
         app.port_candidates
@@ -221,14 +262,27 @@ pub fn render_port_selection(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, chunks[2], &mut list_state);
 
     let mut help_spans = vec![
+        render_shortcut("F1"),
+        Span::raw(" Help | "),
         render_shortcut("↑/↓"),
         Span::raw(" Choose | "),
         render_shortcut("Enter"),
-        Span::raw(" Continue | "),
+        Span::styled(
+            if selected_candidate.is_some() {
+                " Continue | "
+            } else {
+                " disabled: select target | "
+            },
+            Style::default().fg(COLOR_DIM),
+        ),
         render_shortcut("r"),
         Span::raw(" Refresh All | "),
         render_shortcut("b"),
-        Span::raw(" Scan BLE | "),
+        Span::raw(if app.ble_scan_in_progress {
+            " Scanning BLE | "
+        } else {
+            " Scan BLE | "
+        }),
     ];
     if area.width >= 104 {
         help_spans.push(Span::styled(

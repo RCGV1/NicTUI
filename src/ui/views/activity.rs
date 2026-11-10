@@ -1,5 +1,5 @@
 use crate::activity::format_frequency_mhz;
-use crate::app::App;
+use crate::app::{App, activity::HeartbeatStatus};
 use crate::ui::theme::{
     COLOR_BORDER, COLOR_DIM, COLOR_PRIMARY, COLOR_SELECTION_BG, COLOR_SELECTION_FG, COLOR_TEXT,
     COLOR_WARNING,
@@ -18,6 +18,7 @@ pub fn render_activity(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let active = app.activity_active();
     let state = app.activity.lock().unwrap().clone();
+    let heartbeat = state.heartbeat_status(active);
     let status = state.status.label();
     let title = format!(
         " Activity [A] | {status}{} ",
@@ -35,21 +36,37 @@ pub fn render_activity(f: &mut Frame, app: &mut App, area: Rect) {
 
     let setup_height = if inner.width < 76 { 3 } else { 2 };
     let chunks = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(if inner.height >= 12 { 2 } else { 1 }),
+        Constraint::Length(
+            (heartbeat.label().len() as u16)
+                .div_ceil(inner.width.saturating_sub(2).max(1))
+                .min(3)
+                + 2,
+        ),
         Constraint::Length(setup_height),
         Constraint::Min(0),
-        Constraint::Length(if inner.height >= 10 { 2 } else { 1 }),
+        Constraint::Length(if state.notice.is_empty() {
+            if inner.height >= 12 { 2 } else { 1 }
+        } else {
+            1 + state
+                .notice
+                .chars()
+                .count()
+                .div_ceil(inner.width.saturating_sub(8).max(1) as usize)
+                .min(3) as u16
+        }),
     ])
     .split(inner);
     let raw = state
         .latest_signal_raw
         .map_or_else(|| "--".into(), |raw| raw.to_string());
     let summary = vec![
-        Line::from(format!(
-            "Hits {}  Heartbeats {}  Latest raw {}",
-            state.hit_count, state.heartbeat_count, raw
-        )),
-        Line::from(if active {
+        Line::from(format!("Hits {}  Latest raw {}", state.hit_count, raw)),
+        Line::from(if app.simulator_mode {
+            "Synthetic events from the local simulator; no RF.".into()
+        } else if state.stopping {
+            "Capture stopping; wait for cleanup.".into()
+        } else if active {
             "Capture owns radio; stop before other radio actions.".into()
         } else if state.truncated_frames > 0 {
             format!("Incomplete frames: {}", state.truncated_frames)
@@ -61,21 +78,54 @@ pub fn render_activity(f: &mut Frame, app: &mut App, area: Rect) {
         Paragraph::new(summary).style(Style::default().fg(COLOR_PRIMARY)),
         chunks[0],
     );
-    f.render_widget(Paragraph::new("Start a VFO preset scan, then enable Activity Mode on the radio.\nCapture does not change radio settings.")
-        .wrap(Wrap { trim: true }).style(Style::default().fg(COLOR_DIM)), chunks[1]);
+    let heartbeat_color = if heartbeat.is_warning() {
+        COLOR_WARNING
+    } else if heartbeat == HeartbeatStatus::Receiving {
+        COLOR_PRIMARY
+    } else {
+        COLOR_DIM
+    };
+    f.render_widget(
+        Paragraph::new(heartbeat.label())
+            .block(Block::default().borders(Borders::ALL))
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(heartbeat_color)),
+        chunks[1],
+    );
+    let setup = if app.simulator_mode {
+        "Press s to receive synthetic activity from NicFWSim.\nNo physical radio setup is needed."
+    } else {
+        "Start a VFO preset scan, then enable Activity Mode on the radio.\nCapture does not change radio settings."
+    };
+    f.render_widget(
+        Paragraph::new(setup)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(COLOR_DIM)),
+        chunks[2],
+    );
 
     if state.log.rows().next().is_none() {
         f.render_widget(
-            Paragraph::new(if active && state.heartbeat_count > 0 {
-                "Radio scan is running. No signal hits received yet."
+            Paragraph::new(if state.stopping {
+                "Stopping capture; wait for cleanup."
+            } else if heartbeat == HeartbeatStatus::Receiving {
+                "No signal hits received yet."
             } else if active {
-                "Waiting for radio activity. Check manual setup if no hits arrive."
+                "No signal hits received. Check radio setup and connection."
+            } else if app.remote_active
+                || app.remote_tx.is_some()
+                || app.ble_scan_in_progress
+                || (!app.demo_mode
+                    && app.protocol_port_name.is_none()
+                    && app.selected_ble_device_id().is_none())
+            {
+                "No activity captured. Start unavailable; see controls below."
             } else {
                 "No activity captured. Press s to start local capture."
             })
             .wrap(Wrap { trim: true })
             .style(Style::default().fg(COLOR_TEXT)),
-            chunks[2],
+            chunks[3],
         );
     } else {
         let wide = inner.width >= 43;
@@ -134,25 +184,36 @@ pub fn render_activity(f: &mut Frame, app: &mut App, area: Rect) {
             )
             .highlight_symbol("> ")
             .column_spacing(1);
-        f.render_stateful_widget(table, chunks[2], &mut app.activity_state);
+        f.render_stateful_widget(table, chunks[3], &mut app.activity_state);
     }
     let controls = if state.stopping {
-        "Stopping; waiting for cleanup | e CSV"
+        "Stopping; wait for cleanup | e save CSV"
     } else if active {
-        "s stop | e CSV | Up/Down select"
+        "s stop | e save CSV | Up/Down select"
+    } else if app.remote_active || app.remote_tx.is_some() {
+        "s disabled: stop Remote; wait for cleanup | e save CSV"
+    } else if app.ble_scan_in_progress {
+        "s disabled: wait for discovery | e save CSV"
+    } else if !app.demo_mode
+        && app.protocol_port_name.is_none()
+        && app.selected_ble_device_id().is_none()
+    {
+        "s disabled: select radio target | e save CSV"
     } else {
-        "s start | c clear | e CSV | Up/Down select"
+        "s start | c clear | e save CSV | Up/Down select"
     };
     let mut lines = vec![Line::from(controls)];
     if !state.notice.is_empty() {
         lines.push(Line::from(state.notice.clone()));
     }
     f.render_widget(
-        Paragraph::new(lines).style(Style::default().fg(if state.notice.is_empty() {
-            COLOR_DIM
-        } else {
-            COLOR_WARNING
-        })),
-        chunks[3],
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(if state.notice.is_empty() {
+                COLOR_DIM
+            } else {
+                COLOR_WARNING
+            })),
+        chunks[4],
     );
 }

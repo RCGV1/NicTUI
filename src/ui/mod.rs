@@ -5,6 +5,9 @@ use ratatui::{
 };
 
 mod editors;
+mod help;
+mod terminal;
+mod terminal_output;
 mod theme;
 pub mod views;
 mod widgets;
@@ -12,6 +15,9 @@ mod widgets;
 use self::editors::*;
 use self::theme::*;
 use crate::app::{App, AppMode, MainTab};
+pub use help::help_page_rows;
+pub use terminal::TerminalPalette;
+pub use terminal_output::TerminalWriter;
 use views::bin_flash::render_bin_flash_overlay;
 pub use views::*;
 
@@ -53,6 +59,9 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             render_delete_confirm(f, app, area);
         }
         AppMode::Error(msg) => render_error(f, msg, area),
+    }
+    if app.help.open {
+        help::render_help(f, app);
     }
 }
 

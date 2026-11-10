@@ -19,20 +19,28 @@ impl App {
     }
 
     pub fn start_edit_setting(&mut self) {
-        if let Some(i) = self.settings_state.selected() {
-            self.mode = AppMode::EditSetting(i);
-            self.status_message = format!("Editing {}", SETTINGS_METADATA[i].name);
-            if let Some(s) = &self.settings {
-                let meta = &SETTINGS_METADATA[i];
-                match meta.setting_type {
-                    SettingType::Enum(_) | SettingType::Boolean => {
-                        self.selection_index = s.get_value(i) as usize;
-                    }
-                    _ => {}
-                }
+        let Some(settings) = &self.settings else {
+            self.status_message = "Read settings before editing".into();
+            return;
+        };
+        let Some((i, meta)) = self
+            .settings_state
+            .selected()
+            .and_then(|i| SETTINGS_METADATA.get(i).map(|meta| (i, meta)))
+        else {
+            self.status_message = "Select a setting".into();
+            return;
+        };
+
+        self.mode = AppMode::EditSetting(i);
+        self.status_message = format!("Editing {}", meta.name);
+        match meta.setting_type {
+            SettingType::Enum(_) | SettingType::Boolean => {
+                self.selection_index = settings.get_value(i) as usize;
             }
-            self.update_setting_edit_buffer();
+            _ => {}
         }
+        self.update_setting_edit_buffer();
     }
 
     pub fn update_setting_edit_buffer(&mut self) {
@@ -87,7 +95,10 @@ impl App {
 
     pub fn handle_settings_editor_key(&mut self, key: KeyCode) {
         match key {
-            KeyCode::Esc => self.mode = AppMode::Main(MainTab::Settings),
+            KeyCode::Esc => {
+                self.mode = AppMode::Main(MainTab::Settings);
+                self.status_message = "Setting edit cancelled".into();
+            }
             KeyCode::Enter => self.commit_setting_edit(),
             KeyCode::Down => self.select_next_setting_option(),
             KeyCode::Up => self.select_previous_setting_option(),
@@ -145,6 +156,89 @@ impl App {
 mod tests {
     use super::*;
     use crate::protocol::SettingsBlock;
+
+    #[test]
+    fn rejected_edit_preserves_mode_draft_and_workspace() {
+        for loaded in [false, true] {
+            for selected in [
+                None,
+                Some(0),
+                Some(SETTINGS_METADATA.len()),
+                Some(usize::MAX),
+            ] {
+                if loaded && selected == Some(0) {
+                    continue;
+                }
+                for mode in [AppMode::Main(MainTab::Settings), AppMode::EditSetting(4)] {
+                    for dirty in [false, true] {
+                        let mut app = App::demo();
+                        if !loaded {
+                            app.settings = None;
+                        }
+                        app.mode = mode.clone();
+                        app.settings_state.select(selected);
+                        app.settings_dirty = dirty;
+                        app.edit_buffer = "keep this draft".into();
+                        app.selection_index = 42;
+                        let workspace = app.workspace_snapshot().unwrap();
+
+                        app.start_edit_setting();
+
+                        assert_eq!(
+                            app.status_message,
+                            if loaded {
+                                "Select a setting"
+                            } else {
+                                "Read settings before editing"
+                            }
+                        );
+                        assert_eq!(app.mode, mode);
+                        assert_eq!(app.settings_state.selected(), selected);
+                        assert_eq!(app.edit_buffer, "keep this draft");
+                        assert_eq!(app.selection_index, 42);
+                        assert_eq!(app.settings_dirty, dirty);
+                        assert_eq!(app.workspace_snapshot().unwrap(), workspace);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loaded_valid_settings_keep_existing_edit_and_unchanged_commit_behavior() {
+        for (index, metadata) in SETTINGS_METADATA.iter().enumerate() {
+            for dirty in [false, true] {
+                let mut app = App::demo();
+                app.settings_state.select(Some(index));
+                app.settings_dirty = dirty;
+                app.edit_buffer = "old draft".into();
+                app.selection_index = 42;
+                let raw = app.settings.as_ref().unwrap().get_value(index);
+                let workspace = app.workspace_snapshot().unwrap();
+
+                app.start_edit_setting();
+
+                assert_eq!(app.mode, AppMode::EditSetting(index));
+                assert_eq!(app.status_message, format!("Editing {}", metadata.name));
+                assert_eq!(app.edit_buffer, edit_value(index, raw));
+                assert_eq!(
+                    app.selection_index,
+                    match metadata.setting_type {
+                        SettingType::Enum(_) | SettingType::Boolean => raw as usize,
+                        SettingType::Numeric { .. } => 42,
+                    }
+                );
+                assert_eq!(app.workspace_snapshot().unwrap(), workspace);
+
+                app.commit_setting_edit();
+
+                assert_eq!(app.mode, AppMode::Main(MainTab::Settings));
+                assert_eq!(app.status_message, "Setting unchanged");
+                assert_eq!(app.settings_dirty, dirty);
+                assert_eq!(app.workspace_snapshot().unwrap(), workspace);
+            }
+        }
+    }
 
     #[test]
     fn backspace_only_changes_numeric_settings() {

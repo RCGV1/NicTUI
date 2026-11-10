@@ -1,5 +1,6 @@
 use super::common::{
-    BANDPLAN_EDITOR_HEIGHT, BANDPLAN_EDITOR_WIDTH, begin_editor, render_option_popup,
+    BANDPLAN_EDITOR_HEIGHT, BANDPLAN_EDITOR_WIDTH, begin_editor, editor_footer, field_body,
+    render_option_popup,
 };
 use crate::app::{App, AppMode};
 use crate::protocol::editor_value::{
@@ -59,8 +60,12 @@ pub(crate) fn render_bandplan_editor(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5),
-            Constraint::Min(10),
-            Constraint::Length(1),
+            Constraint::Min(4),
+            Constraint::Length(if app.status_message.starts_with("Invalid band:") {
+                3
+            } else {
+                2
+            }),
         ])
         .split(inner_area);
 
@@ -107,10 +112,7 @@ pub(crate) fn render_bandplan_editor(f: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::BOTTOM).title(" Summary "));
     f.render_widget(summary, vertical[0]);
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(29), Constraint::Min(34)])
-        .split(vertical[1]);
+    let body = field_body(vertical[1], 29, 34);
 
     let details = Paragraph::new(vec![
         Line::from(vec![
@@ -179,19 +181,7 @@ pub(crate) fn render_bandplan_editor(f: &mut Frame, app: &App) {
     }
 
     f.render_widget(
-        Paragraph::new(if app.status_message.starts_with("Invalid band:") {
-            app.status_message.as_str()
-        } else {
-            "↑/↓/Tab: Field | ←/→: Option | Enter: Save | Esc: Cancel"
-        })
-        .style(
-            Style::default().fg(if app.status_message.starts_with("Invalid band:") {
-                COLOR_WARNING
-            } else {
-                COLOR_DIM
-            }),
-        )
-        .alignment(ratatui::layout::Alignment::Center),
+        editor_footer(&app.status_message, "Invalid band:"),
         vertical[2],
     );
 }

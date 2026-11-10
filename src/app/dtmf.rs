@@ -87,6 +87,7 @@ impl App {
                 self.dtmf_edit_preset_idx = None;
                 self.pending_dtmf_edit = None;
                 self.mode = AppMode::Main(MainTab::DTMF);
+                self.status_message = "DTMF edit cancelled".into();
             }
             KeyCode::Enter => self.commit_dtmf_edit(),
             KeyCode::Up | KeyCode::BackTab => self.select_previous_dtmf_field(),

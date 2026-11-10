@@ -110,13 +110,19 @@ def cleanup_terminal_child(pid, fd):
 def terminal_checks(binary, view="channels"):
     pid, fd = pty.fork()
     if pid == 0:
-        os.environ["TERM"] = "xterm-ghostty"
+        # This baseline PTY does not emulate capability replies or key-up events.
+        os.environ["TERM"] = "xterm-256color"
+        os.environ["TERM_PROGRAM"] = "Apple_Terminal"
         fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 120, 0, 0))
         os.execv(binary, [binary, "tui", "--demo", "--demo-view", view])
     try:
-        label = b"Activity [A]" if view == "activity" else b"Channels"
-        output = read_until(fd, label)
+        # Terminal diffs may position the shortcut separately from its view label.
+        label = b"[A]" if view == "activity" else b"Channels"
+        output = read_until(fd, label, seconds=10)
+        if view == "activity":
+            assert b"Activity" in output, "Activity view did not draw its title"
         assert b"NicTUI" in output, "Startup did not draw the demo UI"
+        assert b"\x1b[?u" not in output, "Baseline PTY queried keyboard enhancements"
         assert b"\x1b[?1003h" not in output, "Mouse reporting was enabled"
         if view == "activity":
             os.write(fd, b"s")
@@ -136,6 +142,40 @@ def terminal_checks(binary, view="channels"):
         assert status == 0, "TUI exit failed"
     finally:
         cleanup_terminal_child(pid, fd)
+
+
+def cleanup_flash_child(process, master, slave):
+    original_error = sys.exc_info()[1]
+    errors = []
+    # Release both private PTY descriptors before reaping, including after SIGKILL.
+    for fd in (master, slave):
+        try:
+            os.close(fd)
+        except OSError as error:
+            errors.append(str(error))
+    try:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        errors.append(str(error))
+    finally:
+        if process.stdout is not None:
+            try:
+                process.stdout.close()
+            except OSError as error:
+                errors.append(str(error))
+    if errors:
+        message = "Flash cleanup: " + "; ".join(errors)
+        if original_error is None:
+            raise AssertionError(message)
+        if hasattr(original_error, "add_note"):
+            original_error.add_note(message)
+        else:
+            print(message, file=sys.stderr)
 
 
 def flash_checks(binary, size, ack_init=True):
@@ -185,11 +225,7 @@ def flash_checks(binary, size, ack_init=True):
             assert process.returncode == 0, output.decode(errors="replace")
             assert not read_for(master, 0.1), "Flasher sent an extra firmware packet"
         finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            os.close(master)
-            os.close(slave)
+            cleanup_flash_child(process, master, slave)
 
 
 def launcher_checks():
@@ -203,23 +239,66 @@ def launcher_checks():
         launcher.chmod(0o755)
         binary = app / "nictui-bin"
         binary.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
-                          "open(os.environ['NICTUI_TEST_ARGS'], 'w').write(json.dumps(sys.argv[1:]))\n")
+                          "record = dict(args=sys.argv[1:], env={key: os.environ.get(key) "
+                          "for key in ('NO_COLOR', 'TERM', 'COLORTERM')})\n"
+                          "open(os.environ['NICTUI_TEST_ARGS'], 'w').write(json.dumps(record))\n")
         binary.chmod(0o755)
         mock_bin = root / "bin"
         mock_bin.mkdir()
         opener = mock_bin / "open"
-        opener.write_text('#!/bin/sh\nprintf "%s" "$3" > "$NICTUI_TEST_COMMAND"\n')
+        opener.write_text('#!/bin/sh\nprintf "%s" "$3" > "$NICTUI_TEST_COMMAND"\n'
+                          'exit "${NICTUI_TEST_OPEN_STATUS:-0}"\n')
         opener.chmod(0o755)
         env = dict(os.environ, PATH=str(mock_bin) + ":" + os.environ["PATH"],
                    TMPDIR=str(root), NICTUI_TEST_COMMAND=str(root / "command-path"),
-                   NICTUI_TEST_ARGS=str(root / "args"))
-        for args in ([], ["tui", "--ble-name", "TD-H3; $(echo wrong) ' quoted"]):
-            subprocess.run([str(launcher), *args], env=env, check=True,
-                           stdin=subprocess.DEVNULL, capture_output=True)
-            command = Path((root / "command-path").read_text())
-            subprocess.run([str(command)], env=env, check=True, capture_output=True)
-            assert json.loads((root / "args").read_text()) == args
-            assert not command.exists(), "Launch command was not cleaned up"
+                   NICTUI_TEST_ARGS=str(root / "args"), NO_COLOR="1", COLORTERM="")
+        for term in (None, "", "dumb", "xterm-256color", "xterm-ghostty"):
+            launch_env = dict(env)
+            if term is None:
+                launch_env.pop("TERM", None)
+            else:
+                launch_env["TERM"] = term
+            for args in ([], ["tui", "--ble-name", "TD-H3; $(echo wrong) ' quoted"]):
+                subprocess.run([str(launcher), *args], env=launch_env, check=True,
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=5)
+                command = Path((root / "command-path").read_text())
+                subprocess.run([str(command)], env=launch_env, check=True,
+                               capture_output=True, timeout=5)
+                record = json.loads((root / "args").read_text())
+                assert record["args"] == args
+                assert record["env"] == dict(NO_COLOR=None, COLORTERM="",
+                                             TERM=term if term and term != "dumb" else "xterm-256color")
+                assert not command.exists(), "Launch command was not cleaned up"
+                assert not command.parent.exists(), "Session directory was not cleaned up"
+
+        # Non-TUI logging and direct terminal invocations keep caller color policy.
+        env["TERM"] = "dumb"
+        log = root / "logs with spaces" / "app.log"
+        (root / "command-path").unlink()
+        subprocess.run([str(launcher), "--app-log-file", str(log), "--help"],
+                       env=env, check=True, stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=5)
+        record = json.loads((root / "args").read_text())
+        assert record == dict(args=["--help"], env=dict(NO_COLOR="1", TERM="dumb", COLORTERM=""))
+        assert "Args: --help" in log.read_text()
+        assert not (root / "command-path").exists(), "CLI unexpectedly opened Terminal"
+        master, slave = pty.openpty()
+        try:
+            subprocess.run([str(launcher), "tui", "--demo"], env=env, check=True,
+                           stdin=slave, stdout=slave, stderr=slave, timeout=5)
+        finally:
+            os.close(master)
+            os.close(slave)
+        record = json.loads((root / "args").read_text())
+        assert record == dict(args=["tui", "--demo"],
+                              env=dict(NO_COLOR="1", TERM="dumb", COLORTERM=""))
+        assert not (root / "command-path").exists(), "TTY unexpectedly opened Terminal"
+
+        result = subprocess.run([str(launcher)], env=dict(env, NICTUI_TEST_OPEN_STATUS="1"),
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=5)
+        assert result.returncode == 1
+        command = Path((root / "command-path").read_text())
+        assert not command.parent.exists(), "Failed open left a session directory"
 
 
 if __name__ == "__main__":

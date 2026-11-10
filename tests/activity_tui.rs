@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::KeyCode;
 use nictui::{
+    activity::ActivityLog,
     app::{App, AppMode, MainTab, activity::ActivityStatus},
     ui,
 };
@@ -45,7 +46,7 @@ fn activity_renders_responsively_and_keeps_manual_setup_order() {
             "MeanRaw",
             "LastSeen",
             "146.52000",
-            "Heartbeats",
+            "Heartbeats: capture stopped",
             "Latest raw",
             "s start",
             "e CSV",
@@ -57,6 +58,7 @@ fn activity_renders_responsively_and_keeps_manual_setup_order() {
         }
         assert!(output.contains("Start a VFO preset scan, then enable Activity Mode"));
         assert!(!output.contains("signal_raw"));
+        assert!(!output.contains("Heartbeats 1"));
     }
     for (width, height) in [(1, 1), (8, 3), (20, 8), (40, 12), (60, 18)] {
         let mut app = App::demo();
@@ -66,37 +68,40 @@ fn activity_renders_responsively_and_keeps_manual_setup_order() {
 }
 
 #[test]
-fn activity_empty_state_distinguishes_scan_heartbeats_from_no_data() {
+fn activity_empty_state_does_not_infer_liveness_from_heartbeat_total() {
     for (width, height) in [(100, 30), (140, 38)] {
-        for heartbeats in [0, 12] {
+        for fresh in [false, true] {
             let mut app = App::demo();
             app.mode = AppMode::Main(MainTab::Activity);
             app.start_activity();
             {
                 let mut state = app.activity.lock().unwrap();
-                *state = Default::default();
-                state.heartbeat_count = heartbeats;
-                state.status = if heartbeats > 0 {
-                    ActivityStatus::Listening
+                if fresh {
+                    state.log = ActivityLog::new(4096);
+                    state.hit_count = 0;
+                    state.latest_signal_raw = None;
                 } else {
-                    ActivityStatus::Waiting
-                };
+                    *state = Default::default();
+                    state.status = ActivityStatus::Waiting;
+                }
+                // A diagnostic total alone is not evidence of a recent heartbeat.
+                state.heartbeat_count = 424242;
             }
 
             let output = render(&mut app, width, height);
-            let running = "Radio scan is running. No signal hits received yet.";
-            let waiting = "Waiting for radio activity. Check manual setup if no hits arrive.";
-            let (expected, absent) = if heartbeats > 0 {
-                (running, waiting)
+            let (expected, absent) = if fresh {
+                ("Heartbeats: receiving", "Heartbeats: connecting")
             } else {
-                (waiting, running)
+                ("Heartbeats: connecting", "Heartbeats: receiving")
             };
             assert!(
                 output.contains(expected),
-                "{heartbeats} heartbeats at {width}x{height}:\n{output}"
+                "fresh={fresh} at {width}x{height}:\n{output}"
             );
             assert!(!output.contains(absent));
-            assert!(output.contains(&format!("Hits 0  Heartbeats {heartbeats}  Latest raw --")));
+            assert!(output.contains("Hits 0  Latest raw --"));
+            assert!(!output.contains("424242"));
+            assert!(!output.contains("Radio scan is running"));
             assert!(!output.contains("FrequencyMHz"));
             let state = app.activity.lock().unwrap();
             assert_eq!(state.hit_count, 0);
@@ -110,16 +115,35 @@ fn activity_empty_state_distinguishes_scan_heartbeats_from_no_data() {
 }
 
 #[test]
-fn activity_is_discoverable_in_sidebar_from_other_pages() {
-    for (width, height) in [(80, 24), (100, 27), (100, 28), (100, 29)] {
+fn activity_remains_discoverable_when_the_sidebar_collapses() {
+    for (width, height) in [
+        (80, 24),
+        (100, 24),
+        (120, 24),
+        (100, 27),
+        (100, 28),
+        (100, 29),
+        (120, 30),
+    ] {
         let mut app = App::demo();
         let output = render(&mut app, width, height);
-        assert!(
-            output.contains("A. Activity"),
-            "{width}x{height}:\n{output}"
-        );
-        assert!(output.contains("0. Logs"));
-        assert!(output.contains("1. Channels"));
+        let body = nictui::ui::views::main_layout::main_content_area(ratatui::layout::Rect::new(
+            0, 0, width, height,
+        ));
+        if body.x == 0 {
+            assert!(
+                output.contains("/ a activity"),
+                "{width}x{height}:\n{output}"
+            );
+            assert!(output.contains("Tab"));
+        } else {
+            assert!(
+                output.contains("A. Activity"),
+                "{width}x{height}:\n{output}"
+            );
+            assert!(output.contains("0. Logs"));
+            assert!(output.contains("1. Channels"));
+        }
     }
 }
 

@@ -124,15 +124,22 @@ fn sanitized_progress_status(status: &str) -> String {
 pub(crate) fn render_error(f: &mut Frame, msg: &str, area: Rect) {
     let dialog_area = centered_fixed(ERROR_DIALOG_WIDTH, ERROR_DIALOG_HEIGHT, area);
     f.render_widget(Clear, dialog_area);
-    let p = Paragraph::new(format!("\n ERROR\n\n{}\n\nPress Esc to return", msg))
+    let block = Block::default()
+        .title(" ERROR ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_ERROR));
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let p = Paragraph::new(msg)
         .alignment(ratatui::layout::Alignment::Center)
         .style(Style::default().fg(COLOR_ERROR))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_ERROR)),
-        );
-    f.render_widget(p, dialog_area);
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    f.render_widget(p, chunks[0]);
+    f.render_widget(
+        Paragraph::new("Press Esc to return").alignment(ratatui::layout::Alignment::Center),
+        chunks[1],
+    );
 }
 
 pub(crate) fn render_delete_confirm(f: &mut Frame, app: &App, area: Rect) {

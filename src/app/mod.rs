@@ -29,6 +29,8 @@ pub mod channels;
 pub mod dtmf;
 pub mod group_labels;
 pub mod handlers;
+pub mod help;
+pub mod logs;
 pub mod navigation;
 pub mod scan_presets;
 pub mod settings;
@@ -83,12 +85,15 @@ impl App {
             progress: 0.0,
             status_message,
             logs: VecDeque::new(),
+            help: Default::default(),
+            log_view: Default::default(),
             endian: Endianness::Big,
             edit_buffer: String::new(),
             selection_index: 0,
             event_tx: tx,
             event_rx: rx,
             remote_active: false,
+            remote_keyboard_release_supported: false,
             remote_stop_signal: Arc::new(AtomicBool::new(false)),
             remote_tx: None,
             remote_input_state: Default::default(),
@@ -102,6 +107,7 @@ impl App {
             band_plans_dirty: false,
             codeplug_data: None,
             codeplug_workspace_baseline: None,
+            read_all_request: None,
             codeplug_path: None,
             bin_firmware_data: None,
             bin_file_path: None,
@@ -110,6 +116,8 @@ impl App {
             dtmf_edit_preset_idx: None,
             pending_dtmf_edit: None,
             demo_mode: false,
+            simulator_mode: false,
+            simulator_http_endpoint: None,
         }
     }
 
@@ -433,11 +441,9 @@ impl App {
     }
 
     pub fn log(&mut self, message: &str) {
-        self.logs.push_back(format!(
-            "[{}] {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            message
-        ));
+        let line = format!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), message);
+        self.log_view.on_append(&line);
+        self.logs.push_back(line);
         if self.logs.len() > 100 {
             self.logs.pop_front();
         }

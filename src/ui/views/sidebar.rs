@@ -30,8 +30,18 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
     let content_width = sections[1].width.saturating_sub(4) as usize;
     let session_width = sections[0].width.saturating_sub(4) as usize;
 
-    let has_target = app.selected_port_candidate().is_some();
-    let port_label = app.selected_port_short_label();
+    let simulated = app.simulator_mode;
+    let has_target = !simulated && app.selected_port_candidate().is_some();
+    let port_label = if simulated {
+        if session_width >= 18 {
+            "Local model, no RF"
+        } else {
+            "Model / no RF"
+        }
+        .to_string()
+    } else {
+        app.selected_port_short_label()
+    };
     let changes = [
         app.channels_dirty || !app.deleted_channels.is_empty(),
         app.settings_dirty,
@@ -43,7 +53,11 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
     .into_iter()
     .filter(|dirty| *dirty)
     .count();
-    let transport_summary = app.selected_port_status();
+    let transport_summary = if simulated {
+        "No hardware I/O".to_string()
+    } else {
+        app.selected_port_status()
+    };
     let dirty_label = if changes == 0 {
         "Clean".to_string()
     } else {
@@ -54,7 +68,7 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
     let overview = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
-                " RADIO ",
+                if simulated { " SIMULATOR " } else { " RADIO " },
                 Style::default()
                     .fg(COLOR_SIDEBAR)
                     .bg(COLOR_PRIMARY)
@@ -62,7 +76,13 @@ pub fn render_sidebar(f: &mut Frame, app: &App, area: Rect, active_tab: MainTab)
             ),
             Span::raw(" "),
             Span::styled(
-                if has_target { "target" } else { "none" },
+                if simulated {
+                    ""
+                } else if has_target {
+                    "target"
+                } else {
+                    "none"
+                },
                 Style::default()
                     .fg(if has_target { COLOR_PRIMARY } else { COLOR_DIM })
                     .add_modifier(Modifier::BOLD),
@@ -475,7 +495,9 @@ fn sidebar_badge(app: &App, tab: MainTab) -> String {
             badge
         }
         MainTab::Remote => {
-            if app.remote_active {
+            if app.simulator_mode {
+                "model".to_string()
+            } else if app.remote_active {
                 "open".to_string()
             } else {
                 "idle".to_string()
@@ -496,7 +518,14 @@ fn sidebar_badge(app: &App, tab: MainTab) -> String {
             }
         }
         MainTab::Debug => String::new(),
-        MainTab::Activity => if app.activity_active() { "live" } else { "" }.into(),
+        MainTab::Activity => if app.simulator_mode {
+            "synth"
+        } else if app.activity_active() {
+            "live"
+        } else {
+            ""
+        }
+        .into(),
     }
 }
 
@@ -644,6 +673,34 @@ fn sidebar_context_lines(app: &App, active_tab: MainTab, width: usize) -> Vec<Li
 mod tests {
     use super::{fit_session_status, fit_sidebar_row, fit_word_boundary, sidebar_badge};
     use crate::app::{App, MainTab};
+
+    #[test]
+    fn simulator_sidebar_never_labels_model_as_physical_target_or_live_activity() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::demo();
+        app.simulator_mode = true;
+        assert_eq!(sidebar_badge(&app, MainTab::Remote), "model");
+        assert_eq!(sidebar_badge(&app, MainTab::Activity), "synth");
+        for width in [20, 23, 28] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+            terminal
+                .draw(|frame| super::render_sidebar(frame, &app, frame.area(), MainTab::Remote))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = (0..5)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("SIMULATOR"), "{text}");
+            assert!(text.contains("no RF"), "{text}");
+            assert!(!text.contains("target"), "{text}");
+            assert!(!text.contains("none"), "{text}");
+        }
+    }
 
     #[test]
     fn sidebar_row_keeps_channel_count_visible() {

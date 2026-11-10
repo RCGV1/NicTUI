@@ -21,6 +21,7 @@ const NICFW_REMOTE_TEXT_MAX_BYTES: usize = 256;
 const NICFW_REMOTE_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(5000);
 // Nominal uninterrupted tap release in the programmer: two 200ms stages.
 const PROGRAMMER_TAP_HOLD: Duration = Duration::from_millis(400);
+const MAX_REMOTE_KEY_HOLD: Duration = Duration::from_secs(60);
 const BLE_REMOTE_SETTLE_DELAY: Duration = Duration::from_millis(350);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -148,9 +149,38 @@ pub struct RemoteControlCommand {
     pub strategy: RemoteControlStrategy,
     pub steps: Vec<RemoteWriteStep>,
     steady_state_key: Option<u8>,
+    input_edge: bool,
 }
 
 impl RemoteControlCommand {
+    /// Only use with an input source that reports release (mouse or key-up).
+    pub fn press_key(label: impl Into<String>, key_code: u8) -> Self {
+        let key_code = programmer_remote_key_code(key_code);
+        Self {
+            label: label.into(),
+            strategy: RemoteControlStrategy::RawKey,
+            steps: vec![RemoteWriteStep {
+                bytes: vec![key_code],
+                pause_after: Duration::ZERO,
+            }],
+            steady_state_key: Some(key_code),
+            input_edge: true,
+        }
+    }
+
+    pub fn release_key() -> Self {
+        Self {
+            label: "Key release".to_string(),
+            strategy: RemoteControlStrategy::RawKey,
+            steps: vec![RemoteWriteStep {
+                bytes: vec![NICFW_REMOTE_RELEASE],
+                pause_after: Duration::ZERO,
+            }],
+            steady_state_key: Some(NICFW_REMOTE_RELEASE),
+            input_edge: true,
+        }
+    }
+
     pub fn raw_key(label: impl Into<String>, key_code: u8) -> Self {
         let key_code = programmer_remote_key_code(key_code);
         Self {
@@ -167,6 +197,7 @@ impl RemoteControlCommand {
                 },
             ],
             steady_state_key: Some(NICFW_REMOTE_RELEASE),
+            input_edge: false,
         }
     }
 
@@ -205,6 +236,7 @@ impl RemoteControlCommand {
             strategy: RemoteControlStrategy::Sequence,
             steps,
             steady_state_key: None,
+            input_edge: false,
         }
     }
 
@@ -242,6 +274,7 @@ impl RemoteControlCommand {
             strategy: RemoteControlStrategy::Sequence,
             steps,
             steady_state_key: Some(NICFW_REMOTE_RELEASE),
+            input_edge: false,
         }
     }
 
@@ -251,6 +284,7 @@ impl RemoteControlCommand {
             strategy: RemoteControlStrategy::Sequence,
             steps: vec![RemoteWriteStep { bytes, pause_after }],
             steady_state_key: None,
+            input_edge: false,
         }
     }
 
@@ -389,6 +423,7 @@ struct RemoteSessionCleanup {
     stop_required: bool,
     enable_required: bool,
     decoder_boundary_trusted: bool,
+    key_release_required: bool,
 }
 
 impl std::ops::Deref for RemoteSessionCleanup {
@@ -441,6 +476,13 @@ impl RemoteSessionCleanup {
     }
 
     fn close(&mut self) -> Result<()> {
+        let release_result = if std::mem::take(&mut self.key_release_required) {
+            self.protocol
+                .send_bytes(&[NICFW_REMOTE_RELEASE])
+                .context("Failed to release held remote key during cleanup")
+        } else {
+            Ok(())
+        };
         // Attempt both operations even if stopping remote mode fails. Clear the
         // flags first so unwinding or Drop cannot send duplicate cleanup commands.
         let stop_result = if std::mem::take(&mut self.stop_required) {
@@ -467,11 +509,17 @@ impl RemoteSessionCleanup {
         } else {
             Ok(())
         };
-        match (stop_result, enable_result) {
+        let cleanup_result = match (stop_result, enable_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Err(error), Err(enable_error)) => {
                 Err(error.context(format!("Radio re-enable also failed: {enable_error}")))
+            }
+        };
+        match (release_result, cleanup_result) {
+            (Ok(()), result) | (result, Ok(())) => result,
+            (Err(error), Err(cleanup_error)) => {
+                Err(error.context(format!("Remote cleanup also failed: {cleanup_error:#}")))
             }
         }
     }
@@ -543,7 +591,7 @@ where
                         "{} Retrying...",
                         failure.summary
                     )));
-                    thread::sleep(Duration::from_millis(300));
+                    wait_for_recovery_backoff(|| should_stop(Duration::ZERO));
                     continue;
                 }
                 return Err(failure);
@@ -554,6 +602,7 @@ where
             stop_required: false,
             enable_required: false,
             decoder_boundary_trusted: true,
+            key_release_required: false,
         };
 
         let log_rx = if options.include_raw_logs {
@@ -600,6 +649,7 @@ where
                         &mut summary,
                         &mut recoveries_left,
                         &failure.summary,
+                        || should_stop(Duration::ZERO),
                     )
                 {
                     continue;
@@ -644,6 +694,7 @@ where
                         &mut summary,
                         &mut recoveries_left,
                         &failure.summary,
+                        || should_stop(Duration::ZERO),
                     )
                 {
                     continue;
@@ -696,6 +747,7 @@ where
                     &mut summary,
                     &mut recoveries_left,
                     &failure.summary,
+                    || should_stop(Duration::ZERO),
                 )
             {
                 continue;
@@ -707,6 +759,7 @@ where
         drain_logs_with_filter(&log_rx, &mut on_event, options.suppress_idle_zero_logs);
         let armed_at = Instant::now();
         let mut current_key = NICFW_REMOTE_RELEASE;
+        let mut held_until = None;
         let mut next_heartbeat_at = NICFW_REMOTE_HEARTBEAT_INTERVAL;
         let mut packet_cache = HashMap::<String, String>::new();
 
@@ -725,6 +778,7 @@ where
                             format!("{error:#}"),
                         )
                     })?;
+                    proto.key_release_required = false;
                     proto.close().map_err(|error| {
                         RemoteSessionFailure::new(
                             RemoteSessionFailureKind::StreamLost,
@@ -738,10 +792,30 @@ where
                     return Ok(());
                 }
 
+                if release_expired_remote_key(
+                    &mut current_key,
+                    &mut held_until,
+                    armed_elapsed,
+                    |bytes| proto.send_bytes(bytes),
+                )? {
+                    on_event(RemoteCaptureEvent::Status(
+                        "Remote key released at the 60s safety limit; release input before pressing again"
+                            .to_string(),
+                    ));
+                }
+                proto.key_release_required = current_key != NICFW_REMOTE_RELEASE;
+
                 while !should_stop(armed_at.elapsed())
                     && let Some(command) = next_command(armed_elapsed)
                 {
-                    emit_phase(&mut on_event, &mut last_phase, RemoteSessionPhase::Probing);
+                    if !command.input_edge {
+                        emit_phase(&mut on_event, &mut last_phase, RemoteSessionPhase::Probing);
+                    }
+                    // Track potential writes before execution so unwinding also releases.
+                    proto.key_release_required |= command.steps.iter().any(|step| {
+                        heartbeat_key_after_step(&command, step)
+                            .is_some_and(|key| key != NICFW_REMOTE_RELEASE)
+                    });
                     let mut report = execute_remote_command(
                         &mut proto,
                         &command,
@@ -750,6 +824,26 @@ where
                         &mut next_heartbeat_at,
                         || should_stop(armed_at.elapsed()),
                     );
+                    proto.key_release_required = current_key != NICFW_REMOTE_RELEASE;
+                    if command.input_edge {
+                        held_until = if report.success && current_key != NICFW_REMOTE_RELEASE {
+                            Some(armed_at.elapsed() + MAX_REMOTE_KEY_HOLD)
+                        } else {
+                            None
+                        };
+                        let success = report.success;
+                        let failure_detail = report.detail.clone();
+                        // Never block a queued release behind a reaction observation window.
+                        on_event(RemoteCaptureEvent::Control(report));
+                        if !success && !should_stop(armed_at.elapsed()) {
+                            return Err(RemoteSessionFailure::new(
+                                RemoteSessionFailureKind::StreamLost,
+                                "Remote input transport failed.",
+                                failure_detail,
+                            ));
+                        }
+                        continue;
+                    }
                     if should_stop(armed_at.elapsed()) {
                         on_event(RemoteCaptureEvent::Control(report));
                         continue 'stream;
@@ -862,6 +956,7 @@ where
                         .detail
                         .push_str(&format!("; remote key release failed: {error:#}"));
                 }
+                proto.key_release_required = current_key != NICFW_REMOTE_RELEASE;
                 if let Err(error) = proto.close() {
                     failure
                         .detail
@@ -881,6 +976,7 @@ where
                     &mut summary,
                     &mut recoveries_left,
                     &failure.summary,
+                    || should_stop(armed_at.elapsed()),
                 ) {
                     continue;
                 }
@@ -915,13 +1011,38 @@ where
 }
 
 fn release_remote_key(proto: &mut RadioProtocol, current_key: &mut u8) -> Result<()> {
+    release_remote_key_with_writer(current_key, |bytes| proto.send_bytes(bytes))
+}
+
+fn release_remote_key_with_writer(
+    current_key: &mut u8,
+    mut send: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
     if *current_key != NICFW_REMOTE_RELEASE {
+        send(&[NICFW_REMOTE_RELEASE]).context("Failed to release held remote key before stop")?;
         *current_key = NICFW_REMOTE_RELEASE;
-        proto
-            .send_bytes(&[NICFW_REMOTE_RELEASE])
-            .context("Failed to release held remote key before stop")?;
     }
     Ok(())
+}
+
+fn release_expired_remote_key(
+    current_key: &mut u8,
+    held_until: &mut Option<Duration>,
+    elapsed: Duration,
+    send: impl FnMut(&[u8]) -> Result<()>,
+) -> RemoteSessionResult<bool> {
+    if held_until.is_some_and(|deadline| elapsed >= deadline) {
+        release_remote_key_with_writer(current_key, send).map_err(|error| {
+            RemoteSessionFailure::new(
+                RemoteSessionFailureKind::StreamLost,
+                "Remote hold safety release failed.",
+                format!("{error:#}"),
+            )
+        })?;
+        *held_until = None;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn check_remote_cancellation() -> RemoteSessionResult<()> {
@@ -1195,11 +1316,22 @@ fn service_remote_heartbeat(
     next_heartbeat_at: &mut Duration,
     session_elapsed: Duration,
 ) -> Result<()> {
+    service_remote_heartbeat_with_writer(current_key, next_heartbeat_at, session_elapsed, |bytes| {
+        proto.send_bytes(bytes)
+    })
+}
+
+fn service_remote_heartbeat_with_writer(
+    current_key: u8,
+    next_heartbeat_at: &mut Duration,
+    session_elapsed: Duration,
+    mut send: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
     while session_elapsed >= *next_heartbeat_at {
         if crate::cancellation::is_requested() {
             return Ok(());
         }
-        proto.send_bytes(&[current_key])?;
+        send(&[current_key])?;
         *next_heartbeat_at += NICFW_REMOTE_HEARTBEAT_INTERVAL;
     }
     Ok(())
@@ -1377,6 +1509,12 @@ fn execute_remote_command(
                 detail: "cancelled before command write".to_string(),
             };
         }
+        // A failed write may still have reached the peer; retain release ownership.
+        if let Some(key) = heartbeat_key_after_step(command, step)
+            && key != NICFW_REMOTE_RELEASE
+        {
+            *current_key = key;
+        }
         if !step.bytes.is_empty()
             && let Err(error) = proto.send_bytes(&step.bytes)
         {
@@ -1462,12 +1600,25 @@ fn emit_phase<F>(
     }
 }
 
+fn wait_for_recovery_backoff(mut should_stop: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_millis(300);
+    // Callbacks may do work; do not start another after the wait expires.
+    while Instant::now() < deadline {
+        if crate::cancellation::is_requested() || should_stop() {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
 fn should_recover<F>(
     on_event: &mut F,
     last_phase: &mut Option<RemoteSessionPhase>,
     summary: &mut RemoteCaptureSummary,
     recoveries_left: &mut usize,
     message: &str,
+    should_stop: impl FnMut() -> bool,
 ) -> bool
 where
     F: FnMut(RemoteCaptureEvent),
@@ -1482,7 +1633,7 @@ where
     on_event(RemoteCaptureEvent::Status(format!(
         "{message}. Retrying..."
     )));
-    thread::sleep(Duration::from_millis(300));
+    wait_for_recovery_backoff(should_stop);
     true
 }
 
@@ -1575,6 +1726,13 @@ fn record_remote_packet(
     packet: &RemotePacket,
     suppress_repeated_idle: bool,
 ) -> (bool, Option<String>) {
+    // A repaint can erase a voltage label without changing its next text packet.
+    // Do not suppress the identical redraw after pixels may have been replaced.
+    if matches!(packet, RemotePacket::DrawRectangle { y, height, .. }
+        if *height != 0 && u16::from(*y) + u16::from(*height) > 60)
+    {
+        packet_cache.remove("battery_text");
+    }
     let family_key = packet.family_key();
     let current_detail = packet.detail_key();
     let previous = packet_cache.insert(family_key.clone(), current_detail.clone());
@@ -1643,10 +1801,99 @@ pub fn classify_remote_evidence(
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "remote_hold_tests.rs"]
+mod hold_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::RemotePacket;
+
+    #[test]
+    fn stop_during_open_failure_backoff_does_not_wait_or_reopen() {
+        let recovering_at = std::cell::Cell::new(None::<Instant>);
+        let openings = std::cell::Cell::new(0);
+        // Port zero fails simulator validation before any socket/device I/O.
+        let summary = run_remote_session(
+            "sim://127.0.0.1:0",
+            &RemoteSessionOptions {
+                recover_retries: 3,
+                ..Default::default()
+            },
+            |_| {
+                recovering_at
+                    .get()
+                    .is_some_and(|at| at.elapsed() >= Duration::from_millis(20))
+            },
+            |_| panic!("a failed open must not request a radio command"),
+            |event| match event {
+                RemoteCaptureEvent::Phase(RemoteSessionPhase::Opening) => {
+                    openings.set(openings.get() + 1)
+                }
+                RemoteCaptureEvent::Phase(RemoteSessionPhase::Recovering) => {
+                    recovering_at.set(Some(Instant::now()))
+                }
+                _ => {}
+            },
+        )
+        .unwrap();
+        assert!(
+            recovering_at.get().unwrap().elapsed() < Duration::from_millis(150),
+            "stop was held behind the recovery backoff"
+        );
+        assert_eq!(openings.get(), 1, "stop must not open another transport");
+        assert_eq!(summary.recovery_count, 1);
+    }
+
+    #[test]
+    fn shared_recovery_backoff_observes_stop_and_preserves_retry_accounting() {
+        let mut phases = Vec::new();
+        let mut last_phase = Some(RemoteSessionPhase::Live);
+        let mut summary = RemoteCaptureSummary::default();
+        let mut retries = 3;
+        let mut stop_checks = 0;
+        let started = Instant::now();
+        assert!(should_recover(
+            &mut |event| if let RemoteCaptureEvent::Phase(phase) = event {
+                phases.push(phase);
+            },
+            &mut last_phase,
+            &mut summary,
+            &mut retries,
+            "Owned simulated stream failed",
+            || {
+                stop_checks += 1;
+                stop_checks == 2
+            },
+        ));
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(stop_checks, 2);
+        assert_eq!(retries, 2);
+        assert_eq!(summary.recovery_count, 1);
+        assert_eq!(phases, [RemoteSessionPhase::Recovering]);
+    }
+
+    #[test]
+    fn recovery_backoff_keeps_the_existing_delay_without_stop() {
+        let started = Instant::now();
+        wait_for_recovery_backoff(|| false);
+        assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[test]
+    fn recovery_backoff_checks_deadline_before_pumping_another_callback() {
+        let mut calls = 0;
+        wait_for_recovery_backoff(|| {
+            calls += 1;
+            thread::sleep(Duration::from_millis(310));
+            false
+        });
+        assert_eq!(
+            calls, 1,
+            "callback exhausted the backoff budget; do not pump it again"
+        );
+    }
 
     #[test]
     fn raw_key_command_includes_release() {
@@ -2095,7 +2342,7 @@ mod tests {
         };
 
         assert!(status.is_idle_telemetry());
-        assert_eq!(status.family_key(), "status:70");
+        assert_eq!(status.family_key(), "led_status");
         assert!(battery.is_idle_telemetry());
         assert_eq!(battery.family_key(), "battery_text");
     }
@@ -2155,6 +2402,50 @@ mod tests {
             delta_second.as_deref(),
             Some("noise_level: NOISE:20:0 -> NOISE:21:0")
         );
+    }
+
+    #[test]
+    fn idle_status_after_transmit_is_a_transition_not_a_repeated_heartbeat() {
+        let mut cache = HashMap::new();
+        let status = |id| RemotePacket::SmallStatus {
+            id,
+            value1: 0,
+            value2: 0,
+        };
+        assert!(record_remote_packet(&mut cache, &status(0x70), true).0);
+        assert!(!record_remote_packet(&mut cache, &status(0x70), true).0);
+        for active in [0x71, 0x72, 0x74, 0x78, 0x7f] {
+            assert!(record_remote_packet(&mut cache, &status(active), true).0);
+            let (emit, delta) = record_remote_packet(&mut cache, &status(0x70), true);
+            assert!(emit, "idle after {active:02x} must clear the LED state");
+            assert!(delta.unwrap().contains("-> STS:70:00:00"));
+            assert!(!record_remote_packet(&mut cache, &status(0x70), true).0);
+        }
+    }
+
+    #[test]
+    fn idle_voltage_redraw_is_not_dropped_after_screen_repaint() {
+        let mut cache = HashMap::new();
+        let battery = RemotePacket::DisplayText {
+            font_size: 0,
+            x: 103,
+            y: 70,
+            fg_color: 0xffff,
+            bg_color: 0,
+            text: "8.2V".into(),
+        };
+        assert!(record_remote_packet(&mut cache, &battery, true).0);
+        assert!(!record_remote_packet(&mut cache, &battery, true).0);
+        let clear = RemotePacket::DrawRectangle {
+            x: 0,
+            y: 0,
+            width: 128,
+            height: 128,
+            color: 0,
+        };
+        record_remote_packet(&mut cache, &clear, true);
+        assert!(record_remote_packet(&mut cache, &battery, true).0);
+        assert!(!record_remote_packet(&mut cache, &battery, true).0);
     }
 
     #[test]
@@ -2265,6 +2556,7 @@ mod session_tests {
                 stop_required: true,
                 enable_required: false,
                 decoder_boundary_trusted: true,
+                key_release_required: false,
             };
             let result = nicfw_remote_on(&mut proto, staged_sync, || false);
             proto.close().unwrap();
@@ -2426,6 +2718,7 @@ mod session_tests {
             stop_required: true,
             enable_required: false,
             decoder_boundary_trusted: true,
+            key_release_required: false,
         };
         nicfw_remote_on(&mut proto, false, || false).unwrap();
         proto.close().unwrap();
@@ -2766,7 +3059,8 @@ mod session_tests {
         let report = report.expect("virtual radio should observe the command");
         assert!(report.success);
         assert_eq!(report.evidence, RemoteEvidenceKind::NoControlEvidence);
-        assert_eq!(report.reaction.unwrap().deltas, 3);
+        // Signal, noise, packed LED state and voltage all changed autonomously.
+        assert_eq!(report.reaction.unwrap().deltas, 4);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::ui::theme::{
     COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_PRIMARY, COLOR_SELECTION_BG, COLOR_SELECTION_FG,
     COLOR_SURFACE_1, COLOR_SURFACE_2, COLOR_TEXT, COLOR_WARNING,
 };
-use crate::ui::views::ready_state::{ReadyStateAction, ReadyStateContent, render_ready_state};
+use crate::ui::views::ready_state::{ReadyStateContent, render_ready_state};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -24,13 +24,11 @@ pub fn render_dtmf(f: &mut Frame, app: &mut App, area: Rect) {
                 outer_title: "DTMF Presets",
                 card_title: "Ready To Load",
                 heading: "No DTMF Loaded",
-                description: "Read the radio to load the current DTMF preset bank.".to_string(),
+                description: "r: read DTMF presets | Shift+R: read all sections | 8: import .nfw"
+                    .into(),
                 note: None,
             },
-            &[ReadyStateAction {
-                key: "r",
-                label: "read radio",
-            }],
+            &[],
         );
         return;
     }
@@ -111,7 +109,7 @@ pub fn render_dtmf(f: &mut Frame, app: &mut App, area: Rect) {
     });
 
     let title = if app.dtmf_dirty {
-        " DTMF PRESETS (UNSAVED) "
+        " DTMF PRESETS (UNSAVED local; w writes) "
     } else {
         " DTMF PRESETS "
     };

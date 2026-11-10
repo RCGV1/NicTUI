@@ -565,6 +565,14 @@ pub fn write_codeplug<F>(
 where
     F: FnMut(ProgressEvent),
 {
+    ensure_programming_mutation_supported(port_name)?;
+    if codeplug_data.get(EEPROM_SIZE - 32..EEPROM_SIZE - 16)
+        == Some(b"NICFWSIM-MODEL\0\0".as_slice())
+    {
+        bail!(
+            "This is a synthetic simulator snapshot, not a radio backup. It cannot be restored to a physical radio."
+        );
+    }
     validate_codeplug_payload(codeplug_data)?;
 
     report(ProgressEvent::Status(format!(
@@ -620,6 +628,55 @@ pub(crate) fn validate_codeplug_payload(data: &[u8]) -> Result<()> {
         bail!("Codeplug has no supported NicSure band-plan version marker");
     }
     Ok(())
+}
+
+/// Read one slot without loading the channel bank when the initial RX/TX
+/// evidence is conclusive. Empty slots do not require byte-order detection.
+pub fn read_channel<F>(port_name: &str, channel_num: u16, mut report: F) -> Result<Option<Channel>>
+where
+    F: FnMut(ProgressEvent),
+{
+    if !(1..=CHANNEL_RECORD_COUNT as u16).contains(&channel_num) {
+        bail!("Channel number must be between 1 and {CHANNEL_RECORD_COUNT}");
+    }
+    report(ProgressEvent::Status(format!(
+        "Opening {port_name} and reading channel {channel_num}"
+    )));
+    with_read_session(port_name, normal_read_timing(port_name), |session| {
+        let target_block = usize::from(channel_num) + CHANNEL_START_BLOCK - 1;
+        let target = session.read_blocks(target_block, 1, &mut |_| {})?;
+        let mut samples = vec![target.clone()];
+        let (_, empty) = RadioProtocol::channel_endianness_from_samples(&samples)?;
+        if empty {
+            report(ProgressEvent::Progress(1.0));
+            return Ok(None);
+        }
+
+        // Share the protocol detector's eight-slot evidence window, reusing the
+        // target and checking it too when it lies outside that window.
+        for block in CHANNEL_START_BLOCK..CHANNEL_START_BLOCK + 8 {
+            if block != target_block {
+                samples.push(session.read_blocks(block, 1, &mut |_| {})?);
+            }
+        }
+        let (mut endian, _) = RadioProtocol::channel_endianness_from_samples(&samples)?;
+        if endian.is_none() {
+            report(ProgressEvent::Status(
+                "Checking later RX/TX evidence for channel byte order".into(),
+            ));
+            for block in [0, 1].into_iter().chain(10..200) {
+                if block != target_block {
+                    samples.push(session.read_blocks(block, 1, &mut |_| {})?);
+                }
+            }
+            (endian, _) = RadioProtocol::channel_endianness_from_samples(&samples)?;
+        }
+        let endian =
+            endian.context("Channel byte order is ambiguous: no consistent RX/TX evidence")?;
+        let channel = RadioProtocol::parse_channel(&target, channel_num, endian);
+        report(ProgressEvent::Progress(1.0));
+        Ok(channel)
+    })
 }
 
 pub fn read_channels<F>(port_name: &str, mut report: F) -> Result<(Vec<Channel>, Endianness)>
@@ -695,6 +752,7 @@ pub fn write_channels<F>(
 where
     F: FnMut(ProgressEvent),
 {
+    ensure_programming_mutation_supported(port_name)?;
     validate_channels(channels)?;
     let mut seen: HashSet<u16> = channels.iter().map(|channel| channel.channel_num).collect();
     for &channel in deleted_channels {
@@ -813,6 +871,7 @@ pub fn write_settings<F>(
 where
     F: FnMut(ProgressEvent),
 {
+    ensure_programming_mutation_supported(port_name)?;
     report(ProgressEvent::Status(format!(
         "Opening {} and writing settings",
         port_name
@@ -925,6 +984,7 @@ pub fn write_scan_presets<F>(
 where
     F: FnMut(ProgressEvent),
 {
+    ensure_programming_mutation_supported(port_name)?;
     validate_scan_presets(presets)?;
 
     report(ProgressEvent::Status(format!(
@@ -969,6 +1029,7 @@ pub fn update_scan_preset<F>(port_name: &str, preset: &ScanPreset, mut report: F
 where
     F: FnMut(ProgressEvent),
 {
+    ensure_programming_mutation_supported(port_name)?;
     validate_scan_presets(std::slice::from_ref(preset))?;
 
     report(ProgressEvent::Status(format!(
@@ -1050,6 +1111,7 @@ pub fn write_band_plans<F>(
 where
     F: FnMut(ProgressEvent),
 {
+    ensure_programming_mutation_supported(port_name)?;
     validate_band_plans_payload(band_plans)?;
 
     report(ProgressEvent::Status(format!(
@@ -1154,6 +1216,7 @@ pub fn write_group_labels<F>(port_name: &str, labels: &[String], mut report: F) 
 where
     F: FnMut(ProgressEvent),
 {
+    ensure_programming_mutation_supported(port_name)?;
     validate_group_labels_payload(labels)?;
     report(ProgressEvent::Status(format!(
         "Opening {} and saving group names",
@@ -1187,6 +1250,7 @@ pub fn write_dtmf_presets<F>(port_name: &str, presets: &[DTMFPreset], mut report
 where
     F: FnMut(ProgressEvent),
 {
+    ensure_programming_mutation_supported(port_name)?;
     validate_dtmf_presets_payload(presets)?;
 
     report(ProgressEvent::Status(format!(
@@ -1213,6 +1277,7 @@ pub fn update_dtmf_preset<F>(port_name: &str, preset: &DTMFPreset, mut report: F
 where
     F: FnMut(ProgressEvent),
 {
+    ensure_programming_mutation_supported(port_name)?;
     validate_dtmf_presets_payload(std::slice::from_ref(preset))?;
 
     report(ProgressEvent::Status(format!(
@@ -1238,6 +1303,7 @@ pub fn flash_firmware<F>(port_name: &str, firmware_data: &[u8], mut report: F) -
 where
     F: FnMut(ProgressEvent),
 {
+    ensure_programming_mutation_supported(port_name)?;
     if crate::ble::parse_ble_device_uri(port_name).is_some() {
         bail!("Firmware flashing requires a USB serial connection");
     }
@@ -1727,6 +1793,15 @@ fn summarize_region(
         first_non_ff_offset,
         preview_hex,
     }
+}
+
+fn ensure_programming_mutation_supported(port_name: &str) -> Result<()> {
+    if port_name.starts_with(crate::simulator_link::PREFIX) {
+        bail!(
+            "Unsupported simulator operation: EEPROM is read-only; programming writes, reboot, and firmware flashing are unavailable (reboot is not acknowledged)"
+        );
+    }
+    Ok(())
 }
 
 fn open_protocol(port_name: &str) -> Result<RadioProtocol> {
@@ -2250,12 +2325,27 @@ mod tests {
     use super::{
         CodeplugRegionKind, FirmwareVariant, PortCandidate, PortKind, build_codeplug_regions,
         classify_firmware_variant_from_settings, dedupe_port_candidates, known_codeplug_regions,
-        port_sort_key, resolve_port_from_candidates,
+        port_sort_key, resolve_port_from_candidates, write_codeplug,
     };
     use crate::protocol::EEPROM_SIZE;
     use crate::protocol::radio::SETTINGS_MAGIC;
     use std::time::Duration;
 
+    #[test]
+    fn simulated_snapshot_restore_is_rejected_before_any_port_or_progress() {
+        let mut snapshot = vec![0xff; EEPROM_SIZE];
+        snapshot[EEPROM_SIZE - 32..EEPROM_SIZE - 16].copy_from_slice(b"NICFWSIM-MODEL\0\0");
+        let mut reported = false;
+        let error = write_codeplug(
+            "/dev/nictui-synthetic-snapshot-must-not-open",
+            &snapshot,
+            false,
+            |_| reported = true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("synthetic simulator snapshot"));
+        assert!(!reported);
+    }
     #[test]
     fn normal_reads_select_responsive_serial_but_keep_ble_conservative() {
         use crate::protocol::radio::ReadTiming;

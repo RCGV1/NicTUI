@@ -3,9 +3,9 @@ use crate::protocol::{GROUP_LABEL_COUNT, group_display};
 use crate::ui::render_shortcut;
 use crate::ui::theme::{
     COLOR_ACCENT, COLOR_BORDER, COLOR_DIM, COLOR_PRIMARY, COLOR_SELECTION_BG, COLOR_SELECTION_FG,
-    COLOR_SURFACE_1, COLOR_SURFACE_2, COLOR_TEXT,
+    COLOR_SURFACE_1, COLOR_SURFACE_2, COLOR_TEXT, COLOR_WARNING,
 };
-use crate::ui::views::ready_state::{ReadyStateAction, ReadyStateContent, render_ready_state};
+use crate::ui::views::ready_state::{ReadyStateContent, render_ready_state};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -17,7 +17,7 @@ use ratatui::{
 
 pub fn render_memory_groups_page(f: &mut Frame, app: &mut App, area: Rect) {
     let summary_height = if area.width < 90 { 3 } else { 2 };
-    let detail_height = if area.width < 90 { 6 } else { 5 };
+    let detail_height = 6;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -36,7 +36,7 @@ pub fn render_memory_groups_page(f: &mut Frame, app: &mut App, area: Rect) {
         .count();
 
     let summary_text = if area.width < 90 {
-        format!("{populated_groups} used | {named_groups} named | Enter rename")
+        format!("{populated_groups} used | {named_groups} named | Enter rename | 3 presets")
     } else {
         format!(
             "{} populated groups | {} named groups | Enter renames selected group",
@@ -75,24 +75,27 @@ fn render_group_list(
     group_counts: &[u16; GROUP_LABEL_COUNT],
     compact: bool,
 ) {
-    let border_style = Style::default().fg(COLOR_PRIMARY);
+    let border_style = Style::default().fg(if app.group_labels_dirty {
+        COLOR_WARNING
+    } else {
+        COLOR_PRIMARY
+    });
 
-    if app.channels.is_empty() {
+    if app.channels.is_empty() && app.group_labels.iter().all(|label| label.trim().is_empty()) {
         render_ready_state(
             f,
             area,
             ReadyStateContent {
-                outer_title: "Memory Groups (A-P)",
+                outer_title: &format!(
+                    "Memory Groups (A-{})",
+                    (b'A' + GROUP_LABEL_COUNT as u8 - 1) as char
+                ),
                 card_title: "Ready To Load",
                 heading: "No Channels Loaded",
-                description: "Read the radio to load channels and group names into the workspace."
-                    .to_string(),
+                description: "r: read labels | Shift+R: read all sections".into(),
                 note: None,
             },
-            &[ReadyStateAction {
-                key: "r",
-                label: "read radio",
-            }],
+            &[],
         );
         return;
     }
@@ -145,7 +148,15 @@ fn render_group_list(
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" MEMORY GROUPS (A-P) ")
+            .title(format!(
+                " MEMORY GROUPS (A-{}){} ",
+                (b'A' + GROUP_LABEL_COUNT as u8 - 1) as char,
+                if app.group_labels_dirty {
+                    " (Unsaved local; w writes)"
+                } else {
+                    ""
+                }
+            ))
             .border_style(border_style)
             .bg(COLOR_SURFACE_1),
     )
@@ -171,7 +182,7 @@ fn selected_group_lines(
         .unwrap_or(0)
         .min(GROUP_LABEL_COUNT - 1);
     let group_num = (selected + 1) as u8;
-    let preview = channels_for_group(app, group_num, 8);
+    let preview = channels_for_group(app, group_num, if compact { 2 } else { 4 });
 
     vec![
         Line::from(vec![
@@ -184,7 +195,9 @@ fn selected_group_lines(
             ),
             Span::raw(format!(" {} channels", group_counts[selected])),
         ]),
-        Line::from(if preview.is_empty() {
+        Line::from(if app.channels.is_empty() {
+            "Channels not loaded; Shift+R reads all".to_string()
+        } else if preview.is_empty() {
             "No channels assigned".to_string()
         } else if compact {
             format!("CH {}", preview.join(", "))
@@ -208,25 +221,41 @@ fn selected_group_lines(
                 "Stored label: <unnamed>".to_string()
             },
         ),
-        Line::from(vec![
-            render_shortcut("Enter"),
-            Span::raw(": Rename | "),
-            render_shortcut("w"),
-            Span::raw(": Write labels | "),
-            render_shortcut("r"),
-            Span::raw(": Refresh | "),
-            render_shortcut("3"),
-            Span::raw(": Scan presets"),
-        ]),
+        Line::from(if compact {
+            vec![
+                render_shortcut("Enter"),
+                Span::raw(": Rename | "),
+                render_shortcut("w"),
+                Span::raw(": Write labels | "),
+                render_shortcut("r"),
+                Span::raw(": Read labels"),
+            ]
+        } else {
+            vec![
+                render_shortcut("Enter"),
+                Span::raw(": Rename | "),
+                render_shortcut("w"),
+                Span::raw(": Write labels | "),
+                render_shortcut("r"),
+                Span::raw(": Read labels | "),
+                render_shortcut("3"),
+                Span::raw(": Scan presets"),
+            ]
+        }),
     ]
 }
 
 fn compute_group_counts(app: &App) -> [u16; GROUP_LABEL_COUNT] {
     let mut counts = [0u16; GROUP_LABEL_COUNT];
     for channel in &app.channels {
+        if app.deleted_channels.contains(&channel.channel_num) {
+            continue;
+        }
+        let mut counted = [false; GROUP_LABEL_COUNT];
         for &group in &channel.groups {
-            if (1..=GROUP_LABEL_COUNT as u8).contains(&group) {
+            if (1..=GROUP_LABEL_COUNT as u8).contains(&group) && !counted[(group - 1) as usize] {
                 counts[(group - 1) as usize] += 1;
+                counted[(group - 1) as usize] = true;
             }
         }
     }
@@ -236,7 +265,9 @@ fn compute_group_counts(app: &App) -> [u16; GROUP_LABEL_COUNT] {
 fn channels_for_group(app: &App, group: u8, limit: usize) -> Vec<String> {
     app.channels
         .iter()
-        .filter(|channel| channel.groups.contains(&group))
+        .filter(|channel| {
+            !app.deleted_channels.contains(&channel.channel_num) && channel.groups.contains(&group)
+        })
         .take(limit)
         .map(|channel| {
             if channel.name.trim().is_empty() {

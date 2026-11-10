@@ -17,11 +17,13 @@ use ratatui::{
 pub fn render_codeplug_view(f: &mut Frame, app: &mut App, area: Rect) {
     let snapshot_reason = snapshot_block_reason(app);
     let write_reason = write_block_reason(app, snapshot_reason);
+    let compact = area.width < 90;
+    let shared_reason = compact && snapshot_reason.is_some() && snapshot_reason == write_reason;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
-            Constraint::Length(6),
+            Constraint::Length(if shared_reason { 5 } else { 6 }),
             Constraint::Min(0),
             Constraint::Length(3),
         ])
@@ -47,7 +49,7 @@ pub fn render_codeplug_view(f: &mut Frame, app: &mut App, area: Rect) {
     );
     f.render_widget(summary, chunks[0]);
 
-    let hero = Paragraph::new(vec![
+    let mut readiness = vec![
         Line::from(vec![
             workspace_chip(
                 "EXPORT",
@@ -91,15 +93,23 @@ pub fn render_codeplug_view(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Style::default().fg(COLOR_TEXT),
         )),
-    ])
-    .style(Style::default().bg(COLOR_SURFACE_1))
-    .wrap(Wrap { trim: true })
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(COLOR_BORDER))
-            .bg(COLOR_SURFACE_1),
-    );
+    ];
+    if shared_reason {
+        readiness.truncate(1);
+        readiness.push(Line::from(format!(
+            "Export / Write: {}",
+            snapshot_reason.unwrap()
+        )));
+    }
+    let hero = Paragraph::new(readiness)
+        .style(Style::default().bg(COLOR_SURFACE_1))
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(COLOR_BORDER))
+                .bg(COLOR_SURFACE_1),
+        );
     f.render_widget(hero, chunks[1]);
 
     let body = if chunks[2].width < 100 {
@@ -129,7 +139,7 @@ pub fn render_codeplug_view(f: &mut Frame, app: &mut App, area: Rect) {
             )
         })
         .unwrap_or_else(|| "No snapshot bytes".to_string());
-    let source_lines = vec![
+    let mut source_lines = vec![
         detail_row(
             "State",
             if full_snapshot {
@@ -148,11 +158,23 @@ pub fn render_codeplug_view(f: &mut Frame, app: &mut App, area: Rect) {
             "Path",
             app.codeplug_path.as_ref().map_or_else(
                 || "No file path".to_string(),
-                |path| path.to_string_lossy().into_owned(),
+                |path| {
+                    if compact {
+                        path.file_name()
+                            .unwrap_or(path.as_os_str())
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        path.to_string_lossy().into_owned()
+                    }
+                },
             ),
             COLOR_TEXT,
         ),
     ];
+    if compact {
+        source_lines.rotate_right(1);
+    }
     let source = Paragraph::new(source_lines)
         .style(Style::default().bg(COLOR_SURFACE_1))
         .wrap(Wrap { trim: true })
@@ -238,7 +260,11 @@ pub fn render_codeplug_view(f: &mut Frame, app: &mut App, area: Rect) {
         Span::raw(" import .nfw"),
     ];
     if snapshot_reason.is_none() {
-        hints.extend([Span::raw(" | "), render_shortcut("e"), Span::raw(" export")]);
+        hints.extend([
+            Span::raw(" | "),
+            render_shortcut("e"),
+            Span::raw(" save .nfw"),
+        ]);
     }
     if write_reason.is_none() {
         hints.extend([Span::raw(" | "), render_shortcut("w"), Span::raw(" write")]);
@@ -268,24 +294,36 @@ fn snapshot_block_reason(app: &App) -> Option<&'static str> {
         return Some("snapshot baseline missing; reload a full snapshot.");
     }
     if !app.codeplug_snapshot_is_current() {
-        return Some("workspace changed; reload a full snapshot.");
+        return Some("workspace changed; write sections, then read full.");
     }
     None
+}
+
+pub(crate) fn codeplug_write_block_reason(app: &App) -> Option<&'static str> {
+    write_block_reason(app, snapshot_block_reason(app))
 }
 
 pub(super) fn write_block_reason(
     app: &App,
     snapshot_reason: Option<&'static str>,
 ) -> Option<&'static str> {
+    if app.simulator_mode {
+        return Some("simulator: writes unsupported; local files only.");
+    }
+    if app.activity_active() {
+        return Some("stop Activity; wait for cleanup.");
+    }
     snapshot_reason.or_else(|| {
         if app.demo_mode {
             Some("demo mode; hardware writes disabled.")
         } else if app.remote_active || app.remote_tx.is_some() {
-            Some("stop Remote and wait for shutdown.")
-        } else if matches!(
-            app.mode,
-            AppMode::Reading | AppMode::Writing | AppMode::BinFlashing
-        ) {
+            Some("stop Remote and wait for cleanup.")
+        } else if app.read_all_request.is_some()
+            || matches!(
+                app.mode,
+                AppMode::Reading | AppMode::Writing | AppMode::BinFlashing
+            )
+        {
             Some("wait for the current radio operation.")
         } else if app.protocol_port_name.is_none() && app.selected_ble_device_id().is_none() {
             Some("select a radio target first.")
@@ -339,9 +377,33 @@ mod tests {
         app
     }
 
-    fn render_text(app: &mut App, width: u16, height: u16, sidebar: u16) -> String {
+    #[test]
+    fn help_write_guard_requires_a_current_snapshot_and_available_radio() {
+        let mut app = current_snapshot();
+        assert!(codeplug_write_block_reason(&app).is_none());
+        app.codeplug_data = None;
+        assert!(
+            codeplug_write_block_reason(&app)
+                .unwrap()
+                .contains("no full snapshot")
+        );
+        for block in [
+            |app: &mut App| app.channels_dirty = true,
+            |app: &mut App| app.codeplug_workspace_baseline = None,
+            |app: &mut App| app.remote_active = true,
+            |app: &mut App| app.protocol_port_name = None,
+            |app: &mut App| app.simulator_mode = true,
+            |app: &mut App| app.demo_mode = true,
+        ] {
+            let mut app = current_snapshot();
+            block(&mut app);
+            assert!(codeplug_write_block_reason(&app).is_some());
+        }
+    }
+
+    fn render_text(app: &mut App, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let area = Rect::new(sidebar, 3, width - sidebar, height - 5);
+        let area = crate::ui::views::main_layout::main_content_area(Rect::new(0, 0, width, height));
         terminal
             .draw(|frame| render_codeplug_view(frame, app, area))
             .unwrap();
@@ -361,9 +423,8 @@ mod tests {
         let mut app = App::new();
         app.channels = vec![Channel::default()];
         app.settings = Some(SettingsBlock::default());
-        for (width, height, sidebar) in [(80, 24, 20), (100, 30, 22), (160, 45, 28), (180, 50, 28)]
-        {
-            let text = render_text(&mut app, width, height, sidebar);
+        for (width, height) in [(60, 20), (80, 24), (100, 30), (160, 45), (190, 80)] {
+            let text = render_text(&mut app, width, height);
             assert!(text.contains("EXPORT BLOCKED"), "{text}");
             assert!(text.contains("WRITE BLOCKED"), "{text}");
             assert!(text.contains("no full snapshot"), "{text}");
@@ -411,7 +472,7 @@ mod tests {
             let reason = snapshot_block_reason(&app);
             assert!(reason.is_some());
             assert!(write_block_reason(&app, reason).is_some());
-            let text = render_text(&mut app, 80, 24, 20);
+            let text = render_text(&mut app, 80, 24);
             assert!(!text.contains("AVAILABLE"), "{text}");
         }
     }
@@ -432,16 +493,15 @@ mod tests {
             .unwrap();
         app.update();
         assert!(app.codeplug_snapshot_is_current());
-        for (width, height, sidebar) in [(80, 24, 20), (100, 30, 22), (160, 45, 28), (180, 50, 28)]
-        {
-            let text = render_text(&mut app, width, height, sidebar);
+        for (width, height) in [(60, 20), (80, 24), (100, 30), (160, 45), (190, 80)] {
+            let text = render_text(&mut app, width, height);
             assert!(text.contains("EXPORT AVAILABLE"), "{text}");
             assert!(text.contains("WRITE AVAILABLE"), "{text}");
             assert!(text.contains("read full"), "{text}");
             assert!(text.contains("Radio snapshot"), "{text}");
         }
         app.remote_active = true;
-        let text = render_text(&mut app, 80, 24, 20);
+        let text = render_text(&mut app, 80, 24);
         assert!(text.contains("EXPORT AVAILABLE"));
         assert!(text.contains("WRITE BLOCKED"));
         assert!(text.contains("stop Remote"));
@@ -461,7 +521,7 @@ mod tests {
                 .draw(|frame| render_codeplug_view(frame, &mut app, Rect::new(0, 0, width, height)))
                 .unwrap();
         }
-        let text = render_text(&mut app, 80, 24, 20);
+        let text = render_text(&mut app, 80, 24);
         assert!(text.contains("EXPORT BLOCKED"));
         assert!(text.contains("WRITE BLOCKED"));
         assert!(!text.contains("read radio"));

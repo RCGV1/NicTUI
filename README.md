@@ -10,9 +10,12 @@ A terminal-based user interface for programming the TIDRADIO TD-H3 HAM radio.
 - **DTMF Presets** - Manage DTMF signaling presets
 - **Scan Presets** - Configure scanning behavior
 - **Codeplug Operations** - Import/export full codeplugs
+- **Read All** - Load every configuration section together while protecting unsaved edits
 - **Firmware Flashing** - Flash firmware updates
 - **Remote Control** - Send remote-control keys or inspect packets over USB serial or native BLE transport
 - **Activity Scanner** - Monitor scan hits and export CSV, or replay raw recordings offline (since v1.0.8)
+- **Contextual Help And Logs** - In-app shortcut guides and filterable, scrollable session history
+- **Simulator Add-On Support** - Try the Remote screen, buttons, and reads using a local NicFWSim instance
 - **AI Skill Installer** - Install a bundled Codex or Claude Code skill that mirrors the NicTUI CLI workflows
 
 ## Screenshots
@@ -141,6 +144,18 @@ nictui tui --ble-name TD-H3
 ```
 
 When you exit the TUI, NicTUI will print a hint about the bundled AI skill if it detects `codex` or `claude` on your system.
+
+### Interactive Radio Simulation
+
+Run the Remote screen with a local radio model, without connecting hardware:
+
+```bash
+nictui tui --simulate --view remote
+```
+
+This requires the separately installed **NicFWSim** add-on, running locally on port 8788. NicTUI connects to its UART-compatible endpoint; no simulator engine is bundled into NicTUI. Use `--simulator-endpoint 127.0.0.1:<port>` for a different local port. Hold the on-screen PTT with the mouse, use `a` to open Activity, and press `s` to start or stop synthetic capture. Simulation rejects USB and BLE targets and non-loopback endpoints.
+
+For the native simulator's LCD, also provide `--simulator-http-endpoint 127.0.0.1:<http-port>` from the same simulator instance. Without a paired LCD endpoint or separately configured source/font assets, UART simulation remains usable with approximate fonts. NicTUI does not bundle firmware source or font ROM assets.
 
 ## AI Skill
 
@@ -443,11 +458,13 @@ NicTUI only listens apart from a connection ping. It does not configure the radi
 
 Signal readings are **raw radio values, not dBm**. CSV export is compatible with the original nicFW Programmer: `Frequency,Count,Signal`, with frequency in MHz to five decimal places and mean raw signal to two decimal places.
 
-The TUI has a separate **Activity** tab, not the Remote control view. With the explicit-port command above, the target is selected passively until you start an action. Press uppercase `A` outside Remote or cycle tabs with `Tab`, then `s` to start or stop local capture. It shows frequency in MHz, hit count, mean raw signal, last-seen time on wider terminals, plus connection status and heartbeat count. Stop capture and wait for cleanup before other radio operations. Starting a new capture begins a fresh log; export previous results first if needed.
+The TUI has a separate **Activity** tab, not the Remote control view. With the explicit-port command above, the target is selected passively until you start an action. Press `a` or `A`, or cycle tabs with `Tab`, then `s` to start or stop local capture. It shows frequency in MHz, hit count, mean raw signal, last-seen time on wider terminals, connection status, and heartbeat freshness. Stop capture and wait for cleanup before other radio operations. Starting a new capture begins a fresh log; export previous results first if needed.
 
-### ASL COS Status (Source-Only Prototype)
+The Activity TUI shows `Heartbeats: receiving` for recent heartbeats, `Warning: no heartbeats received` after five seconds without a first heartbeat once capture is ready, or `Warning: heartbeats stopped` after a five-second gap. CLI/JSON heartbeat counts are unchanged.
 
-This post-v1.0.8 development prototype is **not included in v1.0.8**. Use a source build that provides `nictui asl monitor --help` and `nictui asl replay --help`. This first pass reports carrier-operated squelch (COS) status only, not voice audio, PTT control, or an AllStarLink voice bridge.
+### ASL COS Status (Experimental)
+
+Available since v1.1.0, `nictui asl monitor` and `nictui asl replay` report carrier-operated squelch (COS) status only, not voice audio, PTT control, or an AllStarLink voice bridge. This feature is experimental.
 
 Before monitoring, manually set Menu 45 **ASL Support** to **USB**, as described in the [nicFW V2 user manual](https://github.com/nicsure/nicfw2docs/blob/main/TIDRADIO%20TD-H3%20User%20Manual%20for%20nicFW%20V2.pdf). Stop Activity capture and the radio's Activity Mode, Remote, and all other serial users first. Use an already-known explicit wired serial port; no BLE or automatic target discovery. A metadata-only OS check accepts enumerated USB serial devices; unknown, Bluetooth, and virtual ports are rejected. Do not run `ports`, `probe`, `doctor`, or settings writes to prepare this passive workflow.
 
@@ -497,13 +514,19 @@ nictui activity replay --help
 | `Tab` | Next tab |
 | `Shift+Tab` | Previous tab |
 | `1-9` | Jump to tabs 1 through 9 |
-| `0` | Jump to Debug |
-| `A` | Jump to Activity outside Remote |
+| `0` | Jump to Logs |
+| `a` / `A` | Open Activity; stop Remote first if active |
+| `F1` | Contextual help, including inside editors |
+| `?` | Contextual help from main views and radio selection |
 | `q` | Quit application |
 | `r` | Read from radio |
 | `w` | Write to radio |
 | `Enter` | Open or edit the selected item where supported |
 | `Esc` | Cancel / Go back |
+
+From a main tab, press `Shift+R` or `Ctrl+R` to manually Read All when Remote and Activity capture are stopped. One full snapshot populates Channels, Settings, Scanning, Memory Groups, Band Plan, DTMF, and Codeplug. It refuses unsaved configuration edits or conflicting radio operations, including discovery, and does not run automatically at startup. Lowercase `r` retains its existing per-tab read action where supported.
+
+Help preserves editor drafts and blocks input to the underlying view. In Logs, use `Up`/`Down` or `PgUp`/`PgDn` to browse, `End` to follow new entries, `f` to filter, and `c` to clear local history without changing the radio.
 
 ### Tab-Specific Bindings
 
@@ -541,9 +564,13 @@ nictui activity replay --help
 - `o` - Connect to radio
 - `p` - Disconnect from radio
 - `0-9` - Radio keys
-- `a` - PTT A
-- `b` - PTT B
-- `f` - Flashlight
+- `a` / `A` - Stop Remote and open Activity
+- Mouse-hold the on-screen `PTT` button - Transmit until released, with a 60-second safety limit
+- `Space` - Hold PTT in terminals with key-release support; send a 400 ms tap in Apple Terminal and other legacy terminals
+- `b` / `v` - Radio B key
+- `f` - Radio F key
+
+PTT can transmit. Releasing the mouse outside the button, dragging outside it, losing terminal focus, resizing, or leaving Remote releases a held key. Keyboard holds require a key-release event before another hold can begin.
 
 **Codeplug Tab:**
 - `i` - Import codeplug

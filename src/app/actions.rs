@@ -1,10 +1,10 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 
-use super::state::{App, AppEvent, AppMode, MainTab, RemoteInputState, WriteScope};
+use super::state::{App, AppEvent, AppMode, MainTab, ReadAllRequest, RemoteInputState, WriteScope};
 use crate::ble::{
     ble_scan_supported, disconnect_ble_bridge_for_device, ensure_ble_bridge_for_device,
     parse_ble_device_uri,
@@ -17,6 +17,7 @@ use crate::device::{
     ProgressEvent, flash_firmware, read_band_plans as read_radio_band_plans,
     read_channels_with_group_labels as read_radio_channels_with_group_labels,
     read_codeplug as read_radio_codeplug, read_dtmf_presets as read_radio_dtmf_presets,
+    read_group_labels as read_radio_group_labels,
     read_scan_presets_with_group_labels as read_radio_scan_presets_with_group_labels,
     read_settings as read_radio_settings, write_band_plans as write_radio_band_plans,
     write_channels as write_radio_channels, write_codeplug as write_radio_codeplug,
@@ -28,6 +29,107 @@ use crate::remote::{
     RemoteCaptureEvent, RemoteControlCommand, RemoteSessionOptions, RemoteSessionPhase,
     run_remote_session,
 };
+
+type SimulatorLcdResult = std::result::Result<Vec<u16>, String>;
+type SimulatorLcdUpdate = (std::time::Instant, SimulatorLcdResult);
+
+struct SimulatorLcdPoller {
+    updates: mpsc::Receiver<SimulatorLcdUpdate>,
+    cancel: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl SimulatorLcdPoller {
+    fn start(mut read_frame: impl FnMut() -> SimulatorLcdResult + Send + 'static) -> Self {
+        let (tx, updates) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&cancel);
+        let worker = thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                let started = std::time::Instant::now();
+                let frame = read_frame();
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                match tx.try_send((started, frame)) {
+                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
+                }
+                thread::park_timeout(std::time::Duration::from_millis(100));
+            }
+        });
+        Self {
+            updates,
+            cancel,
+            worker: Some(worker),
+        }
+    }
+
+    fn latest(&self) -> Option<SimulatorLcdUpdate> {
+        self.updates.try_iter().last()
+    }
+
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(worker) = &self.worker {
+            worker.thread().unpark();
+        }
+    }
+}
+
+impl Drop for SimulatorLcdPoller {
+    fn drop(&mut self) {
+        self.cancel();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Default)]
+struct SimulatorLcdDelivery {
+    latest: Option<SimulatorLcdResult>,
+    sent: Option<Vec<u16>>,
+    unavailable: bool,
+    generation: Option<std::time::Instant>,
+}
+
+impl SimulatorLcdDelivery {
+    fn forward(
+        &mut self,
+        update: Option<SimulatorLcdUpdate>,
+        generation: std::time::Instant,
+        tx: &mpsc::Sender<AppEvent>,
+    ) {
+        if self.generation != Some(generation) {
+            self.generation = Some(generation);
+            self.latest = None;
+            self.sent = None;
+            self.unavailable = false;
+        }
+        if let Some((started, update)) = update
+            && started >= generation
+        {
+            self.latest = Some(update);
+        }
+        match &self.latest {
+            Some(Ok(pixels)) => {
+                if self.sent.as_ref() != Some(pixels) || self.unavailable {
+                    self.sent = Some(pixels.clone());
+                    let _ = tx.send(AppEvent::SimulatorLcdFrame(pixels.clone()));
+                }
+                self.unavailable = false;
+            }
+            Some(Err(error)) => {
+                if !self.unavailable {
+                    let _ = tx.send(AppEvent::SimulatorLcdUnavailable(error.clone()));
+                }
+                self.unavailable = true;
+            }
+            None => {}
+        }
+    }
+}
 
 fn update_remote_input_phase(
     input: &std::sync::Mutex<RemoteInputState>,
@@ -43,6 +145,7 @@ fn update_remote_input_phase(
         // Never replay queued user input on a newly opened transport.
         while commands.try_recv().is_ok() {}
         input.pending = false;
+        input.held_key = None;
     }
 }
 
@@ -77,7 +180,8 @@ fn read_with_group_labels<T>(
     };
     let _ = tx.send(AppEvent::Progress(1.0));
     let _ = tx.send(complete(primary, endian));
-    // Completion handlers set their own status; keep any partial-success warning visible.
+    // The UI reconciles this transport outcome with its per-section edit guards.
+    // Keep label-read failures in the final status even when primary edits are preserved.
     let _ = tx.send(AppEvent::Status(status));
     Ok(())
 }
@@ -115,16 +219,20 @@ impl App {
     pub(crate) fn hardware_action_allowed(&mut self) -> bool {
         let reason = if self.activity_active() {
             Some("Activity capture owns the radio; stop capture and wait for cleanup first")
+        } else if self.simulator_mode {
+            Some("Simulator mode: physical discovery, writes and flashing are disabled")
         } else if self.demo_mode {
             Some("Demo mode: hardware I/O disabled")
         } else if self.remote_active || self.remote_tx.is_some() {
             Some(
                 "Remote session owns the radio; stop Remote and wait for shutdown before another operation",
             )
-        } else if matches!(
-            self.mode,
-            AppMode::Reading | AppMode::Writing | AppMode::BinFlashing
-        ) {
+        } else if self.read_all_request.is_some()
+            || matches!(
+                self.mode,
+                AppMode::Reading | AppMode::Writing | AppMode::BinFlashing
+            )
+        {
             Some("A radio operation is still in progress; wait for it to finish")
         } else {
             None
@@ -170,6 +278,30 @@ impl App {
     }
 
     pub(crate) fn active_protocol_port(&mut self) -> Option<String> {
+        if self.simulator_mode {
+            if self.activity_active()
+                || self.remote_active
+                || self.remote_tx.is_some()
+                || self.read_all_request.is_some()
+                || matches!(
+                    self.mode,
+                    AppMode::Reading | AppMode::Writing | AppMode::BinFlashing
+                )
+            {
+                self.status_message = "Wait for the current simulator session to stop".into();
+                return None;
+            }
+            let Some(target) = self.protocol_port_name.clone() else {
+                self.status_message =
+                    "Select a simulator endpoint before starting an operation".into();
+                return None;
+            };
+            if let Err(error) = crate::simulator_link::parse_endpoint(&target) {
+                self.status_message = format!("Invalid simulator target: {error}");
+                return None;
+            }
+            return Some(target);
+        }
         if !self.hardware_action_allowed() {
             return None;
         }
@@ -274,6 +406,9 @@ impl App {
     }
 
     pub fn start_clear_channel(&mut self, channel_num: u16) {
+        if !self.hardware_action_allowed() {
+            return;
+        }
         let Some(port_name) = self.active_protocol_port() else {
             return;
         };
@@ -352,6 +487,36 @@ impl App {
             ) {
                 let _ = tx.send(AppEvent::Error(format!("Failed to read presets: {error}")));
             }
+        });
+    }
+
+    pub fn start_read_group_labels(&mut self) {
+        if self.group_labels_dirty || self.editing_group_label_idx.is_some() {
+            self.status_message = "Group read blocked: save group edits before refreshing".into();
+            return;
+        }
+        let Some(port_name) = self.active_protocol_port() else {
+            return;
+        };
+        self.last_main_tab = MainTab::MemoryGroups;
+        self.last_non_remote_tab = MainTab::MemoryGroups;
+        self.mode = AppMode::Reading;
+        self.progress = 0.0;
+        let tx = self.event_tx.clone();
+        thread::spawn(move || {
+            let result = read_radio_group_labels(&port_name, |event| match event {
+                ProgressEvent::Status(status) => {
+                    let _ = tx.send(AppEvent::Status(status));
+                }
+                ProgressEvent::Progress(progress) => {
+                    let _ = tx.send(AppEvent::Progress(progress));
+                }
+            });
+            let event = match result {
+                Ok(labels) => AppEvent::ReadGroupLabelsOnlyComplete(labels),
+                Err(error) => AppEvent::Error(format!("Failed to read group names: {error}")),
+            };
+            let _ = tx.send(event);
         });
     }
 
@@ -450,6 +615,9 @@ impl App {
     }
 
     pub fn start_write_group_labels(&mut self) {
+        if !self.hardware_action_allowed() {
+            return;
+        }
         let Some(port_name) = self.active_protocol_port() else {
             return;
         };
@@ -537,6 +705,9 @@ impl App {
     }
 
     pub fn start_write_dtmf(&mut self) {
+        if !self.hardware_action_allowed() {
+            return;
+        }
         let Some(port_name) = self.active_protocol_port() else {
             return;
         };
@@ -593,6 +764,9 @@ impl App {
     }
 
     pub fn start_write_settings_and_reboot(&mut self) {
+        if !self.hardware_action_allowed() {
+            return;
+        }
         let settings = match &self.settings {
             Some(s) => s.clone(),
             None => {
@@ -666,6 +840,27 @@ impl App {
         let tx = self.event_tx.clone();
         let (key_tx, key_rx) = mpsc::channel();
         self.remote_screen.reset_session();
+        if self.simulator_mode && !self.remote_screen.display.uses_native_fonts() {
+            let display = crate::simulator_assets::configured_paths().and_then(|assets| {
+                assets
+                    .map(|assets| {
+                        crate::remote_display::RadioDisplay::with_native_fonts(
+                            &assets.source,
+                            &assets.rom,
+                        )
+                    })
+                    .transpose()
+            });
+            match display {
+                Ok(Some(display)) => self.remote_screen.display = display,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = tx.send(AppEvent::Log(format!(
+                        "Simulator LCD is using approximate fonts: {error}"
+                    )));
+                }
+            }
+        }
         self.remote_screen.phase = crate::remote::RemoteSessionPhase::Opening;
         self.remote_screen.last_failure = None;
         self.remote_tx = Some(key_tx);
@@ -675,8 +870,29 @@ impl App {
         self.remote_stop_signal.store(false, Ordering::SeqCst);
         let stop_signal = self.remote_stop_signal.clone();
         let input_state = self.remote_input_state.clone();
+        let lcd_target = if self.simulator_mode {
+            self.simulator_http_endpoint.clone()
+        } else {
+            None
+        };
 
         thread::spawn(move || {
+            let lcd_poller = lcd_target.map(|target| {
+                let endpoint = crate::simulator_lcd::Endpoint::parse(&target);
+                let uart = port_name.clone();
+                SimulatorLcdPoller::start(move || {
+                    endpoint
+                        .as_ref()
+                        .map_err(|error| error.to_string())
+                        .and_then(|endpoint| {
+                            endpoint
+                                .read_frame_for(&uart)
+                                .map_err(|error| error.to_string())
+                        })
+                })
+            });
+            let mut lcd_delivery = SimulatorLcdDelivery::default();
+            let lcd_generation = std::cell::Cell::new(std::time::Instant::now());
             let result = run_remote_session(
                 &port_name,
                 &RemoteSessionOptions {
@@ -686,7 +902,19 @@ impl App {
                     suppress_repeated_idle: true,
                     ..RemoteSessionOptions::default()
                 },
-                |_| stop_signal.load(Ordering::SeqCst),
+                |_| {
+                    if stop_signal.load(Ordering::SeqCst) {
+                        return true;
+                    }
+                    // This callback services UART timing: never perform HTTP I/O here.
+                    // Opening/recovery accepts only reads started in the new phase.
+                    lcd_delivery.forward(
+                        lcd_poller.as_ref().and_then(SimulatorLcdPoller::latest),
+                        lcd_generation.get(),
+                        &tx,
+                    );
+                    stop_signal.load(Ordering::SeqCst)
+                },
                 |_| {
                     let input = input_state.lock().unwrap();
                     if stop_signal.load(Ordering::SeqCst) || !input.ready {
@@ -706,6 +934,13 @@ impl App {
                         let _ = tx.send(AppEvent::Log(message));
                     }
                     RemoteCaptureEvent::Phase(phase) => {
+                        if matches!(
+                            phase,
+                            crate::remote::RemoteSessionPhase::Opening
+                                | crate::remote::RemoteSessionPhase::Recovering
+                        ) {
+                            lcd_generation.set(std::time::Instant::now());
+                        }
                         update_remote_input_phase(&input_state, &key_rx, phase);
                         let _ = tx.send(AppEvent::RemotePhase(phase));
                     }
@@ -722,6 +957,9 @@ impl App {
                 },
             );
 
+            if let Some(poller) = &lcd_poller {
+                poller.cancel();
+            }
             match result {
                 Ok(_) => {
                     let _ = tx.send(AppEvent::RemoteStopped {
@@ -736,10 +974,14 @@ impl App {
                     });
                 }
             }
+            // UI shutdown follows UART cleanup, not a possibly in-flight HTTP read.
+            // Only this UART worker forwards results, so joining cannot emit late UI events.
+            drop(lcd_poller);
         });
     }
 
     pub fn remote_off(&mut self) {
+        self.release_remote_key();
         if self.demo_mode {
             self.remote_active = false;
             self.remote_screen.phase = crate::remote::RemoteSessionPhase::Stopped;
@@ -769,18 +1011,77 @@ impl App {
             return false;
         }
         if self.demo_mode {
-            return true;
+            return self.held_remote_key().is_none();
         }
         let input = self.remote_input_state.lock().unwrap();
-        self.remote_tx.is_some() && input.ready && !input.pending
+        self.remote_tx.is_some() && input.ready && !input.pending && input.held_key.is_none()
+    }
+
+    /// Input ownership remains until release, even after the backend safety timeout.
+    pub fn held_remote_key(&self) -> Option<u8> {
+        self.remote_input_state.lock().unwrap().held_key
+    }
+
+    /// Requires a matching release event; legacy terminals must use send_key.
+    pub fn press_remote_key(&mut self, key_code: u8) -> bool {
+        self.queue_remote_key(key_code, true)
+    }
+
+    /// Release is a safety operation, independent of tab, dialog, or readiness.
+    pub fn release_remote_key(&mut self) {
+        let mut input = self.remote_input_state.lock().unwrap();
+        if input.held_key.take().is_none() {
+            return;
+        }
+        if self.demo_mode {
+            self.status_message = "Demo key released".to_string();
+            return;
+        }
+        if self
+            .remote_tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(RemoteControlCommand::release_key()).is_ok())
+        {
+            input.pending = true;
+            self.status_message = "Queued remote key release".to_string();
+        } else {
+            self.remote_tx = None;
+            self.remote_stop_signal.store(true, Ordering::SeqCst);
+            self.status_message = "Waiting for remote session shutdown".to_string();
+        }
+    }
+
+    pub fn release_remote_key_if_inactive(&mut self) {
+        if self.mode != AppMode::Main(MainTab::Remote)
+            || self.dialog_open
+            || self.activity_active()
+            || !self.remote_active
+            || self.remote_stop_signal.load(Ordering::SeqCst)
+            || matches!(
+                self.remote_screen.phase,
+                RemoteSessionPhase::Opening
+                    | RemoteSessionPhase::Recovering
+                    | RemoteSessionPhase::Stopped
+            )
+        {
+            self.release_remote_key();
+        }
     }
 
     pub fn send_key(&mut self, key_code: u8) {
+        self.queue_remote_key(key_code, false);
+    }
+
+    fn queue_remote_key(&mut self, key_code: u8, hold: bool) -> bool {
+        // Ignore repeats and other controls until the original input is released.
+        if self.held_remote_key().is_some() {
+            return false;
+        }
         if self.activity_active() {
-            return;
+            return false;
         }
         if self.mode != AppMode::Main(MainTab::Remote) || self.dialog_open {
-            return;
+            return false;
         }
         if !self.remote_active || self.remote_stop_signal.load(Ordering::SeqCst) {
             self.status_message = if self.remote_active {
@@ -788,7 +1089,7 @@ impl App {
             } else {
                 "Remote mode is not active".to_string()
             };
-            return;
+            return false;
         }
         if !matches!(
             self.remote_screen.phase,
@@ -796,11 +1097,18 @@ impl App {
         ) {
             self.status_message =
                 "Remote is not ready for keys; wait for the connection".to_string();
-            return;
+            return false;
         }
         if self.demo_mode {
-            self.status_message = format!("Demo key: {}", remote_key_label(key_code));
-            return;
+            if hold {
+                self.remote_input_state.lock().unwrap().held_key = Some(key_code);
+            }
+            self.status_message = if hold {
+                format!("Demo key held: {}", remote_key_label(key_code))
+            } else {
+                format!("Demo key: {}", remote_key_label(key_code))
+            };
+            return true;
         }
         let mut input = self.remote_input_state.lock().unwrap();
         if !input.ready || input.pending {
@@ -809,19 +1117,30 @@ impl App {
             } else {
                 "Remote is not ready for keys; wait for the connection".to_string()
             };
-            return;
+            return false;
         }
         if let Some(tx) = &self.remote_tx {
             let label = remote_key_label(key_code);
-            if tx
-                .send(RemoteControlCommand::raw_key(label, key_code))
-                .is_ok()
-            {
+            let command = if hold {
+                RemoteControlCommand::press_key(label, key_code)
+            } else {
+                RemoteControlCommand::raw_key(label, key_code)
+            };
+            if tx.send(command).is_ok() {
                 input.pending = true;
+                input.held_key = hold.then_some(key_code);
                 drop(input);
                 let label = remote_key_label(key_code);
-                self.status_message = format!("Queued remote key {label}");
+                self.status_message = if hold {
+                    format!("Holding remote key {label}; release to stop (60s safety limit)")
+                } else if matches!(key_code, 0x13 | 0x90) {
+                    "Queued PTT tap (400ms); use mouse hold or a key-up capable terminal to hold"
+                        .to_string()
+                } else {
+                    format!("Queued remote key {label}")
+                };
                 self.log(&format!("Remote key {label}"));
+                return true;
             } else {
                 self.remote_tx = None;
                 self.remote_stop_signal.store(true, Ordering::SeqCst);
@@ -830,9 +1149,13 @@ impl App {
         } else {
             self.status_message = "Remote mode is not active".to_string();
         }
+        false
     }
 
     pub fn start_write_channel(&mut self, index: usize) {
+        if !self.hardware_action_allowed() {
+            return;
+        }
         let Some(port_name) = self.active_protocol_port() else {
             return;
         };
@@ -874,6 +1197,9 @@ impl App {
     }
 
     pub fn start_write_multiple_channels(&mut self, _start_index: usize, reboot: bool) {
+        if !self.hardware_action_allowed() {
+            return;
+        }
         let Some(port_name) = self.active_protocol_port() else {
             return;
         };
@@ -974,6 +1300,10 @@ impl App {
     }
 
     pub fn load_csv(&mut self, path: &Path) -> Result<()> {
+        anyhow::ensure!(
+            self.read_all_request.is_none(),
+            "Wait for Read All to finish before importing"
+        );
         let document = load_channel_document_from_path(path)?;
         crate::device::validate_channels(&document.channels)?;
         self.channels = document.channels;
@@ -998,6 +1328,10 @@ impl App {
     }
 
     pub fn start_import_channels(&mut self, path: PathBuf) {
+        if self.read_all_request.is_some() {
+            self.status_message = "Wait for Read All to finish before importing".into();
+            return;
+        }
         match self.load_csv(&path) {
             Ok(_) => {
                 self.mode = AppMode::Main(MainTab::Channels);
@@ -1150,38 +1484,150 @@ impl App {
     }
 
     pub fn start_read_codeplug(&mut self) {
-        let Some(port_name) = self.active_protocol_port() else {
+        if self.demo_mode {
+            self.status_message = "Demo mode: hardware I/O disabled".into();
+            return;
+        }
+        if self.codeplug_workspace_baseline.is_some()
+            && self.codeplug_workspace_baseline != self.workspace_snapshot()
+        {
+            self.status_message =
+                "Full read blocked: workspace edits preserved. Save changes before reading.".into();
+            return;
+        }
+        // Full snapshots replace every section, so use the same edit and completion guards.
+        self.start_read_all();
+    }
+
+    pub(crate) fn configuration_has_unsaved_edits(&self) -> bool {
+        self.channels_dirty
+            || self.settings_dirty
+            || self.scan_presets_dirty
+            || self.group_labels_dirty
+            || self.band_plans_dirty
+            || self.dtmf_dirty
+            || !self.deleted_channels.is_empty()
+            || self.pending_channel_edit.is_some()
+            || self.pending_dtmf_edit.is_some()
+            || self.editing_scan_preset.is_some()
+            || self.editing_band_plan.is_some()
+            || self.editing_group_label_idx.is_some()
+    }
+
+    /// Read every workspace from a single device snapshot, without discarding edits.
+    pub fn start_read_all(&mut self) {
+        let demo = self.demo_mode;
+        self.start_read_all_with(move |port, report| {
+            if demo {
+                report(ProgressEvent::Status(
+                    "Reading simulated radio configuration (no hardware I/O)".into(),
+                ));
+                Ok((App::demo().codeplug_data.unwrap(), Endianness::Big))
+            } else {
+                read_radio_codeplug(port, report)
+            }
+        });
+    }
+
+    fn start_read_all_with(
+        &mut self,
+        read: impl FnOnce(&str, &mut dyn FnMut(ProgressEvent)) -> Result<(Vec<u8>, Endianness)>
+        + Send
+        + 'static,
+    ) {
+        let reason = if self.activity_active() {
+            Some("Activity capture owns the radio; stop capture and wait for cleanup first")
+        } else if self.remote_active || self.remote_tx.is_some() {
+            Some("Remote session owns the radio; stop Remote and wait for shutdown first")
+        } else if self.ble_scan_in_progress {
+            Some("Radio discovery is scanning; wait for it to finish before Read All")
+        } else if self.read_all_request.is_some()
+            || matches!(
+                self.mode,
+                AppMode::Reading | AppMode::Writing | AppMode::BinFlashing
+            )
+        {
+            Some("A radio operation is still in progress; wait for it to finish")
+        } else if self.dialog_open || !matches!(self.mode, AppMode::Main(_)) {
+            Some("Close the editor or dialog and select a radio before Read All")
+        } else if self.configuration_has_unsaved_edits() {
+            Some(
+                "Read All blocked: unsaved edits. Save changes before reading the entire radio configuration",
+            )
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            self.status_message = reason.into();
+            return;
+        }
+        let AppMode::Main(return_tab) = self.mode else {
             return;
         };
-        self.last_main_tab = MainTab::Codeplug;
+        let Some(workspace) = self.workspace_snapshot() else {
+            self.status_message =
+                "Read All blocked: could not capture the current workspace".into();
+            return;
+        };
+        let port = if self.demo_mode {
+            String::new()
+        } else {
+            let Some(port) = self.active_protocol_port() else {
+                if self.protocol_port_name.is_none() && !matches!(self.mode, AppMode::Error(_)) {
+                    self.status_message = "Select a radio target before Read All".into();
+                }
+                return;
+            };
+            port
+        };
+        self.last_main_tab = return_tab;
+        if return_tab != MainTab::Remote {
+            self.last_non_remote_tab = return_tab;
+        }
+        self.read_all_request = Some(ReadAllRequest {
+            return_tab,
+            workspace,
+        });
         self.mode = AppMode::Reading;
         self.progress = 0.0;
-        self.status_message = "Reading full radio snapshot...".to_string();
+        self.status_message = "Reading entire radio configuration...".into();
         let tx = self.event_tx.clone();
         thread::spawn(move || {
-            match read_radio_codeplug(&port_name, |event| match event {
+            let result = read(&port, &mut |event| match event {
                 ProgressEvent::Status(status) => {
                     let _ = tx.send(AppEvent::Status(status));
                 }
                 ProgressEvent::Progress(progress) => {
-                    let _ = tx.send(AppEvent::Progress(progress));
+                    let _ = tx.send(AppEvent::Progress(progress.clamp(0.0, 0.99)));
                 }
-            }) {
-                Ok((data, _)) => {
-                    let _ = tx.send(loaded_codeplug_event(PathBuf::from("Radio snapshot"), data));
-                }
-                Err(error) => {
-                    let _ = tx.send(AppEvent::Error(format!(
-                        "Failed to read full snapshot: {error}"
-                    )));
-                }
-            }
+            })
+            .and_then(|(data, _firmware_marker_endian)| {
+                anyhow::ensure!(
+                    data.len() == crate::protocol::EEPROM_SIZE,
+                    "Incomplete configuration: expected {} bytes, got {}",
+                    crate::protocol::EEPROM_SIZE,
+                    data.len()
+                );
+                // Section extractors infer their own byte order, not the firmware marker's.
+                Ok(loaded_codeplug_event(PathBuf::from("Radio snapshot"), data))
+            });
+            let event = match result {
+                Ok(event) => event,
+                Err(error) => AppEvent::ReadAllFailed(format!(
+                    "Read All failed; workspace unchanged: {error}"
+                )),
+            };
+            let _ = tx.send(event);
         });
     }
 
     pub fn start_import_codeplug(&mut self, path: PathBuf) {
         use crate::protocol::codeplug;
 
+        if self.read_all_request.is_some() {
+            self.status_message = "Wait for Read All to finish before importing".into();
+            return;
+        }
         let tx = self.event_tx.clone();
         self.mode = AppMode::Reading;
         self.progress = 0.0;
@@ -1420,8 +1866,117 @@ fn remote_key_label(key_code: u8) -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "bundled_read_status_tests.rs"]
+mod bundled_read_status_tests;
+
+#[cfg(test)]
+#[path = "read_all_tests.rs"]
+mod read_all_tests;
+
+#[cfg(test)]
+#[path = "remote_hold_tests.rs"]
+mod remote_hold_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simulator_lcd_blocked_read_does_not_block_uart_stop_or_emit_late_events() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let poller = SimulatorLcdPoller::start(move || {
+            let _ = entered_tx.send(());
+            let _ = finish_rx.recv_timeout(std::time::Duration::from_millis(300));
+            Ok(vec![0; 128 * 128])
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(poller.latest().is_none());
+        poller.cancel();
+        let (tx, rx) = mpsc::channel();
+        tx.send(AppEvent::RemoteStopped {
+            message: "UART stopped".into(),
+            failure: None,
+        })
+        .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::RemoteStopped { .. })));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        finish_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !poller.worker.as_ref().unwrap().is_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            poller.latest().is_none(),
+            "cancelled HTTP result must be discarded"
+        );
+        drop(poller);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn simulator_lcd_capacity_one_mailbox_never_blocks_polling_and_cancel_unparks() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads = Arc::clone(&count);
+        let poller = SimulatorLcdPoller::start(move || {
+            reads.fetch_add(1, Ordering::SeqCst);
+            Err("invalid configured HTTP endpoint".into())
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while count.load(Ordering::SeqCst) < 3 {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            matches!(poller.latest(), Some((_, Err(error))) if error.contains("invalid configured"))
+        );
+        let started = std::time::Instant::now();
+        drop(poller);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn simulator_lcd_delivery_discards_old_reads_and_requires_fresh_results_after_opening() {
+        let (tx, rx) = mpsc::channel();
+        let mut delivery = SimulatorLcdDelivery::default();
+        let pixels = vec![0x1234; 128 * 128];
+        let first = std::time::Instant::now();
+        let second = first + std::time::Duration::from_millis(1);
+        let third = second + std::time::Duration::from_millis(1);
+        delivery.forward(Some((first, Ok(pixels.clone()))), first, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::SimulatorLcdFrame(frame)) if frame == pixels));
+        delivery.forward(None, first, &tx);
+        delivery.forward(Some((first, Ok(pixels.clone()))), first, &tx);
+        assert!(rx.try_recv().is_err());
+        delivery.forward(None, second, &tx);
+        delivery.forward(Some((first, Ok(pixels.clone()))), second, &tx);
+        delivery.forward(Some((first, Err("old parse error".into()))), second, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "neither cached nor queued old-phase data may reappear"
+        );
+        delivery.forward(Some((second, Ok(pixels.clone()))), second, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::SimulatorLcdFrame(frame)) if frame == pixels));
+        delivery.forward(Some((second, Err("parse error".into()))), second, &tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(AppEvent::SimulatorLcdUnavailable(error)) if error == "parse error")
+        );
+        delivery.forward(None, second, &tx);
+        assert!(rx.try_recv().is_err());
+        delivery.forward(None, third, &tx);
+        assert!(rx.try_recv().is_err());
+        delivery.forward(Some((third, Err("parse error".into()))), third, &tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(AppEvent::SimulatorLcdUnavailable(error)) if error == "parse error")
+        );
+        delivery.forward(Some((third, Ok(pixels.clone()))), third, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::SimulatorLcdFrame(frame)) if frame == pixels));
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn bundled_reads_keep_progress_monotonic_until_labels_finish() {
@@ -1488,7 +2043,6 @@ mod tests {
         let demo = App::demo();
         let mut app = App::new();
         app.mode = AppMode::Reading;
-        app.group_labels_dirty = true;
         read_with_group_labels(
             &app.event_tx,
             "Channels",
@@ -1803,7 +2357,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn full_snapshot_read_decodes_mixed_sections_and_exports_untouched_bytes() {
+    fn global_full_snapshot_read_uses_one_session_and_exports_untouched_bytes() {
         use serialport::SerialPort;
         use std::io::{Read, Write};
 
@@ -1854,7 +2408,7 @@ mod tests {
         app.protocol_port_name = Some(port);
         app.endian = crate::protocol::Endianness::Little;
         app.mode = AppMode::Main(MainTab::Codeplug);
-        app.start_read_codeplug();
+        app.start_read_all();
         assert_eq!(app.mode, AppMode::Reading);
         wait_for_app(&mut app, |app| app.codeplug_data.is_some());
         release_tx.send(()).unwrap();
@@ -2363,5 +2917,108 @@ mod tests {
         assert!(!app.dialog_open);
         assert!(!app.ble_scan_ui_suspended);
         assert_eq!(app.status_message, "BLE scan already running...");
+    }
+
+    #[test]
+    fn simulator_read_targets_are_available_from_every_view_without_discovery() {
+        for tab in [
+            MainTab::Channels,
+            MainTab::Settings,
+            MainTab::Scanning,
+            MainTab::MemoryGroups,
+            MainTab::BandPlan,
+            MainTab::DTMF,
+            MainTab::Remote,
+            MainTab::Codeplug,
+            MainTab::BinFlash,
+            MainTab::Debug,
+            MainTab::Activity,
+        ] {
+            let mut app = App::new();
+            app.simulator_mode = true;
+            app.mode = AppMode::Main(tab);
+            app.protocol_port_name = Some("sim://127.0.0.1:8788".into());
+            assert_eq!(
+                app.active_protocol_port().as_deref(),
+                Some("sim://127.0.0.1:8788")
+            );
+            assert_eq!(app.mode, AppMode::Main(tab));
+            assert!(app.port_candidates.is_empty());
+            assert!(!app.ble_scan_in_progress);
+            assert!(app.event_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn simulator_writes_and_discovery_are_blocked_before_workers_or_transport() {
+        let actions: &[fn(&mut App)] = &[
+            App::refresh_ports,
+            App::refresh_radio_targets,
+            App::refresh_radio_targets_from_tui,
+            App::start_ble_scan_from_tui,
+            |app| app.start_ble_scan(true),
+            App::select_port,
+            App::start_write_group_labels,
+            App::start_write_scan_presets,
+            App::start_write_band_plans,
+            App::start_write_dtmf,
+            App::start_write_settings_and_reboot,
+            |app| app.start_clear_channel(1),
+            |app| app.start_write_channel(0),
+            |app| app.start_write_multiple_channels(0, true),
+            |app| app.start_write_csv_channels(PathBuf::from("unused.csv")),
+            App::start_write_codeplug,
+            App::start_bin_flash,
+        ];
+        for action in actions {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let target = format!("sim://{}", listener.local_addr().unwrap());
+            let mut app = App::demo();
+            app.demo_mode = false;
+            app.simulator_mode = true;
+            app.protocol_port_name = Some(target.clone());
+            app.settings_dirty = true;
+            app.scan_presets_dirty = true;
+            app.band_plans_dirty = true;
+            app.bin_firmware_data = Some(vec![0; 33]);
+            action(&mut app);
+            assert_eq!(app.mode, AppMode::Main(MainTab::Channels));
+            assert!(
+                app.status_message
+                    .contains("writes and flashing are disabled"),
+                "{}",
+                app.status_message
+            );
+            assert_eq!(app.protocol_port_name.as_deref(), Some(target.as_str()));
+            assert!(!app.ble_scan_in_progress);
+            assert!(app.remote_tx.is_none());
+            assert!(app.event_rx.try_recv().is_err());
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn simulator_read_targets_never_fall_back_to_physical_targets() {
+        for target in [
+            "/dev/cu.not-a-radio",
+            "ble://not-a-device",
+            "sim://192.0.2.1:8788",
+            "sim://localhost:8788",
+        ] {
+            let mut app = App::new();
+            app.simulator_mode = true;
+            app.protocol_port_name = Some(target.into());
+            assert!(app.active_protocol_port().is_none());
+            assert!(app.status_message.contains("Invalid simulator target"));
+            assert!(app.event_rx.try_recv().is_err());
+        }
+        let mut app = App::new();
+        app.simulator_mode = true;
+        assert!(app.active_protocol_port().is_none());
+        assert!(app.status_message.contains("Select a simulator endpoint"));
     }
 }

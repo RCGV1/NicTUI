@@ -141,6 +141,7 @@ impl App {
             KeyCode::Esc => {
                 self.editing_scan_preset = None;
                 self.mode = AppMode::Main(MainTab::Scanning);
+                self.status_message = "Scan preset edit cancelled".into();
             }
             KeyCode::Enter => self.commit_scan_preset_edit(),
             KeyCode::Up | KeyCode::BackTab => self.select_previous_scan_preset_field(),

@@ -1,187 +1,117 @@
-use crate::app::App;
+use crate::app::{App, logs::classify_log};
 use crate::ui::theme::{
-    COLOR_BORDER, COLOR_DIM, COLOR_PRIMARY, COLOR_SECONDARY, COLOR_SURFACE_1, COLOR_TEXT,
-    COLOR_WARNING,
+    COLOR_BORDER, COLOR_DIM, COLOR_ERROR, COLOR_PRIMARY, COLOR_SECONDARY, COLOR_SURFACE_1,
+    COLOR_TEXT, COLOR_WARNING,
 };
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    prelude::Stylize,
+    layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    text::Line,
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-pub fn render_debug_logs(f: &mut Frame, app: &App, area: Rect) {
-    let summary_height = if area.width < 90 { 3 } else { 2 };
-    let compact = area.width < 90;
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(summary_height),
-            Constraint::Length(4),
-            Constraint::Min(10),
-        ])
-        .split(area);
+fn header_rows(area: Rect) -> u16 {
+    if area.height >= 10 { 5 } else { 2 }
+}
 
-    let remote_count = app
+/// The same page size used by the renderer, for keyboard dispatch.
+pub fn log_page_rows(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(header_rows(area) + 2)).max(1)
+}
+
+pub fn render_debug_logs(f: &mut Frame, app: &mut App, area: Rect) {
+    let chunks =
+        Layout::vertical([Constraint::Length(header_rows(area)), Constraint::Min(0)]).split(area);
+    app.log_view.set_width(chunks[1].width.saturating_sub(2));
+    let rows = app.log_view.rows(&app.logs);
+    app.log_view.clamp(rows.len());
+    let page_rows = usize::from(chunks[1].height.saturating_sub(2));
+    let start = app.log_view.scroll;
+    let end = start.saturating_add(page_rows).min(rows.len());
+    let matched = app
         .logs
         .iter()
-        .filter(|line| line.contains("REMOTE:"))
+        .filter(|line| app.log_view.filter.matches(line))
         .count();
-    let rx_count = app.logs.iter().filter(|line| line.contains("RX:")).count();
-    let tx_count = app.logs.iter().filter(|line| line.contains("TX:")).count();
-
-    let summary = Paragraph::new(format!(
-        "{} entries | {} RX | {} TX | {} remote",
+    let (mut rx, mut tx, mut remote, mut errors) = (0, 0, 0, 0);
+    for line in &app.logs {
+        let class = classify_log(line);
+        rx += usize::from(class.rx);
+        tx += usize::from(class.tx);
+        remote += usize::from(class.remote);
+        errors += usize::from(class.error);
+    }
+    let status = format!(
+        "{} | Filter: {} | {matched}/{} entries | rows {}-{end}/{}",
+        if app.log_view.follow {
+            "LIVE"
+        } else {
+            "PAUSED"
+        },
+        app.log_view.filter.label(),
         app.logs.len(),
-        rx_count,
-        tx_count,
-        remote_count
-    ))
-    .style(Style::default().fg(COLOR_DIM))
-    .wrap(Wrap { trim: true })
-    .block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(COLOR_BORDER)),
+        if end > start { start + 1 } else { 0 },
+        rows.len(),
     );
+    let summary = Paragraph::new(vec![
+        Line::styled(
+            status,
+            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Line::from(format!(
+            "RX {rx} | TX {tx} | Remote {remote} | Errors {errors}"
+        )),
+        Line::from("Up/Down PgUp/PgDn browse | Home newest (paused)"),
+        Line::from("End live | f filter | c clear local | F1/? help"),
+        Line::from("Newest first. RX/TX are data, not RF."),
+    ])
+    .style(Style::default().fg(COLOR_DIM))
+    .wrap(Wrap { trim: false });
     f.render_widget(summary, chunks[0]);
 
-    let hero = Paragraph::new(vec![
-        Line::from(Span::styled(
-            "Activity Logs",
-            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            if compact {
-                "Recent traffic with faster visual scanning."
+    let empty = rows.is_empty();
+    let lines: Vec<Line> = if empty {
+        vec![Line::styled(
+            if app.logs.is_empty() {
+                "No activity logged yet. Local history is empty.".to_string()
             } else {
-                "A cleaner readout of recent traffic so protocol activity is easier to scan quickly."
+                format!(
+                    "No {} entries match. Press f to change filter.",
+                    app.log_view.filter.label()
+                )
             },
             Style::default().fg(COLOR_DIM),
-        )),
-        Line::from(vec![
-            metric_chip("RX", rx_count.to_string(), COLOR_PRIMARY),
-            Span::raw(" "),
-            metric_chip("TX", tx_count.to_string(), COLOR_SECONDARY),
-            Span::raw(" "),
-            metric_chip("REMOTE", remote_count.to_string(), COLOR_WARNING),
-        ]),
-    ])
-    .style(Style::default().bg(COLOR_SURFACE_1))
-    .wrap(Wrap { trim: true })
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(COLOR_BORDER))
-            .bg(COLOR_SURFACE_1),
-    );
-    f.render_widget(hero, chunks[1]);
-
-    let body = if chunks[2].width < 110 {
-        None
+        )]
     } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
-            .split(chunks[2])
-            .into()
-    };
-
-    let logs: Vec<ListItem> = if app.logs.is_empty() {
-        vec![ListItem::new("No activity logged yet").style(Style::default().fg(COLOR_DIM))]
-    } else {
-        app.logs
-            .iter()
-            .rev()
-            .map(|line| {
-                let style = if line.contains("TX:") {
-                    Style::default().fg(COLOR_SECONDARY)
-                } else if line.contains("RX:") {
-                    Style::default().fg(COLOR_PRIMARY)
-                } else if line.contains("REMOTE:") {
-                    Style::default().fg(COLOR_WARNING)
+        rows.into_iter()
+            .skip(start)
+            .take(page_rows)
+            .map(|(line, class)| {
+                let color = if class.tx {
+                    COLOR_SECONDARY
+                } else if class.rx {
+                    COLOR_PRIMARY
+                } else if class.error {
+                    COLOR_ERROR
+                } else if class.remote {
+                    COLOR_WARNING
                 } else {
-                    Style::default().fg(COLOR_TEXT)
+                    COLOR_TEXT
                 };
-                ListItem::new(line.as_str()).style(style)
+                Line::styled(line, Style::default().fg(color))
             })
             .collect()
     };
-
-    let list = List::new(logs).block(
+    let mut list = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Recent Activity ")
+            .title(" Recent Activity | Newest First ")
             .border_style(Style::default().fg(COLOR_BORDER))
-            .bg(COLOR_SURFACE_1),
+            .style(Style::default().bg(COLOR_SURFACE_1)),
     );
-
-    if let Some(body) = body {
-        let insight = Paragraph::new(vec![
-            detail_row("Latest", latest_log(app).unwrap_or("No activity yet")),
-            detail_row(
-                "Bus",
-                if rx_count + tx_count > 0 {
-                    "Traffic present"
-                } else {
-                    "Idle"
-                },
-            ),
-            detail_row("Remote", if remote_count > 0 { "Seen" } else { "None" }),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Newest entries stay at the top so bursts are easier to follow.",
-                Style::default().fg(COLOR_DIM),
-            )),
-        ])
-        .style(Style::default().bg(COLOR_SURFACE_1))
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Insight ")
-                .border_style(Style::default().fg(COLOR_BORDER))
-                .bg(COLOR_SURFACE_1),
-        );
-        f.render_widget(insight, body[0]);
-        f.render_widget(list, body[1]);
-    } else {
-        f.render_widget(list, chunks[2]);
+    if empty {
+        list = list.wrap(Wrap { trim: false });
     }
-}
-
-fn metric_chip(
-    label: impl Into<String>,
-    value: impl Into<String>,
-    color: ratatui::style::Color,
-) -> Span<'static> {
-    let label = label.into();
-    let value = value.into();
-    Span::styled(
-        format!(" {label} {value} "),
-        Style::default()
-            .fg(crate::ui::theme::COLOR_SURFACE_0)
-            .bg(color)
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
-fn detail_row(label: impl Into<String>, value: impl Into<String>) -> Line<'static> {
-    let label = label.into();
-    let value = value.into();
-    Line::from(vec![
-        Span::styled(
-            format!("{label:<8}"),
-            Style::default()
-                .fg(COLOR_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(value, Style::default().fg(COLOR_TEXT)),
-    ])
-}
-
-fn latest_log(app: &App) -> Option<&str> {
-    app.logs.back().map(|line| line.as_str())
+    f.render_widget(list, chunks[1]);
 }

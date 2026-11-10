@@ -46,15 +46,20 @@ fn nictui(args: &[&str]) -> Command {
 }
 
 fn bounded_output(mut command: Command, close_stdout: bool) -> Output {
+    let stdout = if close_stdout {
+        let (reader, writer) = std::io::pipe().unwrap();
+        // Close before spawn: a short replay can finish before a later parent-side close.
+        drop(reader);
+        Stdio::from(writer)
+    } else {
+        Stdio::piped()
+    };
     let mut child = command
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(stdout)
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    if close_stdout {
-        drop(child.stdout.take());
-    }
     let started = Instant::now();
     while child.try_wait().unwrap().is_none() {
         if started.elapsed() > Duration::from_secs(5) {
@@ -320,7 +325,10 @@ fn unread_or_broken_output_stops_within_a_bounded_deadline() {
         assert!(!output.status.success(), "{output:?}");
         assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
     }
-    let input = dir.input(&[0x11]);
-    let output = bounded_output(replay(&input, true), true);
-    assert!(!output.status.success(), "{output:?}");
+    for bytes in [&[][..], &[0x11][..]] {
+        let input = dir.input(bytes);
+        let output = bounded_output(replay(&input, true), true);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+    }
 }

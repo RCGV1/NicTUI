@@ -1,5 +1,5 @@
 //! Persistent, ordered radio display rendering. Wire coordinates are native 128x128 pixels.
-//! Glyphs are independent approximations, not the programmer's font assets.
+//! Glyphs are independent approximations unless user-owned source fonts are imported.
 //! The programmer's 16x16 protocol icons are reduced to native 8x8 cells.
 
 use crate::protocol::RemotePacket;
@@ -10,7 +10,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     widgets::Widget,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::{io::Read, path::Path, sync::Arc};
 
 pub const DISPLAY_WIDTH: usize = 128;
 pub const DISPLAY_HEIGHT: usize = 128;
@@ -18,12 +19,160 @@ const BLACK: Color = Color::Rgb(0, 0, 0);
 
 #[derive(Clone, Debug)]
 pub struct RadioDisplay {
+    fonts: Option<Arc<NativeFonts>>,
+    font_error: Option<String>,
+    font_gaps: BTreeSet<String>,
+    meter_context: Option<(u8, bool, u16)>,
+    native_frame: bool,
     pixels: Vec<Color>,
     text_pixels: Vec<bool>,
     smooth_pixels: Vec<bool>,
     decimal_pixels: Vec<bool>,
     signal_bar_y: usize,
     text: Vec<TextGlyph>,
+}
+
+/// User-owned assets for source revision 8612904 (2.52.18), never bundled.
+#[derive(Clone, Debug)]
+struct NativeFonts {
+    rom: Vec<u8>,
+    tables: Vec<Vec<u8>>,
+}
+
+impl NativeFonts {
+    fn read(path: &Path, limit: usize) -> anyhow::Result<Vec<u8>> {
+        let metadata = std::fs::metadata(path)?;
+        anyhow::ensure!(metadata.is_file(), "asset must be a regular file");
+        anyhow::ensure!(metadata.len() <= limit as u64, "asset exceeds size limit");
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The path can become a FIFO after the preflight metadata check.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        anyhow::ensure!(metadata.is_file(), "asset must be a regular file");
+        anyhow::ensure!(metadata.len() <= limit as u64, "asset exceeds size limit");
+        let mut bytes = Vec::new();
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        anyhow::ensure!(bytes.len() <= limit, "asset exceeds size limit");
+        Ok(bytes)
+    }
+
+    fn load(source: &Path, rom: &Path) -> anyhow::Result<Self> {
+        fn fingerprint(bytes: &[u8]) -> u64 {
+            bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            })
+        }
+        let header = if source.is_file() {
+            source.to_path_buf()
+        } else if source.join("font/font.h").is_file() {
+            source.join("font/font.h")
+        } else {
+            source.join("font.h")
+        };
+        let header = String::from_utf8(Self::read(&header, 1024 * 1024)?)?.replace("\r\n", "\n");
+        // FNV fingerprints identify these exact local inputs; not a security hash.
+        anyhow::ensure!(
+            fingerprint(header.as_bytes()) == 0xc796ce6672ed68c1,
+            "font.h does not match the 2.52.18 source baseline"
+        );
+        let rom = Self::read(rom, 2_096_640)?;
+        anyhow::ensure!(
+            rom.len() == 2_096_640 && fingerprint(&rom) == 0x2a2fe66b71fcc2be,
+            "font ROM does not match the calibrated source dump"
+        );
+        let mut tables = Vec::new();
+        for (name, size) in [
+            ("customSymbols", 136),
+            ("hugeFontNumbers", 320),
+            ("hugeUpperLetters", 832),
+            ("hugeLowerLetters", 832),
+            ("largeFontNumbers", 160),
+        ] {
+            // Only parse literal bytes from the already fingerprinted header.
+            let body = header
+                .split_once(name)
+                .and_then(|(_, rest)| rest.split_once('{'))
+                .and_then(|(_, rest)| rest.split_once('}'))
+                .map(|(body, _)| body)
+                .ok_or_else(|| anyhow::anyhow!("missing font table {name}"))?;
+            let body = body
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let bytes = body
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    u8::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            anyhow::ensure!(bytes.len() == size, "invalid {name} length");
+            tables.push(bytes);
+        }
+        Ok(Self { rom, tables })
+    }
+
+    fn glyph(&self, font: u8, ch: char) -> Option<(usize, usize, usize, Vec<bool>)> {
+        let &(base, width, height) =
+            [(0x3bfbe, 6, 8), (0x66bf, 8, 8), (0x3b7bf, 8, 16)].get(usize::from(font & 0x7f))?;
+        let scale = if font & 0x80 != 0 { 2 } else { 1 };
+        let huge = if scale == 2 {
+            match ch {
+                '0'..='9' => Some((1, ch as usize - '0' as usize)),
+                'A'..='Z' => Some((2, ch as usize - 'A' as usize)),
+                'a'..='z' => Some((3, ch as usize - 'a' as usize)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let (w, h, bytes, columns16, pixel_scale) = if let Some((table, index)) = huge {
+            (
+                16,
+                16,
+                &self.tables[table][index * 32..index * 32 + 32],
+                true,
+                1,
+            )
+        } else if (' '..='~').contains(&ch) {
+            let bytes = if height == 16 && ch.is_ascii_digit() {
+                let index = (ch as usize - '0' as usize) * 16;
+                &self.tables[4][index..index + 16]
+            } else {
+                let index = base + (ch as usize - 32) * height;
+                &self.rom[index..index + height]
+            };
+            (width, height, bytes, false, scale)
+        } else {
+            return None;
+        };
+        let mut ink = vec![false; w * h * pixel_scale * pixel_scale];
+        for y in 0..h * pixel_scale {
+            for x in 0..w * pixel_scale {
+                let (sx, sy) = (x / pixel_scale, y / pixel_scale);
+                let index = if columns16 {
+                    sx * 2 + sy / 8
+                } else {
+                    sy / 8 * 8 + sx
+                };
+                ink[y * w * pixel_scale + x] = bytes[index] & (1 << (sy % 8)) != 0;
+            }
+        }
+        Some((
+            w * pixel_scale,
+            h * pixel_scale,
+            if columns16 { 16 } else { 8 * pixel_scale },
+            ink,
+        ))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +207,25 @@ struct TextRaster {
 }
 
 impl TextRaster {
+    fn ink_size(glyph: &TextGlyph, columns: usize) -> Option<(usize, usize)> {
+        if glyph.height != 16 || !(63..96).contains(&columns) {
+            return None;
+        }
+        let cell_width =
+            (glyph.x + glyph.width) * columns / DISPLAY_WIDTH - glyph.x * columns / DISPLAY_WIDTH;
+        let native_scale = if glyph.width == 16 { 3 } else { 2 };
+        let budget = cell_width.checked_sub(if glyph.width == 16 { 3 } else { 1 })?;
+        let mut width = (3 * native_scale * columns + DISPLAY_WIDTH / 2) / DISPLAY_WIDTH;
+        let mut height = (5 * native_scale * columns + DISPLAY_HEIGHT / 2) / DISPLAY_HEIGHT;
+        if width > budget {
+            width = budget;
+            height = (5 * budget + 1) / 3;
+        }
+        let baseline =
+            (glyph.y + 14) * columns / DISPLAY_HEIGHT - glyph.y * columns / DISPLAY_HEIGHT;
+        (width >= 3 && height <= baseline + 1).then_some((width, height))
+    }
+
     fn new(glyphs: &[&TextGlyph], columns: usize) -> Option<Self> {
         let first = glyphs[0];
         if first.height != 16 || !(63..96).contains(&columns) {
@@ -79,21 +247,7 @@ impl TextRaster {
             let x = glyph.x * columns / DISPLAY_WIDTH - left;
             let cell_width = (glyph.x + glyph.width) * columns / DISPLAY_WIDTH - left - x;
             {
-                // Clip/advance and ink are separate, as in the programmer's
-                // point-sized font drawing. All tall glyphs share one scale.
-                let native_scale = if glyph.width == 16 { 3 } else { 2 };
-                let budget = cell_width.checked_sub(if glyph.width == 16 { 3 } else { 1 })?;
-                let mut ink_width =
-                    (3 * native_scale * columns + DISPLAY_WIDTH / 2) / DISPLAY_WIDTH;
-                let mut ink_height =
-                    (5 * native_scale * columns + DISPLAY_HEIGHT / 2) / DISPLAY_HEIGHT;
-                if ink_width > budget {
-                    ink_width = budget;
-                    ink_height = (5 * budget + 1) / 3;
-                }
-                if ink_width < 3 || ink_height > baseline + 1 {
-                    return None;
-                }
+                let (ink_width, ink_height) = Self::ink_size(glyph, columns)?;
                 let ink_top = phase + baseline + 1 - ink_height;
                 let bits = tall_rows(glyph.ch);
                 for y in 0..ink_height {
@@ -114,6 +268,11 @@ impl TextRaster {
 impl Default for RadioDisplay {
     fn default() -> Self {
         Self {
+            fonts: None,
+            font_error: None,
+            font_gaps: BTreeSet::new(),
+            meter_context: None,
+            native_frame: false,
             pixels: vec![BLACK; DISPLAY_WIDTH * DISPLAY_HEIGHT],
             text_pixels: vec![false; DISPLAY_WIDTH * DISPLAY_HEIGHT],
             smooth_pixels: vec![false; DISPLAY_WIDTH * DISPLAY_HEIGHT],
@@ -125,7 +284,94 @@ impl Default for RadioDisplay {
 }
 
 impl RadioDisplay {
+    /// Load local source fonts explicitly. No files are downloaded or embedded.
+    pub fn with_native_fonts(source: &Path, rom: &Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            fonts: Some(Arc::new(NativeFonts::load(source, rom)?)),
+            ..Self::default()
+        })
+    }
+
+    pub fn uses_native_fonts(&self) -> bool {
+        self.fonts.is_some()
+    }
+
+    /// New black framebuffer retaining explicitly configured assets and meter
+    /// settings. Session resets can discard pixels without re-reading local files.
+    pub fn blank_with_configuration(&self) -> Self {
+        Self {
+            fonts: self.fonts.clone(),
+            font_error: self.font_error.clone(),
+            meter_context: self.meter_context,
+            ..Self::default()
+        }
+    }
+
+    pub fn native_font_coverage_complete(&self) -> bool {
+        self.fonts.is_some() && self.font_gaps.is_empty()
+    }
+
+    /// Explicit session-start import of the optional NicFWSim environment assets.
+    /// Call before applying any packets. Packet rendering never reads files or env.
+    /// Errors remain available through `font_error` rather than silently claiming
+    /// native font coverage. Callers should opt in only for configured sessions.
+    pub fn load_environment_fonts(&mut self) {
+        if self.fonts.is_some() || self.font_error.is_some() {
+            return;
+        }
+        let source = std::env::var_os("NICFW_SOURCE");
+        let rom = std::env::var_os("NICFW_FONT_ROM");
+        match (source, rom) {
+            (Some(source), Some(rom)) => {
+                match NativeFonts::load(Path::new(&source), Path::new(&rom)) {
+                    Ok(fonts) => self.fonts = Some(Arc::new(fonts)),
+                    Err(error) => self.font_error = Some(error.to_string()),
+                }
+            }
+            (None, None) => {}
+            _ => self.font_error = Some("Provide both NICFW_SOURCE and NICFW_FONT_ROM".into()),
+        }
+    }
+
+    pub fn font_error(&self) -> Option<&str> {
+        self.font_error.as_deref()
+    }
+
+    /// Telemetry omits these settings. Supply known source settings, not guesses.
+    /// Style: 0 segmented, 1 stepped, 2 solid. Without context meters approximate.
+    pub fn set_meter_context(&mut self, style: u8, fm_tuner: bool, background: u16) {
+        self.meter_context = Some((style, fm_tuner, background));
+    }
+
+    pub fn has_meter_context(&self) -> bool {
+        self.meter_context.is_some()
+    }
+
+    pub fn has_native_frame(&self) -> bool {
+        self.native_frame
+    }
+
+    /// Replace the complete LCD with a validated local simulator snapshot.
+    pub fn set_native_frame(&mut self, pixels: &[u16]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            pixels.len() == DISPLAY_WIDTH * DISPLAY_HEIGHT,
+            "LCD must contain 128x128 pixels"
+        );
+        self.clear();
+        for (pixel, word) in self.pixels.iter_mut().zip(pixels) {
+            *pixel = wire_color(*word);
+        }
+        self.native_frame = true;
+        Ok(())
+    }
+
+    pub fn release_native_frame(&mut self) {
+        self.native_frame = false;
+    }
+
     pub fn clear(&mut self) {
+        self.native_frame = false;
+        self.font_gaps.clear();
         self.pixels.fill(BLACK);
         self.text_pixels.fill(false);
         self.smooth_pixels.fill(false);
@@ -153,6 +399,9 @@ impl RadioDisplay {
                 height,
                 color,
             } => {
+                if u16::from(*width) * u16::from(*height) >= 0x8000 {
+                    return;
+                }
                 // The live frequency protocol adds its decimal in the padding of
                 // the last double-width MHz cell, before the narrow fraction.
                 let decimal = self
@@ -215,23 +464,66 @@ impl RadioDisplay {
                 bg_color,
                 text,
             } => {
-                let slot = if *font_size == 129 { 3 } else { *font_size & 3 };
-                let (width, height) = [(6, 8), (8, 8), (8, 16), (16, 16)][slot as usize];
+                let slot = *font_size & 3;
+                let (base_width, base_height) = [(6, 8), (8, 8), (8, 16), (16, 16)][slot as usize];
+                let scale = if *font_size & 0x80 != 0 { 2 } else { 1 };
+                let advance = base_width * scale;
                 let mut x = *x as usize;
-                for ch in text.chars().take_while(|ch| *ch != '\0') {
+                for ch in text.chars().take(21).take_while(|ch| *ch != '\0') {
+                    let ch = if ch == '@' { ' ' } else { ch };
+                    if let Some(fonts) = &self.fonts {
+                        let advance = [6, 8, 8]
+                            .get(usize::from(*font_size & 0x7f))
+                            .copied()
+                            .unwrap_or(0)
+                            * if *font_size & 0x80 != 0 { 2 } else { 1 };
+                        if let Some((w, h, page, ink)) = fonts.glyph(*font_size, ch) {
+                            for offset in (0..h).step_by(page) {
+                                self.fill(
+                                    x,
+                                    usize::from(y.wrapping_add(offset as u8)),
+                                    w,
+                                    page,
+                                    wire_color(*bg_color),
+                                );
+                            }
+                            for dy in 0..h {
+                                for dx in 0..w {
+                                    if ink[dy * w + dx] {
+                                        self.paint_pixel(
+                                            x + dx,
+                                            usize::from(y.wrapping_add((dy / page * page) as u8))
+                                                + dy % page,
+                                            wire_color(*fg_color),
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            self.font_gaps
+                                .insert(format!("font:{font_size}:U+{:04X}", ch as u32));
+                        }
+                        x = (x + advance) & 255;
+                        continue;
+                    }
                     if x >= DISPLAY_WIDTH {
                         break;
                     }
+                    let (width, height) = if scale == 2 && ch.is_ascii_alphanumeric() {
+                        (16, 16)
+                    } else {
+                        (advance, base_height * scale)
+                    };
                     self.glyph(
                         x,
                         *y as usize,
                         width,
                         height,
-                        if ch == '@' { ' ' } else { ch },
+                        ch,
                         wire_color(*fg_color),
                         wire_color(*bg_color),
                     );
-                    x += width;
+                    x = (x + advance) & 255;
                 }
             }
             RemotePacket::DrawSymbol {
@@ -241,6 +533,34 @@ impl RadioDisplay {
                 fg_color,
                 bg_color,
             } => {
+                if let Some(fonts) = &self.fonts {
+                    if let Some(bytes) = fonts.tables[0]
+                        .get(usize::from(*symbol_id) * 8..usize::from(*symbol_id) * 8 + 8)
+                    {
+                        let bytes = bytes.to_vec();
+                        self.fill(
+                            usize::from(*x),
+                            usize::from(*y),
+                            8,
+                            8,
+                            wire_color(*bg_color),
+                        );
+                        for (dx, byte) in bytes.iter().enumerate() {
+                            for dy in 0..8 {
+                                if byte & (1 << dy) != 0 {
+                                    self.paint_pixel(
+                                        usize::from(*x) + dx,
+                                        usize::from(*y) + dy,
+                                        wire_color(*fg_color),
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        self.font_gaps.insert(format!("symbol:{symbol_id}"));
+                    }
+                    return;
+                }
                 if let Some(rows) = SYMBOL_ROWS.get(*symbol_id as usize) {
                     self.fill(*x as usize, *y as usize, 8, 8, wire_color(*bg_color));
                     for dy in 0..8 {
@@ -260,6 +580,38 @@ impl RadioDisplay {
             }
             RemotePacket::SignalBarPos { y, .. } => self.signal_bar_y = *y as usize,
             RemotePacket::SignalStrength { strength, mode, .. } => {
+                if let Some((style, fm_tuner, _)) = self.meter_context {
+                    let rx = mode & 1 == 0;
+                    let level = if rx {
+                        (usize::from(*strength) * 27) >> 4
+                    } else {
+                        usize::from(*strength)
+                    };
+                    for i in (0..120).step_by(2) {
+                        let color = if i >= level {
+                            0x8210
+                        } else if rx {
+                            i.min(31) as u16
+                                | ((if i < 90 { 61 } else { 240 - 2 * i }) as u16) << 5
+                                | if fm_tuner { 16 << 11 } else { 0 }
+                        } else {
+                            0x001f
+                        };
+                        let short = style == 1 && (i / 2 + 1) % 5 != 0;
+                        self.fill(
+                            i + 4,
+                            usize::from((self.signal_bar_y as u8).wrapping_add(if short {
+                                3
+                            } else {
+                                0
+                            })),
+                            if style == 2 { 2 } else { 1 },
+                            if short { 3 } else { 6 },
+                            wire_color(color),
+                        );
+                    }
+                    return;
+                }
                 let level = ((*strength as usize * 27) >> 4).min(120);
                 let active = if *mode == 0 {
                     Color::Rgb(50, 205, 50)
@@ -282,6 +634,23 @@ impl RadioDisplay {
             }
             RemotePacket::NoiseLevel { level, mode } => {
                 let level = (*level as usize).min(120);
+                if let Some((_, _, background)) = self.meter_context {
+                    self.fill(
+                        4,
+                        usize::from((self.signal_bar_y as u8).wrapping_add(7)),
+                        level,
+                        1,
+                        wire_color(if *mode == 0 { 0xf9ad } else { 0x07e0 }),
+                    );
+                    self.fill(
+                        level,
+                        usize::from((self.signal_bar_y as u8).wrapping_add(7)),
+                        120 - level,
+                        1,
+                        wire_color(background),
+                    );
+                    return;
+                }
                 let color = if *mode == 0 {
                     Color::Rgb(90, 90, 255)
                 } else {
@@ -401,7 +770,8 @@ impl RadioDisplay {
                     .fill(!narrow_grid);
             }
         }
-        if x + width <= DISPLAY_WIDTH && y + height <= DISPLAY_HEIGHT {
+        if width <= 16 && height <= 16 && x + width <= DISPLAY_WIDTH && y + height <= DISPLAY_HEIGHT
+        {
             let mut remaining = [0; 16];
             remaining[..height].fill(u16::MAX >> (16 - width));
             self.text.push(TextGlyph {
@@ -481,14 +851,32 @@ impl Widget for &RadioDisplay {
                 buffer[(x, y)].set_bg(BLACK);
             }
         }
-        let columns = usize::from(area.width).min(usize::from(area.height) * 2);
+        let capacity = usize::from(area.width).min(usize::from(area.height) * 2);
+        let native_pixels = self.native_frame || self.fonts.is_some();
+        let columns = if native_pixels && capacity >= DISPLAY_WIDTH {
+            capacity / DISPLAY_WIDTH * DISPLAY_WIDTH
+        } else {
+            capacity
+        };
         if columns == 0 {
             return;
         }
         let rows = columns.div_ceil(2);
         let left = area.x + (area.width - columns as u16) / 2;
         let top = area.y + (area.height - rows as u16) / 2;
-        let mut glyphs: Vec<_> = self.text.iter().collect();
+        // A frame containing double-width source text uses one raster for ALL
+        // labels and graphics. Mixing terminal labels into that frame changes
+        // their physical font scale even when the frequency itself stays raster.
+        let raster_frame = native_pixels
+            || self
+                .text
+                .iter()
+                .any(|glyph| glyph.width == 16 && glyph.height == 16);
+        let mut glyphs: Vec<_> = if raster_frame {
+            Vec::new()
+        } else {
+            self.text.iter().collect()
+        };
         glyphs.sort_by_key(|glyph| (glyph.y, glyph.x));
         // Connected cells form a region even across packet/color/font-width
         // boundaries. A damaged label cannot turn into a semantic suffix, but an
@@ -515,7 +903,7 @@ impl Widget for &RadioDisplay {
             // resolution. Four raster columns cannot represent 5x7 menu letters.
             let narrow_grid =
                 glyph.height == 16 && (glyph.ch.is_ascii_digit() || matches!(glyph.ch, '.' | '-'));
-            region.2 |= glyph.height < 16
+            region.2 |= (glyph.height < 16 && columns < 128)
                 || if narrow_grid {
                     glyph.width * columns / DISPLAY_WIDTH < 4
                         || glyph.height * columns / DISPLAY_HEIGHT < 5
@@ -536,6 +924,35 @@ impl Widget for &RadioDisplay {
             .collect();
         for (start, _, needs_text) in &mut regions {
             *needs_text |= compact_rows.contains(&(glyphs[*start].y, glyphs[*start].height));
+        }
+        // Fractional cell advances can leave one glyph with fewer raster columns
+        // than its neighbors. Choose a projection for the whole font row, not
+        // independently for a label and its value.
+        let mut semantic_rows = BTreeSet::new();
+        let mut ink_sizes = BTreeMap::new();
+        if columns < 96 {
+            for glyph in glyphs
+                .iter()
+                .filter(|glyph| glyph.intact && glyph.height == 16)
+            {
+                let row = (glyph.y, glyph.height);
+                if let Some(size) = TextRaster::ink_size(glyph, columns) {
+                    // Compare within a font slot: mixed-width frequency fonts
+                    // intentionally differ, but fractional rounding must not
+                    // give adjacent same-font digits different ink scales.
+                    if ink_sizes
+                        .insert((row, glyph.width), size)
+                        .is_some_and(|old| old != size)
+                    {
+                        semantic_rows.insert(row);
+                    }
+                } else {
+                    semantic_rows.insert(row);
+                }
+            }
+        }
+        for (start, _, needs_text) in &mut regions {
+            *needs_text |= semantic_rows.contains(&(glyphs[*start].y, glyphs[*start].height));
         }
         let mut compact = Vec::new();
         let mut index = 0;
@@ -560,7 +977,11 @@ impl Widget for &RadioDisplay {
                 end += 1;
             }
             let run = &glyphs[index..end];
-            let raster = TextRaster::new(run, columns);
+            let raster = if semantic_rows.contains(&(first.y, first.height)) {
+                None
+            } else {
+                TextRaster::new(run, columns)
+            };
             if regions[region].1 && (regions[region].2 || raster.is_some()) {
                 let mut text = String::new();
                 for glyph in run {
@@ -725,6 +1146,14 @@ impl Widget for &RadioDisplay {
                     }
                 }
             }
+            if native_pixels {
+                // The imported LCD is a discrete pixel grid. Interpolating its
+                // palette creates faint duplicate edges around every glyph.
+                let x = ((column * 2 + 1) * DISPLAY_WIDTH / (columns * 2)).min(DISPLAY_WIDTH - 1);
+                let y =
+                    ((pixel_row * 2 + 1) * DISPLAY_HEIGHT / (columns * 2)).min(DISPLAY_HEIGHT - 1);
+                return graphics[y * DISPLAY_WIDTH + x];
+            }
             let text_sample = (y0..y1).any(|y| {
                 (x0..x1).any(|x| {
                     self.text_pixels[y * DISPLAY_WIDTH + x] && !substituted[y * DISPLAY_WIDTH + x]
@@ -788,10 +1217,16 @@ impl Widget for &RadioDisplay {
             for col in 0..columns {
                 let fg = sample(col, row * 2);
                 let bg = sample(col, row * 2 + 1);
-                buffer[(left + col as u16, top + row as u16)]
-                    .set_symbol("▀")
-                    .set_fg(fg)
-                    .set_bg(bg);
+                let cell = &mut buffer[(left + col as u16, top + row as u16)];
+                if native_pixels {
+                    // Solid areas use background fills, independent of the
+                    // terminal font's block-glyph leading and antialiasing.
+                    cell.set_symbol(if fg == bg { " " } else { "▀" })
+                        .set_fg(fg)
+                        .set_bg(bg);
+                } else {
+                    cell.set_symbol("▀").set_fg(fg).set_bg(bg);
+                }
             }
         }
         for run in compact {
@@ -1192,11 +1627,13 @@ mod tests {
 
     fn half_pixel(buffer: &Buffer, x: usize, y: usize) -> Color {
         let cell = &buffer[(x as u16, (y / 2) as u16)];
-        assert_eq!(cell.symbol(), "▀");
-        if y.is_multiple_of(2) {
-            cell.fg
-        } else {
-            cell.bg
+        match cell.symbol() {
+            " " => cell.bg,
+            "▄" if y.is_multiple_of(2) => cell.bg,
+            "▄" => cell.fg,
+            "▀" if y.is_multiple_of(2) => cell.fg,
+            "▀" => cell.bg,
+            other => panic!("unexpected LCD glyph {other:?}"),
         }
     }
 
@@ -1210,8 +1647,13 @@ mod tests {
         for columns in [24_u16, 32, 33, 34, 57, 58, 59, 62] {
             let buffer = rendered(&display, columns, columns.div_ceil(2));
             let content = buffer_text(&buffer);
-            assert!(content.contains("162.55000"), "{columns}: {content}");
-            assert!(content.contains("453.47500"), "{columns}: {content}");
+            assert!(
+                !content.chars().any(|ch| ch.is_ascii_digit()),
+                "{columns}: {content}"
+            );
+            let mut native_only = display.clone();
+            native_only.text.clear();
+            assert_eq!(buffer, rendered(&native_only, columns, columns.div_ceil(2)));
         }
     }
 
@@ -1265,14 +1707,10 @@ mod tests {
             let mut native_only = black.clone();
             native_only.text.clear();
             let native = rendered(&native_only, columns, columns.div_ceil(2));
-            if columns < 96 {
-                assert!(
-                    black_buffer != native,
-                    "medium size must use snapped glyphs"
-                );
-            } else {
-                assert_eq!(black_buffer, native);
-            }
+            assert_eq!(
+                black_buffer, native,
+                "frequency projection must retain source geometry"
+            );
         }
     }
 
@@ -1335,11 +1773,7 @@ mod tests {
                 let with_dot = rendered(&display, columns, columns.div_ceil(2));
                 let without_dot = rendered(&erased, columns, columns.div_ceil(2));
                 let scale = usize::from(columns);
-                let (x, y) = if columns < 96 {
-                    (87 * scale / 128 - 2, (41 + 14) * scale / 128)
-                } else {
-                    (85 * scale / 128, 54 * scale / 128)
-                };
+                let (x, y) = (85 * scale / 128, 54 * scale / 128);
                 assert_eq!(half_pixel(&with_dot, x, y), ink, "{columns}, bg {bg:#x}");
                 assert_ne!(
                     half_pixel(&without_dot, x, y),
@@ -1587,6 +2021,12 @@ mod tests {
     fn rectangles_clip_without_wrapping_or_clamping_origins() {
         let mut display = RadioDisplay::default();
         display.apply(&rect(127, 127, 255, 255, 0x001f));
+        assert_eq!(
+            display.pixel(127, 127),
+            BLACK,
+            "source suppresses fills with count high bit set"
+        );
+        display.apply(&rect(127, 127, 127, 127, 0x001f));
         assert_eq!(display.pixel(127, 127), wire_color(0x001f));
         assert_eq!(display.pixel(126, 127), BLACK);
         display.apply(&rect(255, 255, 255, 255, 0xffff));
@@ -1618,7 +2058,8 @@ mod tests {
             (2, 8, 16),
             (3, 16, 16),
             (129, 16, 16),
-            (130, 8, 16),
+            (128, 12, 16),
+            (130, 16, 32),
         ] {
             let mut display = RadioDisplay::default();
             display.apply(&text(slot, 3, 4, "  "));
@@ -1738,5 +2179,296 @@ mod tests {
         assert_eq!(display.pixel(4, 16), BLACK);
         assert_eq!(display.pixel(123, 16), BLACK);
         assert_eq!(display.pixel(127, 16), Color::Rgb(50, 205, 50));
+    }
+
+    #[test]
+    fn source_meter_context_preserves_styles_palette_and_noise_draw_order() {
+        for style in 0..=2 {
+            let mut display = RadioDisplay::default();
+            assert!(!display.has_meter_context());
+            display.set_meter_context(style, false, 0x1234);
+            display.apply(&RemotePacket::SignalBarPos { y: 11, aux: 0 });
+            display.apply(&RemotePacket::SignalStrength {
+                strength: 5,
+                mode: 0,
+                battery: 0,
+            });
+            assert_eq!(display.pixel(4, 14), wire_color(0x07a0));
+            assert_eq!(
+                display.pixel(4, 11),
+                if style == 1 {
+                    BLACK
+                } else {
+                    wire_color(0x07a0)
+                }
+            );
+            assert_eq!(
+                display.pixel(5, 14),
+                if style == 2 {
+                    wire_color(0x07a0)
+                } else {
+                    BLACK
+                }
+            );
+            assert_eq!(display.pixel(12, 11), wire_color(0x8210));
+            display.apply(&RemotePacket::NoiseLevel { level: 5, mode: 0 });
+            assert_eq!(display.pixel(4, 18), wire_color(0xf9ad));
+            assert_eq!(display.pixel(5, 18), wire_color(0x1234));
+            display.apply(&RemotePacket::SignalStrength {
+                strength: 5,
+                mode: 1,
+                battery: 0,
+            });
+            assert_eq!(display.pixel(8, 14), wire_color(0x001f));
+            assert_eq!(display.pixel(10, 14), wire_color(0x8210));
+        }
+        let mut display = RadioDisplay::default();
+        display.set_meter_context(0, true, 0);
+        display.apply(&RemotePacket::SignalStrength {
+            strength: 5,
+            mode: 0,
+            battery: 0,
+        });
+        assert_eq!(display.pixel(4, 0), wire_color(0x87a0));
+    }
+
+    #[test]
+    fn missing_source_glyphs_are_reported_and_clear_resets_coverage() {
+        let mut display = RadioDisplay {
+            fonts: Some(Arc::new(NativeFonts {
+                rom: Vec::new(),
+                tables: vec![vec![0; 136]],
+            })),
+            ..RadioDisplay::default()
+        };
+        assert!(display.native_font_coverage_complete());
+        display.apply(&text(3, 0, 0, "unsupported"));
+        assert!(!display.native_font_coverage_complete());
+        display.clear();
+        assert!(display.native_font_coverage_complete());
+        display.apply(&RemotePacket::DrawSymbol {
+            symbol_id: 17,
+            x: 0,
+            y: 0,
+            fg_color: 0xffff,
+            bg_color: 0,
+        });
+        assert!(!display.native_font_coverage_complete());
+    }
+
+    #[test]
+    fn blank_session_keeps_explicit_configuration_but_no_pixels_or_glyph_damage() {
+        let mut display = RadioDisplay {
+            fonts: Some(Arc::new(NativeFonts {
+                rom: Vec::new(),
+                tables: Vec::new(),
+            })),
+            ..RadioDisplay::default()
+        };
+        display.set_meter_context(0, false, 0);
+        display.apply(&text(3, 0, 0, "unsupported"));
+        display.apply(&rect(0, 0, 128, 128, 0xffff));
+        let blank = display.blank_with_configuration();
+        assert!(blank.uses_native_fonts());
+        assert!(blank.native_font_coverage_complete());
+        assert!(blank.has_meter_context());
+        assert!(blank.pixels.iter().all(|pixel| *pixel == BLACK));
+        assert!(blank.text.is_empty());
+        assert!(Arc::ptr_eq(
+            blank.fonts.as_ref().unwrap(),
+            display.fonts.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_asset_reader_rejects_fifo_and_oversize_but_accepts_regular_symlinks() {
+        use std::{
+            os::unix::fs::symlink,
+            time::{Duration, SystemTime, UNIX_EPOCH},
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "nictui-native-assets-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let regular = directory.join("regular");
+        std::fs::write(&regular, b"owned fixture").unwrap();
+        let link = directory.join("link");
+        symlink(&regular, &link).unwrap();
+        assert_eq!(NativeFonts::read(&link, 4096).unwrap(), b"owned fixture");
+        let oversized = directory.join("oversized");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(4097)
+            .unwrap();
+        assert!(
+            NativeFonts::read(&oversized, 4096)
+                .unwrap_err()
+                .to_string()
+                .contains("size limit")
+        );
+        let fifo = directory.join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(NativeFonts::read(&fifo, 4096).map_err(|e| e.to_string()));
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("FIFO asset import blocked")
+                .unwrap_err()
+                .contains("regular file")
+        );
+    }
+
+    #[test]
+    fn native_projection_preserves_pixel_palette_and_integer_enlargement() {
+        let mut display = RadioDisplay {
+            fonts: Some(Arc::new(NativeFonts {
+                rom: Vec::new(),
+                tables: Vec::new(),
+            })),
+            ..RadioDisplay::default()
+        };
+        // Owned synthetic pixels exercise the native path without external assets.
+        for y in 0..128 {
+            for x in 0..128 {
+                display.pixels[y * 128 + x] =
+                    Color::Rgb((x * 2) as u8, (y * 2) as u8, ((x + y) % 256) as u8);
+            }
+        }
+        for (width, height) in [
+            (80, 24),
+            (120, 36),
+            (160, 48),
+            (200, 64),
+            (220, 80),
+            (300, 150),
+        ] {
+            let capacity = usize::from(width.min(height * 2));
+            let columns = if capacity >= 128 {
+                capacity / 128 * 128
+            } else {
+                capacity
+            };
+            let buffer = rendered(&display, width, height);
+            let left = (usize::from(width) - columns) / 2;
+            let top = (usize::from(height) - columns.div_ceil(2)) / 2;
+            for y in 0..columns {
+                for x in 0..columns {
+                    let actual = half_pixel(&buffer, left + x, top * 2 + y);
+                    let sx = (x * 2 + 1) * 128 / (columns * 2);
+                    let sy = (y * 2 + 1) * 128 / (columns * 2);
+                    assert_eq!(actual, display.pixel(sx, sy), "{width}x{height} at {x},{y}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_solid_panels_do_not_depend_on_block_glyph_coverage() {
+        let mut display = RadioDisplay {
+            fonts: Some(Arc::new(NativeFonts {
+                rom: Vec::new(),
+                tables: Vec::new(),
+            })),
+            ..RadioDisplay::default()
+        };
+        let area = Rect::new(0, 0, 128, 64);
+        let mut buffer = Buffer::empty(area);
+        let blue = Color::Rgb(16, 80, 168);
+        let white = Color::Rgb(248, 252, 248);
+        for (upper, lower) in [(blue, BLACK), (BLACK, blue), (white, blue)] {
+            for y in 0..128 {
+                display.pixels[y * 128..(y + 1) * 128].fill(if y % 2 == 0 { upper } else { lower });
+            }
+            Widget::render(&display, area, &mut buffer);
+            for cell in &buffer.content {
+                assert_eq!(cell.symbol(), "▀");
+                assert_eq!(cell.bg, lower);
+                assert_eq!(cell.fg, upper);
+            }
+            for solid in [blue, BLACK, white] {
+                display.pixels.fill(solid);
+                Widget::render(&display, area, &mut buffer);
+                for cell in &buffer.content {
+                    assert_eq!(cell.symbol(), " ");
+                    assert_eq!(cell.bg, solid);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn authoritative_native_frame_replaces_stale_drawing_and_resets_between_sessions() {
+        let mut display = RadioDisplay::default();
+        display.apply(&text(0, 0, 0, "stale"));
+        let pixels: Vec<u16> = (0..128 * 128).map(|index| index as u16).collect();
+        display.set_native_frame(&pixels).unwrap();
+        assert!(display.has_native_frame());
+        assert!(display.text.is_empty());
+        for (index, word) in pixels.iter().enumerate() {
+            assert_eq!(display.pixel(index % 128, index / 128), wire_color(*word));
+        }
+        assert!(display.set_native_frame(&[0; 12]).is_err());
+        assert!(display.has_native_frame());
+        assert!(!display.blank_with_configuration().has_native_frame());
+        display.release_native_frame();
+        assert!(!display.has_native_frame());
+        assert_eq!(display.pixel(127, 127), wire_color(*pixels.last().unwrap()));
+    }
+
+    #[test]
+    fn native_snapshot_projects_every_pixel_at_integer_scales_without_font_assets() {
+        let pixels: Vec<u16> = (0..128 * 128)
+            .map(|index| {
+                if index % 5 == 0 {
+                    0
+                } else {
+                    (index as u16).wrapping_mul(17)
+                }
+            })
+            .collect();
+        let mut display = RadioDisplay::default();
+        display.set_native_frame(&pixels).unwrap();
+        for (width, height) in [(128, 64), (135, 69), (300, 140)] {
+            let area = Rect::new(3, 2, width, height);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width + 6, height + 4));
+            Widget::render(&display, area, &mut buffer);
+            let scale = usize::from(width.min(height * 2)) / 128;
+            let columns = scale * 128;
+            let left = area.x + (width - columns as u16) / 2;
+            let top = area.y + (height - (columns / 2) as u16) / 2;
+            for y in 0..columns {
+                for x in 0..columns {
+                    let cell = &buffer[(left + x as u16, top + (y / 2) as u16)];
+                    let color = match cell.symbol() {
+                        " " => cell.bg,
+                        "▀" if y % 2 == 0 => cell.fg,
+                        "▀" => cell.bg,
+                        symbol => panic!("Unexpected native LCD glyph: {symbol}"),
+                    };
+                    assert_eq!(color, wire_color(pixels[y / scale * 128 + x / scale]));
+                }
+            }
+        }
     }
 }

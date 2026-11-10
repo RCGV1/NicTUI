@@ -60,6 +60,7 @@ impl App {
             KeyCode::Esc => {
                 self.editing_group_label_idx = None;
                 self.mode = AppMode::Main(MainTab::MemoryGroups);
+                self.status_message = "Group name edit cancelled".into();
             }
             KeyCode::Enter => self.commit_group_label_edit(),
             KeyCode::Char(c) => {

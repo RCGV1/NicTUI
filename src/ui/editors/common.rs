@@ -1,9 +1,9 @@
 use crate::ui::theme::*;
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
-    widgets::{Block, Borders, Clear, List, ListItem},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 pub(super) const CHANNEL_EDITOR_WIDTH: u16 = 84;
@@ -35,13 +35,44 @@ pub(super) fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
 
 pub(super) fn anchor_right_of(editor_area: Rect, popup_width: u16, popup_height: u16) -> Rect {
     let width = popup_width.min(editor_area.width.saturating_sub(2).max(1));
-    let height = popup_height.min(editor_area.height.saturating_sub(2).max(1));
+    // Leave the editor's save/cancel rows unobscured by long option lists.
+    let height = popup_height.min(editor_area.height.saturating_sub(4).max(1));
     Rect::new(
         editor_area.x + editor_area.width.saturating_sub(width + 1),
         editor_area.y + 1,
         width,
         height,
     )
+}
+
+pub(super) fn field_body(area: Rect, details_width: u16, fields_width: u16) -> [Rect; 2] {
+    let chunks = if area.width < details_width + fields_width {
+        Layout::vertical([Constraint::Length(4), Constraint::Min(4)]).split(area)
+    } else {
+        Layout::horizontal([
+            Constraint::Length(details_width),
+            Constraint::Min(fields_width),
+        ])
+        .split(area)
+    };
+    [chunks[0], chunks[1]]
+}
+
+pub(super) fn editor_footer<'a>(status: &'a str, error_prefix: &str) -> Paragraph<'a> {
+    let error = status.starts_with(error_prefix);
+    Paragraph::new(if error {
+        format!("{status}\nEnter: Save | Esc: Cancel")
+    } else {
+        match error_prefix {
+            "Invalid setting:" => "↑/↓: Option | Enter: Save | Esc: Cancel",
+            "Invalid DTMF:" => "↑/↓/Tab: Field | Enter: Save | Esc: Cancel",
+            _ => "↑/↓/Tab: Field | ←/→: Option | Enter: Save | Esc: Cancel",
+        }
+        .to_string()
+    })
+    .style(Style::default().fg(if error { COLOR_WARNING } else { COLOR_DIM }))
+    .alignment(ratatui::layout::Alignment::Center)
+    .wrap(Wrap { trim: true })
 }
 
 pub(super) fn begin_editor(f: &mut Frame, title: String, width: u16, height: u16) -> (Rect, Rect) {
@@ -89,5 +120,9 @@ pub(super) fn render_option_popup(
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(" Options "))
         .style(Style::default().bg(COLOR_SURFACE_1));
-    f.render_widget(list, popup_area);
+    let mut state = ListState::default();
+    if selection_index < options.len() {
+        state.select(Some(selection_index));
+    }
+    f.render_stateful_widget(list, popup_area, &mut state);
 }

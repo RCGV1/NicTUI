@@ -9,6 +9,7 @@ impl App {
             KeyCode::Esc => {
                 self.pending_channel_edit = None;
                 self.mode = AppMode::Main(MainTab::Channels);
+                self.status_message = "Channel edit cancelled".into();
             }
             KeyCode::Enter => self.commit_edit(),
             KeyCode::Up | KeyCode::BackTab => self.select_previous_channel_field(),

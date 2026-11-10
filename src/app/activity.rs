@@ -12,6 +12,41 @@ use super::{App, AppMode};
 use crate::activity::{ActivityEvent, ActivityLog, write_activity_csv};
 use crate::activity_session::{ActivityMonitorEvent, ActivityMonitorOptions, monitor_activity};
 
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeartbeatStatus {
+    Inactive,
+    Connecting,
+    Starting,
+    Receiving,
+    Missing,
+    Stale,
+    Stopping,
+    Stopped,
+    Error,
+}
+
+impl HeartbeatStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Inactive => "Heartbeats: capture inactive",
+            Self::Connecting => "Heartbeats: connecting",
+            Self::Starting => "Heartbeats: waiting for first heartbeat",
+            Self::Receiving => "Heartbeats: receiving",
+            Self::Missing => "Warning: no heartbeats received",
+            Self::Stale => "Warning: heartbeats stopped",
+            Self::Stopping => "Heartbeats: capture stopping",
+            Self::Stopped => "Heartbeats: capture stopped",
+            Self::Error => "Heartbeats: capture error",
+        }
+    }
+
+    pub fn is_warning(self) -> bool {
+        matches!(self, Self::Missing | Self::Stale | Self::Error)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActivityStatus {
     Ready,
@@ -43,7 +78,8 @@ pub struct ActivitySnapshot {
     pub latest_signal_raw: Option<u8>,
     pub notice: String,
     pub stopping: bool,
-    last_received: Option<Instant>,
+    ready_at: Option<Instant>,
+    last_heartbeat_received: Option<Instant>,
     changed: bool,
     failure_detail: Option<String>,
 }
@@ -59,7 +95,8 @@ impl Default for ActivitySnapshot {
             latest_signal_raw: None,
             notice: String::new(),
             stopping: false,
-            last_received: None,
+            ready_at: None,
+            last_heartbeat_received: None,
             changed: true,
             failure_detail: None,
         }
@@ -67,14 +104,66 @@ impl Default for ActivitySnapshot {
 }
 
 impl ActivitySnapshot {
+    pub fn heartbeat_status(&self, active: bool) -> HeartbeatStatus {
+        self.heartbeat_status_at(active, Instant::now())
+    }
+
+    fn heartbeat_status_at(&self, active: bool, now: Instant) -> HeartbeatStatus {
+        if self.status == ActivityStatus::Error {
+            return HeartbeatStatus::Error;
+        }
+        if self.stopping {
+            return HeartbeatStatus::Stopping;
+        }
+        if self.status == ActivityStatus::Stopped {
+            return HeartbeatStatus::Stopped;
+        }
+        if !active {
+            return HeartbeatStatus::Inactive;
+        }
+        if let Some(last) = self.last_heartbeat_received {
+            if now.saturating_duration_since(last) < HEARTBEAT_TIMEOUT {
+                HeartbeatStatus::Receiving
+            } else {
+                HeartbeatStatus::Stale
+            }
+        } else {
+            match self.ready_at {
+                Some(start) if now.saturating_duration_since(start) >= HEARTBEAT_TIMEOUT => {
+                    HeartbeatStatus::Missing
+                }
+                Some(_) => HeartbeatStatus::Starting,
+                None => HeartbeatStatus::Connecting,
+            }
+        }
+    }
+
+    fn refresh_status_at(&mut self, now: Instant) {
+        let status = match self.heartbeat_status_at(true, now) {
+            HeartbeatStatus::Receiving => ActivityStatus::Listening,
+            HeartbeatStatus::Starting => ActivityStatus::Ready,
+            HeartbeatStatus::Connecting | HeartbeatStatus::Missing | HeartbeatStatus::Stale => {
+                ActivityStatus::Waiting
+            }
+            _ => return,
+        };
+        if self.status != status {
+            self.status = status;
+            self.changed = true;
+        }
+    }
+
     fn receive(&mut self, event: ActivityMonitorEvent) -> bool {
+        self.receive_at(event, Instant::now())
+    }
+
+    fn receive_at(&mut self, event: ActivityMonitorEvent, now: Instant) -> bool {
         if self.failure_detail.is_some() {
             return false;
         }
         match event {
             ActivityMonitorEvent::Ready => {
-                self.status = ActivityStatus::Ready;
-                self.last_received = Some(Instant::now());
+                self.ready_at = Some(now);
             }
             ActivityMonitorEvent::Event(event) => {
                 if let Err(error) = self.log.record(&event) {
@@ -93,15 +182,15 @@ impl ActivitySnapshot {
                     }
                     ActivityEvent::Heartbeat { .. } => {
                         self.heartbeat_count = self.heartbeat_count.saturating_add(1);
+                        self.last_heartbeat_received = Some(now);
                     }
                 }
-                self.last_received = Some(Instant::now());
-                self.status = ActivityStatus::Listening;
             }
             ActivityMonitorEvent::Warning(_) => {
                 self.notice = "Incomplete activity data received; capture continues.".into();
             }
         }
+        self.refresh_status_at(now);
         self.changed = true;
         true
     }
@@ -256,18 +345,8 @@ impl App {
             .into();
         }
         let mut state = self.activity.lock().unwrap();
-        if self.activity_active()
-            && !state.stopping
-            && state
-                .last_received
-                .is_some_and(|last| last.elapsed() >= Duration::from_secs(5))
-            && matches!(
-                state.status,
-                ActivityStatus::Ready | ActivityStatus::Listening
-            )
-        {
-            state.status = ActivityStatus::Waiting;
-            state.changed = true;
+        if self.activity_active() {
+            state.refresh_status_at(Instant::now());
         }
         let changed = std::mem::take(&mut state.changed);
         let len = state.log.rows().count();
@@ -399,23 +478,250 @@ mod tests {
         assert_eq!(state.log.rows().next().unwrap().count, 100_000);
     }
 
+    fn heartbeat() -> ActivityMonitorEvent {
+        ActivityMonitorEvent::Event(ActivityEvent::Heartbeat {
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
     #[test]
-    fn idle_capture_becomes_waiting_and_heartbeat_restores_listening() {
+    fn initial_grace_expires_even_with_continuous_hits() {
+        let now = Instant::now();
+        let mut state = ActivitySnapshot::default();
+        assert_eq!(
+            state.heartbeat_status_at(false, now),
+            HeartbeatStatus::Inactive
+        );
+        state.receive_at(ActivityMonitorEvent::Ready, now);
+        assert_eq!(
+            state.heartbeat_status_at(true, now),
+            HeartbeatStatus::Starting
+        );
+        let before_timeout = now + HEARTBEAT_TIMEOUT - Duration::from_nanos(1);
+        assert_eq!(
+            state.heartbeat_status_at(true, before_timeout),
+            HeartbeatStatus::Starting
+        );
+        for seconds in 1..=10 {
+            let received = now + Duration::from_secs(seconds);
+            state.receive_at(hit(14_652_000), received);
+            let expected = if seconds < 5 {
+                HeartbeatStatus::Starting
+            } else {
+                HeartbeatStatus::Missing
+            };
+            assert_eq!(state.heartbeat_status_at(true, received), expected);
+        }
+        assert_eq!(state.status, ActivityStatus::Waiting);
+        assert_eq!(state.hit_count, 10);
+        assert_eq!(state.heartbeat_count, 0);
+        assert_eq!(state.ready_at, Some(now));
+        assert_eq!(state.last_heartbeat_received, None);
+    }
+
+    #[test]
+    fn long_opening_gets_a_full_grace_period_after_ready() {
+        let now = Instant::now();
+        let mut state = ActivitySnapshot {
+            status: ActivityStatus::Waiting,
+            ..Default::default()
+        };
+        let ready = now + Duration::from_secs(60);
+        state.refresh_status_at(ready);
+        assert_eq!(
+            state.heartbeat_status_at(true, ready),
+            HeartbeatStatus::Connecting
+        );
+        assert_eq!(state.status, ActivityStatus::Waiting);
+        state.receive_at(hit(14_652_000), ready);
+        assert_eq!(
+            state.heartbeat_status_at(true, ready),
+            HeartbeatStatus::Connecting
+        );
+        state.receive_at(ActivityMonitorEvent::Ready, ready);
+        assert_eq!(state.ready_at, Some(ready));
+        assert_eq!(state.status, ActivityStatus::Ready);
+        assert_eq!(
+            state.heartbeat_status_at(true, ready + HEARTBEAT_TIMEOUT - Duration::from_nanos(1)),
+            HeartbeatStatus::Starting
+        );
+        state.refresh_status_at(ready + HEARTBEAT_TIMEOUT);
+        assert_eq!(
+            state.heartbeat_status_at(true, ready + HEARTBEAT_TIMEOUT),
+            HeartbeatStatus::Missing
+        );
+        assert_eq!(state.status, ActivityStatus::Waiting);
+    }
+
+    #[test]
+    fn heartbeat_freshness_ignores_hits_and_recovers_without_losing_counts() {
+        let now = Instant::now();
+        let mut state = ActivitySnapshot::default();
+        state.receive_at(ActivityMonitorEvent::Ready, now);
+        state.refresh_status_at(now + HEARTBEAT_TIMEOUT);
+        state.receive_at(heartbeat(), now + HEARTBEAT_TIMEOUT);
+        assert_eq!(state.status, ActivityStatus::Listening);
+        assert_eq!(
+            state.heartbeat_status_at(true, now + HEARTBEAT_TIMEOUT),
+            HeartbeatStatus::Receiving
+        );
+        let stale = now + HEARTBEAT_TIMEOUT * 2;
+        assert_eq!(
+            state.heartbeat_status_at(true, stale - Duration::from_nanos(1)),
+            HeartbeatStatus::Receiving
+        );
+        state.changed = false;
+        state.refresh_status_at(stale);
+        assert!(
+            state.changed,
+            "expiry must schedule a redraw without new events"
+        );
+        assert_eq!(state.status, ActivityStatus::Waiting);
+        state.receive_at(hit(14_652_000), stale);
+        state.receive_at(ActivityMonitorEvent::Warning("partial frame".into()), stale);
+        assert_eq!(
+            state.heartbeat_status_at(true, stale),
+            HeartbeatStatus::Stale
+        );
+        assert_eq!(state.status, ActivityStatus::Waiting);
+        assert_eq!(state.last_heartbeat_received, Some(now + HEARTBEAT_TIMEOUT));
+        state.receive_at(heartbeat(), stale);
+        assert_eq!(
+            state.heartbeat_status_at(true, stale),
+            HeartbeatStatus::Receiving
+        );
+        assert_eq!(state.status, ActivityStatus::Listening);
+        assert_eq!(state.heartbeat_count, 2);
+        assert_eq!(state.hit_count, 1);
+    }
+
+    #[test]
+    fn ready_preserves_the_actual_pre_ack_heartbeat_time() {
+        let now = Instant::now();
+        let mut state = ActivitySnapshot::default();
+        state.receive_at(heartbeat(), now);
+        state.receive_at(ActivityMonitorEvent::Ready, now + Duration::from_secs(1));
+        assert_eq!(state.last_heartbeat_received, Some(now));
+        assert_eq!(state.status, ActivityStatus::Listening);
+        assert_eq!(
+            state.heartbeat_status_at(true, now + HEARTBEAT_TIMEOUT),
+            HeartbeatStatus::Stale
+        );
+    }
+
+    #[test]
+    fn fresh_or_historical_heartbeats_never_make_inactive_capture_live() {
+        let now = Instant::now();
+        for age in [Duration::ZERO, HEARTBEAT_TIMEOUT] {
+            for (status, stopping, active, expected) in [
+                (
+                    ActivityStatus::Listening,
+                    false,
+                    false,
+                    HeartbeatStatus::Inactive,
+                ),
+                (
+                    ActivityStatus::Listening,
+                    true,
+                    true,
+                    HeartbeatStatus::Stopping,
+                ),
+                (
+                    ActivityStatus::Stopped,
+                    false,
+                    true,
+                    HeartbeatStatus::Stopped,
+                ),
+                (ActivityStatus::Error, false, true, HeartbeatStatus::Error),
+            ] {
+                let mut state = ActivitySnapshot::default();
+                state.receive_at(heartbeat(), now);
+                state.status = status;
+                state.stopping = stopping;
+                assert_eq!(state.heartbeat_status_at(active, now + age), expected);
+                if active {
+                    state.refresh_status_at(now + age);
+                    assert_eq!(state.status, status);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn heartbeat_box_renders_all_lifecycle_states_without_a_counter() {
+        use ratatui::{Terminal, backend::TestBackend};
+
         let mut app = App::demo();
         app.start_activity();
-        app.activity.lock().unwrap().last_received = Some(Instant::now() - Duration::from_secs(6));
-        assert!(app.poll_activity());
-        assert_eq!(app.activity.lock().unwrap().status, ActivityStatus::Waiting);
-        app.activity
-            .lock()
-            .unwrap()
-            .receive(ActivityMonitorEvent::Event(ActivityEvent::Heartbeat {
-                timestamp: chrono::Utc::now(),
-            }));
-        assert_eq!(
-            app.activity.lock().unwrap().status,
-            ActivityStatus::Listening
-        );
+        let old = Instant::now() - HEARTBEAT_TIMEOUT * 2;
+        let now = Instant::now() + Duration::from_secs(3600);
+        for expected in [
+            HeartbeatStatus::Connecting,
+            HeartbeatStatus::Starting,
+            HeartbeatStatus::Receiving,
+            HeartbeatStatus::Missing,
+            HeartbeatStatus::Stale,
+            HeartbeatStatus::Stopping,
+            HeartbeatStatus::Stopped,
+            HeartbeatStatus::Error,
+            HeartbeatStatus::Inactive,
+        ] {
+            let mut state = ActivitySnapshot::default();
+            if !matches!(
+                expected,
+                HeartbeatStatus::Connecting | HeartbeatStatus::Inactive
+            ) {
+                state.receive_at(ActivityMonitorEvent::Ready, now);
+            }
+            if expected == HeartbeatStatus::Missing {
+                state.ready_at = Some(old);
+                // A historical total cannot turn a never-received timestamp live.
+            } else if !matches!(
+                expected,
+                HeartbeatStatus::Starting | HeartbeatStatus::Connecting | HeartbeatStatus::Inactive
+            ) {
+                state.receive_at(
+                    heartbeat(),
+                    if expected == HeartbeatStatus::Stale {
+                        old
+                    } else {
+                        now
+                    },
+                );
+            }
+            state.heartbeat_count = 424242;
+            match expected {
+                HeartbeatStatus::Stopping => state.stopping = true,
+                HeartbeatStatus::Stopped => state.status = ActivityStatus::Stopped,
+                HeartbeatStatus::Error => state.status = ActivityStatus::Error,
+                HeartbeatStatus::Inactive => drop(app.activity_worker.take()),
+                _ => {}
+            }
+            *app.activity.lock().unwrap() = state;
+            for (width, height) in [(40, 12), (60, 18), (80, 24), (120, 30)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        crate::ui::views::activity::render_activity(frame, &mut app, frame.area());
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let output: String = (0..height)
+                    .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
+                    .collect();
+                let plain: String = output
+                    .chars()
+                    .map(|ch| if ch.is_ascii() { ch } else { ' ' })
+                    .collect();
+                let plain = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(
+                    plain.contains(expected.label()),
+                    "{expected:?} at {width}x{height}: {output}"
+                );
+                assert!(!output.contains("424242"));
+                assert!(!output.contains("Radio scan is running"));
+            }
+        }
     }
 
     #[test]

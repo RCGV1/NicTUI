@@ -3,6 +3,7 @@ pub mod bandplan;
 pub mod bin_flash;
 pub mod channels;
 mod codeplug;
+pub(crate) use codeplug::codeplug_write_block_reason;
 pub mod debug;
 pub mod dtmf;
 pub mod footer;

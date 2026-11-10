@@ -13,7 +13,7 @@ use ratatui::{
     prelude::Stylize,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph, Wrap},
+    widgets::{Block, Borders, Gauge, Padding, Paragraph, Wrap},
 };
 use std::time::{Duration, Instant};
 
@@ -52,7 +52,7 @@ const REMOTE_KEYS: [Option<RemoteKey>; 20] = [
     None,
     key("F", "f", 0x12),
     key("B", "v/b", 0x11),
-    key("PTT", "a", 0x13),
+    key("PTT", "Space", 0x13),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,15 +104,31 @@ fn remote_screen_layout(area: Rect) -> RemoteScreenLayout {
     let keypad_width = if area.width < 54 {
         area.width / 2
     } else {
-        (area.width / 3).clamp(27, 37)
+        // Widen buttons only after reserving the LCD's useful (at most native) size.
+        let lcd_width = area.height.saturating_sub(5).saturating_mul(2).min(128) + 2;
+        let max_keypad = if area.width < 100 { 32 } else { 37 };
+        area.width.saturating_sub(lcd_width).clamp(27, max_keypad)
     };
     let body =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(keypad_width)]).split(rows[0]);
-    let keypad = Layout::vertical([Constraint::Length(18), Constraint::Min(0)]).split(body[1]);
+    // Four two/three-line key rows leave room for PTT guidance on short terminals.
+    let keypad_height = match body[1].height {
+        0..=13 => body[1].height,
+        14..=17 => 10,
+        18..=21 => 14,
+        _ => 18,
+    };
+    let keypad = Rect::new(body[1].x, body[1].y, body[1].width, keypad_height);
+    let keypad_help = Rect::new(
+        body[1].x,
+        keypad.bottom(),
+        body[1].width,
+        body[1].height.saturating_sub(keypad_height).min(6),
+    );
     RemoteScreenLayout {
         display: body[0],
-        keypad: keypad[0],
-        keypad_help: keypad[1],
+        keypad,
+        keypad_help,
         overview: rows[1],
     }
 }
@@ -147,19 +163,25 @@ fn keypad_cells(area: Rect) -> [Rect; 20] {
 
 fn render_keypad(f: &mut Frame, app: &App, area: Rect) {
     let controls_ready = app.remote_controls_ready();
+    let held_key = app.held_remote_key();
     f.render_widget(
         Block::bordered()
-            .title(" Keypad: may save state ")
+            .title(if app.simulator_mode {
+                " Simulated keypad "
+            } else {
+                " Keypad: may save state "
+            })
             .border_style(Style::default().fg(COLOR_BORDER))
             .bg(COLOR_SURFACE_0),
         area,
     );
     let cells = keypad_cells(area);
     // Use the smallest cell so rounding never mixes button styles within a grid.
-    let bordered = cells.iter().all(|cell| cell.width >= 6 && cell.height >= 4);
+    let bordered = cells.iter().all(|cell| cell.width >= 7 && cell.height >= 4);
     let underlined = cells.iter().all(|cell| cell.width >= 5 && cell.height >= 3);
     for (cell, key) in cells.into_iter().zip(REMOTE_KEYS) {
         let Some(key) = key else { continue };
+        let held = held_key == Some(key.code);
         let accent = match key.code {
             0x0B => COLOR_PRIMARY,
             0x0E => COLOR_ERROR,
@@ -174,22 +196,33 @@ fn render_keypad(f: &mut Frame, app: &App, area: Rect) {
             Block::default()
         }
         .border_style(Style::default().fg(accent))
-        .bg(COLOR_SURFACE_1);
+        .bg(if held { accent } else { COLOR_SURFACE_1 });
         let inner = block.inner(cell);
         f.render_widget(block, cell);
         let mut lines = vec![Line::from(Span::styled(
             key.label,
-            Style::default().fg(COLOR_TEXT).bold(),
+            Style::default()
+                .fg(if held { COLOR_SURFACE_0 } else { COLOR_TEXT })
+                .bold(),
         ))];
         if inner.height >= 2 {
+            let mouse_hold = key.code == 0x13 && !app.remote_keyboard_release_supported;
             lines.push(Line::from(Span::styled(
-                if key.label == key.shortcut {
+                if mouse_hold {
+                    "mouse"
+                } else if key.label == key.shortcut {
                     ""
                 } else {
                     key.shortcut
                 },
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(if held { COLOR_SURFACE_0 } else { COLOR_DIM }),
             )));
+            if mouse_hold && inner.height >= 3 {
+                lines.push(Line::from(Span::styled(
+                    "hold",
+                    Style::default().fg(if held { COLOR_SURFACE_0 } else { COLOR_DIM }),
+                )));
+            }
         }
         let height = (lines.len() as u16).min(inner.height);
         let centered = Rect::new(
@@ -201,8 +234,8 @@ fn render_keypad(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(
             Paragraph::new(lines)
                 .alignment(Alignment::Center)
-                .style(Style::default().bg(COLOR_SURFACE_1))
-                .add_modifier(if controls_ready {
+                .style(Style::default().bg(if held { accent } else { COLOR_SURFACE_1 }))
+                .add_modifier(if controls_ready || held {
                     Modifier::empty()
                 } else {
                     Modifier::DIM
@@ -213,15 +246,23 @@ fn render_keypad(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_keypad_help(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::LEFT | Borders::RIGHT)
-        .border_style(Style::default().fg(COLOR_BORDER));
+    let block = Block::default().padding(Padding::horizontal(1));
     let inner = block.inner(area);
     if inner.height == 0 || inner.width < 16 {
         return;
     }
     let lines = [
-        Line::from("PTT can transmit"),
+        Line::from(if app.simulator_mode {
+            "Simulated PTT: no RF"
+        } else {
+            "PTT can transmit"
+        }),
+        Line::from("PTT: hold mouse"),
+        Line::from(if app.remote_keyboard_release_supported {
+            "Space: hold PTT"
+        } else {
+            "Space: tap PTT"
+        }),
         Line::from("Click or type a shortcut"),
         Line::from(format!("Battery: {}", battery_label(app))),
         Line::from(format!("Status: {}", status_label(app))),
@@ -239,6 +280,26 @@ fn render_keypad_help(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_compact_overview(f: &mut Frame, app: &App, area: Rect) {
+    if app.simulator_mode {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " SIMULATOR ",
+                    Style::default()
+                        .fg(COLOR_SURFACE_0)
+                        .bg(COLOR_WARNING)
+                        .bold(),
+                ),
+                Span::styled(
+                    format!(" {}", simulated_state_label(app)),
+                    Style::default().fg(COLOR_TEXT),
+                ),
+            ]))
+            .style(Style::default().bg(COLOR_SURFACE_1)),
+            area,
+        );
+        return;
+    }
     let verdict = remote_session_verdict(app.remote_active, &app.remote_screen);
     let freshness = freshness_summary(app);
     let (badge, headline, accent) =
@@ -277,26 +338,29 @@ fn render_compact_overview(f: &mut Frame, app: &App, area: Rect) {
         } else {
             COLOR_WARNING
         };
+        let outcome = format!(
+            " ({})",
+            match (report.success, report.evidence) {
+                (false, _) | (_, RemoteEvidenceKind::CommandFailed) => "failed",
+                (true, RemoteEvidenceKind::ControlConfirmed) => "confirmed",
+                _ => "not confirmed",
+            }
+        );
+        let prefix_width = Line::from(spans.clone()).width();
+        let report_width = " | Last: ".len() + outcome.len();
+        if prefix_width + report_width + 4 > usize::from(area.width) {
+            spans.truncate(1);
+        }
+        let label_width = usize::from(area.width)
+            .saturating_sub(Line::from(spans.clone()).width() + report_width)
+            .min(24);
         spans.extend([
             Span::styled(" | Last: ", Style::default().fg(COLOR_DIM)),
             Span::styled(
-                truncate_line(
-                    &report.label,
-                    area.width.saturating_sub(45).clamp(4, 24) as usize,
-                ),
+                truncate_line(&report.label, label_width),
                 Style::default().fg(COLOR_TEXT).bold(),
             ),
-            Span::styled(
-                format!(
-                    " ({})",
-                    match (report.success, report.evidence) {
-                        (false, _) | (_, RemoteEvidenceKind::CommandFailed) => "failed",
-                        (true, RemoteEvidenceKind::ControlConfirmed) => "confirmed",
-                        _ => "not confirmed",
-                    }
-                ),
-                Style::default().fg(color),
-            ),
+            Span::styled(outcome, Style::default().fg(color)),
         ]);
     } else {
         spans.push(Span::styled(
@@ -372,15 +436,49 @@ fn remote_diagnostics_layout(area: Rect) -> RemoteDiagnosticsLayout {
 
 fn render_lcd_preview(f: &mut Frame, app: &App, area: Rect) {
     let has_updates = app.remote_screen.has_display_updates;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(if has_updates && !app.remote_active {
-            " Radio Display: cached "
-        } else if has_updates {
-            " Radio Display: updates only "
+    let title = if app.simulator_mode {
+        if app.remote_screen.display.has_native_frame() {
+            if app.remote_active {
+                " Simulator LCD "
+            } else {
+                " Simulator LCD: cached "
+            }
+        } else if app.remote_screen.display.uses_native_fonts()
+            && !app.remote_screen.display.native_font_coverage_complete()
+        {
+            " Simulated LCD: partial source fonts "
+        } else if app.remote_screen.display.uses_native_fonts() {
+            " Simulated LCD: source fonts "
+        } else if app.remote_screen.display.font_error().is_some() {
+            " Simulated LCD: font import failed "
         } else {
-            " Radio Display "
-        })
+            " Simulated LCD: approximate fonts "
+        }
+    } else if has_updates && !app.remote_active {
+        " Radio Display: cached "
+    } else if has_updates {
+        " Radio Display: updates only "
+    } else {
+        " Radio Display "
+    };
+    let compact_title = if app.simulator_mode {
+        if !app.remote_active && has_updates {
+            " LCD: cached "
+        } else {
+            " Simulated LCD "
+        }
+    } else if !app.remote_active && has_updates {
+        " Radio LCD: cached "
+    } else if has_updates {
+        " LCD: updates only "
+    } else {
+        " Radio Display "
+    };
+    let block = Block::bordered()
+        .title(fitting_text(
+            area.width.saturating_sub(2),
+            &[title, compact_title, " LCD "],
+        ))
         .border_style(if app.remote_active {
             Style::default().fg(COLOR_SUCCESS)
         } else {
@@ -422,7 +520,24 @@ fn render_lcd_preview(f: &mut Frame, app: &App, area: Rect) {
             area,
         );
     }
-    let mut completeness = if has_updates {
+    let simulated = app.simulator_mode;
+    let mut completeness = if simulated {
+        if app.remote_screen.display.has_native_frame() {
+            "Native 128x128 LCD / no RF"
+        } else if app.remote_screen.simulator_lcd_error.is_some() {
+            "LCD stream unavailable / UART preview"
+        } else if app.remote_screen.display.font_error().is_some() {
+            "Font import failed / no RF"
+        } else if !app.remote_screen.display.uses_native_fonts() {
+            "Approximate fonts / no RF"
+        } else if !app.remote_screen.display.native_font_coverage_complete() {
+            "Source font coverage incomplete"
+        } else if !app.remote_screen.display.has_meter_context() {
+            "Native fonts / meter unknown"
+        } else {
+            "2.52.18 source model / no RF"
+        }
+    } else if has_updates {
         "Screen may be incomplete"
     } else if !app.remote_active {
         "Remote is not running"
@@ -432,7 +547,21 @@ fn render_lcd_preview(f: &mut Frame, app: &App, area: Rect) {
         "Only new updates are sent"
     }
     .to_string();
-    if has_updates
+    if !simulated
+        && app.remote_active
+        && has_updates
+        && !app.remote_screen.has_non_battery_drawings
+        && app.remote_screen.battery_text.is_some()
+        && app.remote_screen.unknown_packet_count == 0
+    {
+        let battery = battery_label(app);
+        completeness = ["Waiting for screen redraw", "Waiting for redraw", "Redraw"]
+            .into_iter()
+            .map(|label| format!("{label} | {}", battery.trim()))
+            .find(|line| line.chars().count() <= usize::from(rows[1].width))
+            .unwrap_or_else(|| truncate_line(battery.trim(), usize::from(rows[1].width)));
+    } else if !simulated
+        && has_updates
         && (app.remote_screen.battery_text.is_some() || app.remote_screen.battery_level.is_some())
     {
         let battery = battery_label(app);
@@ -441,14 +570,41 @@ fn render_lcd_preview(f: &mut Frame, app: &App, area: Rect) {
             completeness = format!("May be incomplete | {battery}");
         }
     }
+    // Prefer complete short phrases to centered clipping, which can hide the caveat.
+    let compact_completeness = if simulated {
+        if app.remote_screen.display.has_native_frame() {
+            "Native LCD / no RF"
+        } else if app.remote_screen.simulator_lcd_error.is_some() {
+            "LCD unavailable / UART"
+        } else if app.remote_screen.display.font_error().is_some() {
+            "Font import failed"
+        } else if !app.remote_screen.display.uses_native_fonts() {
+            "Approximate / no RF"
+        } else if !app.remote_screen.display.native_font_coverage_complete() {
+            "Partial source fonts"
+        } else if !app.remote_screen.display.has_meter_context() {
+            "Meter unknown / no RF"
+        } else {
+            "Source model / no RF"
+        }
+    } else if has_updates {
+        "May be incomplete"
+    } else if !app.remote_active {
+        "Remote inactive"
+    } else {
+        "New updates only"
+    };
     f.render_widget(
-        Paragraph::new(completeness)
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(COLOR_DIM)),
+        Paragraph::new(fitting_text(
+            rows[1].width,
+            &[&completeness, compact_completeness],
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(COLOR_DIM)),
         rows[1],
     );
     if has_updates {
-        app.remote_screen.display.render(f, rows[2]);
+        app.remote_screen.display.render(f, lcd_canvas(rows[2]));
     } else {
         let lines = if app.remote_active {
             vec![
@@ -494,6 +650,25 @@ fn render_lcd_preview(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn lcd_canvas(area: Rect) -> Rect {
+    let columns = area.width.min(area.height.saturating_mul(2)).min(128);
+    let rows = columns.div_ceil(2);
+    Rect::new(
+        area.x + (area.width - columns) / 2,
+        area.y + (area.height - rows) / 2,
+        columns,
+        rows,
+    )
+}
+
+fn fitting_text<'a>(width: u16, candidates: &[&'a str]) -> &'a str {
+    candidates
+        .iter()
+        .copied()
+        .find(|text| Line::from(*text).width() <= usize::from(width))
+        .unwrap_or("")
+}
+
 fn led_visual(state: u8) -> (&'static str, Color) {
     match state & 3 {
         1 => ("green", COLOR_SUCCESS),
@@ -531,7 +706,11 @@ fn render_status_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 .style(Style::default().fg(COLOR_TEXT))
                 .block(
                     Block::bordered()
-                        .title(" Radio Status ")
+                        .title(if app.simulator_mode {
+                            " Model Status "
+                        } else {
+                            " Radio Status "
+                        })
                         .border_style(Style::default().fg(COLOR_BORDER)),
                 ),
             area,
@@ -574,9 +753,13 @@ fn render_status_sidebar(f: &mut Frame, app: &App, area: Rect) {
     let battery_label = battery_label(app);
     let (battery_level, battery_color) = battery_visuals(app);
     let status_label = status_label(app);
-    let session_verdict = remote_session_verdict(app.remote_active, &app.remote_screen);
+    let session_verdict = app_session_verdict(app);
     let verdict_value = session_verdict.badge.trim();
-    let verdict_detail = session_summary(app.remote_active, app.remote_screen.phase);
+    let verdict_detail = if app.simulator_mode {
+        "local behavior model".to_string()
+    } else {
+        session_summary(app.remote_active, app.remote_screen.phase)
+    };
     let link_detail = freshness_summary(app);
 
     render_metric_card(
@@ -604,7 +787,11 @@ fn render_status_sidebar(f: &mut Frame, app: &App, area: Rect) {
         &app.remote_screen
             .last_signal_update
             .map_or_else(|| "unknown".to_string(), |_| format!("{signal} raw")),
-        "uncalibrated radio value",
+        if app.simulator_mode {
+            "synthetic model value"
+        } else {
+            "uncalibrated radio value"
+        },
         COLOR_PRIMARY,
         "⌁",
     );
@@ -615,7 +802,11 @@ fn render_status_sidebar(f: &mut Frame, app: &App, area: Rect) {
         &app.remote_screen
             .last_noise_update
             .map_or_else(|| "unknown".to_string(), |_| format!("{noise} raw")),
-        "uncalibrated radio value",
+        if app.simulator_mode {
+            "synthetic model value"
+        } else {
+            "uncalibrated radio value"
+        },
         COLOR_SECONDARY,
         "≈",
     );
@@ -624,7 +815,11 @@ fn render_status_sidebar(f: &mut Frame, app: &App, area: Rect) {
         bottom_row[0],
         "Battery",
         &battery_label,
-        &if app.remote_screen.battery_text.is_some() || app.remote_screen.battery_level.is_some() {
+        &if app.simulator_mode {
+            "synthetic model value".to_string()
+        } else if app.remote_screen.battery_text.is_some()
+            || app.remote_screen.battery_level.is_some()
+        {
             format!("{} battery reading", battery_meter(battery_level))
         } else {
             "no battery reading".to_string()
@@ -705,7 +900,11 @@ fn render_activity(f: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Live Activity ")
+                .title(if app.simulator_mode {
+                    " Model Activity "
+                } else {
+                    " Live Activity "
+                })
                 .border_style(Style::default().fg(COLOR_BORDER))
                 .bg(COLOR_SURFACE_1),
         )
@@ -747,8 +946,12 @@ fn render_controls(f: &mut Frame, app: &App, area: Rect) {
                 Span::raw(": Nav | "),
                 render_shortcut("* / #"),
                 Span::raw(": Keys | "),
-                render_shortcut("a"),
-                Span::raw(": PTT"),
+                render_shortcut("Space"),
+                Span::raw(if app.remote_keyboard_release_supported {
+                    ": PTT hold"
+                } else {
+                    ": PTT tap"
+                }),
             ]),
             Line::from(vec![
                 render_shortcut("f"),
@@ -791,7 +994,7 @@ fn render_controls(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_remote_overview(f: &mut Frame, app: &App, area: Rect) {
-    let session_verdict = remote_session_verdict(app.remote_active, &app.remote_screen);
+    let session_verdict = app_session_verdict(app);
     let session_style = Style::default()
         .fg(COLOR_SURFACE_0)
         .bg(session_verdict.accent)
@@ -864,6 +1067,27 @@ fn render_remote_overview(f: &mut Frame, app: &App, area: Rect) {
             .bg(COLOR_SURFACE_1),
     );
     f.render_widget(summary, area);
+}
+
+fn simulated_state_label(app: &App) -> &'static str {
+    if app.remote_active && app.remote_screen.leds & 0x0A != 0 {
+        "simulated TX active / no RF"
+    } else {
+        "local model idle / no RF"
+    }
+}
+
+fn app_session_verdict(app: &App) -> RemoteSessionVerdict {
+    if app.simulator_mode {
+        return RemoteSessionVerdict {
+            badge: " SIMULATOR ",
+            headline: simulated_state_label(app),
+            detail: "Source-derived behavior subset; no hardware I/O or live control evidence."
+                .into(),
+            accent: COLOR_WARNING,
+        };
+    }
+    remote_session_verdict(app.remote_active, &app.remote_screen)
 }
 
 fn remote_session_verdict(remote_active: bool, screen: &RemoteScreen) -> RemoteSessionVerdict {
@@ -1152,6 +1376,9 @@ fn battery_label(app: &App) -> String {
 }
 
 fn status_label(app: &App) -> String {
+    if app.simulator_mode {
+        return simulated_state_label(app).to_string();
+    }
     app.remote_screen
         .last_small_status
         .map(|_| "updated".to_string())
@@ -1159,6 +1386,9 @@ fn status_label(app: &App) -> String {
 }
 
 fn status_detail(app: &App) -> String {
+    if app.simulator_mode {
+        return "local model state only".into();
+    }
     match app.remote_screen.last_small_status {
         Some(_) => "status bytes received".to_string(),
         None => "waiting for update".to_string(),
@@ -1201,6 +1431,13 @@ fn battery_color(level: u8) -> Color {
 }
 
 fn freshness_summary(app: &App) -> (String, String, Color) {
+    if app.simulator_mode {
+        return (
+            "local".into(),
+            "model packets; no radio link".into(),
+            COLOR_WARNING,
+        );
+    }
     let last = app.remote_screen.last_received;
 
     if !app.remote_active {
@@ -1254,7 +1491,13 @@ fn parse_voltage_text(text: &str) -> Option<f32> {
 }
 
 fn render_last_control_panel(f: &mut Frame, app: &App, area: Rect) {
-    let lines = if let Some(report) = &app.remote_screen.last_control_report {
+    let lines = if app.simulator_mode {
+        vec![
+            Line::from(simulated_state_label(app)),
+            Line::from("Local behavior model only."),
+            Line::from("No hardware control or RF transmission."),
+        ]
+    } else if let Some(report) = &app.remote_screen.last_control_report {
         let outcome = if !report.success {
             "failed".to_string()
         } else {
@@ -1379,9 +1622,91 @@ mod tests {
         RemoteCommandReaction, RemoteControlReport, RemoteControlStrategy, RemoteEvidenceKind,
         RemoteSessionFailure, RemoteSessionFailureKind,
     };
+    use crate::ui::views::main_layout::main_content_area;
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
-    const TERMINAL_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (160, 48), (240, 64)];
+    const TERMINAL_SIZES: [(u16, u16); 8] = [
+        (80, 24),
+        (100, 30),
+        (120, 36),
+        (160, 48),
+        (200, 64),
+        (220, 80),
+        (240, 64),
+        (240, 80),
+    ];
+
+    #[test]
+    fn simulator_labels_follow_model_packets_not_held_input() {
+        let mut app = App::demo();
+        app.simulator_mode = true;
+        app.remote_active = true;
+        assert_eq!(simulated_state_label(&app), "local model idle / no RF");
+        app.remote_input_state.lock().unwrap().held_key = Some(0x13);
+        assert_eq!(simulated_state_label(&app), "local model idle / no RF");
+        receive_packet(
+            &mut app,
+            RemotePacket::SmallStatus {
+                id: 0x72,
+                value1: 0,
+                value2: 0,
+            },
+        );
+        assert_eq!(simulated_state_label(&app), "simulated TX active / no RF");
+        assert_eq!(app_session_verdict(&app).badge.trim(), "SIMULATOR");
+        for diagnostics in [false, true] {
+            app.remote_screen.show_diagnostics = diagnostics;
+            for (width, height) in [(80, 24), (160, 48)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| render_remote_screen(frame, &app, frame.area()))
+                    .unwrap();
+                let text = buffer_text(terminal.backend().buffer(), Rect::new(0, 0, width, height));
+                assert!(text.contains("SIMULATOR"), "{text}");
+                assert!(text.contains("Simulated LCD: approximate fonts"), "{text}");
+                assert!(!text.contains("PTT can transmit"), "{text}");
+                assert!(!text.contains("Live Activity"), "{text}");
+                assert!(!text.contains("CONTROL CONFIRMED"), "{text}");
+                if !diagnostics {
+                    assert!(text.contains("simulated TX active / no RF"), "{text}");
+                    assert!(!text.contains("PARTIAL"), "{text}");
+                }
+            }
+        }
+        receive_packet(
+            &mut app,
+            RemotePacket::SmallStatus {
+                id: 0x70,
+                value1: 0,
+                value2: 0,
+            },
+        );
+        assert_eq!(simulated_state_label(&app), "local model idle / no RF");
+    }
+
+    #[test]
+    fn simulator_preserves_mouse_hold_and_terminal_specific_space_hint() {
+        let mut app = App::demo();
+        app.simulator_mode = true;
+        for enhanced in [false, true] {
+            app.remote_keyboard_release_supported = enhanced;
+            let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+            terminal
+                .draw(|frame| render_keypad_help(frame, &app, frame.area()))
+                .unwrap();
+            let text = buffer_text(terminal.backend().buffer(), Rect::new(0, 0, 40, 8));
+            assert!(text.contains("Simulated PTT: no RF"), "{text}");
+            assert!(text.contains("PTT: hold mouse"), "{text}");
+            assert!(
+                text.contains(if enhanced {
+                    "Space: hold PTT"
+                } else {
+                    "Space: tap PTT"
+                }),
+                "{text}"
+            );
+        }
+    }
 
     fn buffer_text(buffer: &Buffer, area: Rect) -> String {
         (area.y..area.bottom())
@@ -1401,9 +1726,19 @@ mod tests {
         assert!(app.update());
     }
 
+    fn battery_packet(text: &str) -> RemotePacket {
+        RemotePacket::DisplayText {
+            font_size: 0,
+            x: 103,
+            y: 70,
+            fg_color: 0xffff,
+            bg_color: 0,
+            text: text.to_string(),
+        }
+    }
+
     fn preview_snapshot(app: &App, width: u16, height: u16) -> (Buffer, Rect) {
-        let sidebar = if width < 100 { 20 } else { 28 };
-        let area = Rect::new(sidebar, 3, width - sidebar, height - 5);
+        let area = main_content_area(Rect::new(0, 0, width, height));
         let preview = if app.remote_screen.show_diagnostics {
             remote_diagnostics_layout(area).preview
         } else {
@@ -1431,7 +1766,7 @@ mod tests {
         expected
             .draw(|frame| {
                 frame.render_widget(Block::default().bg(COLOR_SURFACE_0), canvas);
-                app.remote_screen.display.render(frame, canvas);
+                app.remote_screen.display.render(frame, lcd_canvas(canvas));
             })
             .unwrap();
         for y in canvas.y..canvas.bottom() {
@@ -1628,32 +1963,256 @@ mod tests {
     }
 
     #[test]
-    fn battery_only_shows_updates_only_and_preserves_received_voltage() {
-        let mut app = App::new();
-        app.remote_active = true;
-        receive_packet(
-            &mut app,
+    fn battery_only_waits_for_screen_redraw_and_preserves_received_voltage() {
+        for (fg_color, bg_color) in [(0xffff, 0), (0xfe9a, 0), (0xfe9a, 0x8000)] {
+            let mut app = App::new();
+            app.remote_active = true;
+            for mut packet in [
+                battery_packet("7.3V"),
+                RemotePacket::SmallStatus {
+                    id: 0x72,
+                    value1: 0,
+                    value2: 0,
+                },
+                RemotePacket::SignalBarPos { y: 104, aux: 0 },
+                RemotePacket::SignalStrength {
+                    strength: 32,
+                    mode: 0,
+                    battery: 0,
+                },
+                RemotePacket::NoiseLevel { level: 12, mode: 0 },
+                battery_packet("7.4V"),
+            ] {
+                if let RemotePacket::DisplayText {
+                    fg_color: fg,
+                    bg_color: bg,
+                    ..
+                } = &mut packet
+                {
+                    *fg = fg_color;
+                    *bg = bg_color;
+                }
+                receive_packet(&mut app, packet);
+            }
+            assert!(app.remote_screen.has_display_updates);
+            assert!(!app.remote_screen.has_non_battery_drawings);
+            for diagnostics in [false, true] {
+                app.remote_screen.show_diagnostics = diagnostics;
+                for (width, height) in [(80, 24), (160, 45)] {
+                    let (buffer, preview) = preview_snapshot(&app, width, height);
+                    let text = preview_text(&buffer, preview);
+                    assert!(buffer_text(&buffer, preview).contains("updates only"));
+                    let waiting = if preview.width.saturating_sub(2) >= 32 {
+                        "Waiting for screen redraw"
+                    } else {
+                        "Waiting for redraw"
+                    };
+                    assert!(text.contains(waiting), "{text}");
+                    assert!(!text.contains("incomplete"));
+                    assert!(text.contains("7.4V"), "{text}");
+                    assert!(!text.contains("Waiting for radio"));
+                    assert_preview_canvas_matches(&app, &buffer, preview);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_battery_drawings_or_unknowns_keep_the_incomplete_warning() {
+        let mut other_position = battery_packet("7.4V");
+        if let RemotePacket::DisplayText { x, .. } = &mut other_position {
+            *x = 4;
+        }
+        let mut other_font = battery_packet("7.4V");
+        if let RemotePacket::DisplayText { font_size, .. } = &mut other_font {
+            *font_size = 1;
+        }
+        for packet in [
             RemotePacket::DisplayText {
-                font_size: 0,
-                x: 103,
-                y: 70,
+                font_size: 1,
+                x: 4,
+                y: 20,
                 fg_color: 0xffff,
                 bg_color: 0,
-                text: "7.4V".to_string(),
+                text: "MENU".to_string(),
             },
-        );
-        assert!(app.remote_screen.has_display_updates);
-        for diagnostics in [false, true] {
-            app.remote_screen.show_diagnostics = diagnostics;
-            for (width, height) in [(80, 24), (160, 45)] {
-                let (buffer, preview) = preview_snapshot(&app, width, height);
+            RemotePacket::DrawRectangle {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                color: 0,
+            },
+            RemotePacket::DrawSymbol {
+                symbol_id: 0,
+                x: 0,
+                y: 0,
+                fg_color: 0xffff,
+                bg_color: 0,
+            },
+            other_position,
+            other_font,
+            RemotePacket::UnknownFrame {
+                opcode: 0xe8,
+                payload: vec![0x65],
+            },
+        ] {
+            let mut app = App::new();
+            app.remote_active = true;
+            receive_packet(&mut app, battery_packet("7.4V"));
+            receive_packet(&mut app, packet);
+            receive_packet(&mut app, battery_packet("7.5V"));
+            for diagnostics in [false, true] {
+                app.remote_screen.show_diagnostics = diagnostics;
+                let (buffer, preview) = preview_snapshot(&app, 160, 45);
                 let text = preview_text(&buffer, preview);
-                assert!(buffer_text(&buffer, preview).contains("updates only"));
-                assert!(text.contains("incomplete"));
-                assert!(text.contains("7.4V"), "{text}");
-                assert!(!text.contains("Waiting for radio"));
+                assert!(text.contains("incomplete"), "{text}");
+                assert!(!text.contains("Waiting for"), "{text}");
+                assert!(text.contains("7.5V"), "{text}");
                 assert_preview_canvas_matches(&app, &buffer, preview);
             }
+        }
+    }
+
+    #[test]
+    fn battery_waiting_survives_history_clear_but_not_session_reset() {
+        use crate::app::AppEvent;
+        use crate::remote::RemoteSessionPhase;
+
+        for phase in [RemoteSessionPhase::Opening, RemoteSessionPhase::Recovering] {
+            let mut app = App::new();
+            app.remote_active = true;
+            receive_packet(&mut app, battery_packet("7.4V"));
+            app.remote_screen.elements.clear();
+            let (buffer, preview) = preview_snapshot(&app, 160, 45);
+            let text = preview_text(&buffer, preview);
+            assert!(text.contains("Waiting for screen redraw"));
+            assert!(!text.contains("incomplete"));
+            assert_preview_canvas_matches(&app, &buffer, preview);
+
+            app.event_tx.send(AppEvent::RemotePhase(phase)).unwrap();
+            assert!(app.update());
+            assert!(app.remote_screen.battery_text.is_none());
+            for diagnostics in [false, true] {
+                app.remote_screen.show_diagnostics = diagnostics;
+                let (buffer, preview) = preview_snapshot(&app, 160, 45);
+                let text = preview_text(&buffer, preview);
+                assert!(text.contains("Waiting for radio display updates"), "{text}");
+                assert!(!text.contains("7.4V"));
+                assert!(!text.contains("Waiting for screen redraw"));
+            }
+            for y in 0..128 {
+                for x in 0..128 {
+                    assert_eq!(app.remote_screen.display.pixel(x, y), Color::Rgb(0, 0, 0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn main_drawings_and_unknowns_stay_incomplete_after_battery_history_eviction() {
+        use crate::app::AppEvent;
+        use crate::remote::RemoteSessionPhase;
+
+        for packet in [
+            RemotePacket::DisplayText {
+                font_size: 1,
+                x: 4,
+                y: 20,
+                fg_color: 0xffff,
+                bg_color: 0,
+                text: "MENU".to_string(),
+            },
+            RemotePacket::DrawRectangle {
+                x: 0,
+                y: 0,
+                width: 128,
+                height: 128,
+                color: 0x8000,
+            },
+            RemotePacket::DrawSymbol {
+                symbol_id: 0,
+                x: 0,
+                y: 0,
+                fg_color: 0xffff,
+                bg_color: 0,
+            },
+            RemotePacket::UnknownFrame {
+                opcode: 0xe8,
+                payload: Vec::new(),
+            },
+        ] {
+            for phase in [RemoteSessionPhase::Opening, RemoteSessionPhase::Recovering] {
+                let mut app = App::new();
+                app.remote_active = true;
+                let unknown = matches!(packet, RemotePacket::UnknownFrame { .. });
+                receive_packet(&mut app, packet.clone());
+                for index in 0..60 {
+                    receive_packet(
+                        &mut app,
+                        battery_packet(if index % 2 == 0 { "7.4V" } else { "7.5V" }),
+                    );
+                }
+                assert_eq!(app.remote_screen.elements.len(), 50);
+                assert!(
+                    app.remote_screen
+                        .elements
+                        .iter()
+                        .all(RemotePacket::is_battery_voltage_label)
+                );
+                assert_eq!(app.remote_screen.has_non_battery_drawings, !unknown);
+                assert_eq!(app.remote_screen.unknown_packet_count, usize::from(unknown));
+                for diagnostics in [false, true] {
+                    app.remote_screen.show_diagnostics = diagnostics;
+                    let (buffer, preview) = preview_snapshot(&app, 160, 45);
+                    let text = preview_text(&buffer, preview);
+                    assert!(text.contains("incomplete"), "{text}");
+                    assert!(!text.contains("Waiting for"), "{text}");
+                    assert_preview_canvas_matches(&app, &buffer, preview);
+                }
+
+                app.event_tx.send(AppEvent::RemotePhase(phase)).unwrap();
+                assert!(app.update());
+                assert!(!app.remote_screen.has_non_battery_drawings);
+                assert_eq!(app.remote_screen.unknown_packet_count, 0);
+                assert!(app.remote_screen.battery_text.is_none());
+                receive_packet(&mut app, battery_packet("7.4V"));
+                let (buffer, preview) = preview_snapshot(&app, 160, 45);
+                assert!(preview_text(&buffer, preview).contains("Waiting for screen redraw"));
+                assert_preview_canvas_matches(&app, &buffer, preview);
+            }
+        }
+    }
+
+    #[test]
+    fn battery_waiting_label_fits_narrow_previews_without_overlaying_the_raster() {
+        let mut app = App::new();
+        app.remote_active = true;
+        receive_packet(&mut app, battery_packet("7.4V"));
+        for (width, expected) in [
+            (34, "Waiting for screen redraw | 7.4V"),
+            (27, "Waiting for redraw | 7.4V"),
+            (16, "Redraw | 7.4V"),
+            (6, "7.4V"),
+        ] {
+            let area = Rect::new(3, 2, width, 20);
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| render_lcd_preview(frame, &app, area))
+                .unwrap();
+            let inner = Block::bordered().inner(area);
+            let label = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+            assert_eq!(
+                buffer_text(terminal.backend().buffer(), label).trim(),
+                expected
+            );
+            assert_preview_canvas_matches(&app, terminal.backend().buffer(), area);
+        }
+        for width in 0..6 {
+            let mut terminal = Terminal::new(TestBackend::new(10, 10)).unwrap();
+            terminal
+                .draw(|frame| render_lcd_preview(frame, &app, Rect::new(0, 0, width, 4)))
+                .unwrap();
         }
     }
 
@@ -1790,7 +2349,9 @@ mod tests {
         for (width, height) in TERMINAL_SIZES {
             let area = Rect::new(7, 4, width, height);
             let layout = remote_screen_layout(area);
-            let keypad_width = (width / 3).clamp(27, 37);
+            let lcd_width = height.saturating_sub(5).saturating_mul(2).min(128) + 2;
+            let max_keypad = if width < 100 { 32 } else { 37 };
+            let keypad_width = width.saturating_sub(lcd_width).clamp(27, max_keypad);
             assert_eq!(
                 layout.display,
                 Rect::new(7, 4, width - keypad_width, height - 1)
@@ -1801,7 +2362,8 @@ mod tests {
             );
             assert!(layout.display.width > layout.keypad.width);
             assert_eq!(layout.keypad_help.y, layout.keypad.bottom());
-            assert_eq!(layout.keypad_help.bottom(), layout.display.bottom());
+            assert!(layout.keypad_help.bottom() <= layout.display.bottom());
+            assert!(layout.keypad_help.height <= 6);
             assert_eq!(layout.overview.height, 1);
             assert_eq!(layout.overview.bottom(), area.bottom());
             for cell in keypad_cells(layout.keypad) {
@@ -1814,22 +2376,42 @@ mod tests {
 
     #[test]
     fn actual_content_rects_reclaim_display_space_at_requested_sizes() {
-        for (width, height, sidebar, expected_columns) in [
-            (80, 24, 20, 28),
-            (100, 30, 22, 40),
-            (160, 48, 28, 76),
-            (240, 64, 28, 108),
+        for (width, height, expected_columns) in [
+            (60, 20, 20),
+            (80, 24, 28),
+            (100, 30, 40),
+            (120, 40, 60),
+            (160, 48, 76),
+            (190, 80, 128),
+            (240, 64, 108),
+            (240, 80, 128),
         ] {
-            let area = Rect::new(sidebar, 3, width - sidebar, height - 5);
+            let area = main_content_area(Rect::new(0, 0, width, height));
             let layout = remote_screen_layout(area);
             let inner = Block::bordered().inner(layout.display);
-            let columns = inner.width.min(inner.height.saturating_sub(2) * 2);
+            let columns = lcd_canvas(Rect::new(
+                inner.x,
+                inner.y + 2,
+                inner.width,
+                inner.height - 2,
+            ))
+            .width;
             let old_columns = (area.width / 2 - 2).min((area.height - 10) * 2);
             assert_eq!(columns, expected_columns, "{width}x{height}");
             assert!(columns > old_columns);
             assert!(layout.keypad.width <= 37);
             assert!(layout.keypad.height <= 18);
             assert_eq!(layout.overview.height, 1);
+            if width == 190 {
+                assert_eq!(area.width, 167);
+                assert_eq!(layout.display.width, 130);
+                assert_eq!(layout.keypad.width, 37);
+                assert!(
+                    keypad_cells(layout.keypad)
+                        .iter()
+                        .all(|cell| cell.width == 7 && cell.height == 4)
+                );
+            }
         }
     }
 
@@ -1858,6 +2440,8 @@ mod tests {
                     assert!(
                         [
                             "PTT can transmit",
+                            "PTT: hold mouse",
+                            "Space: tap PTT",
                             "Click or type a shortcut",
                             "Battery: unknown",
                             "Status: none",
@@ -1894,18 +2478,158 @@ mod tests {
     }
 
     #[test]
+    fn ptt_hints_follow_keyboard_release_support_without_activity_conflict() {
+        let mut app = App::demo();
+        for enhanced in [false, true] {
+            app.remote_keyboard_release_supported = enhanced;
+            let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+            terminal
+                .draw(|frame| render_keypad_help(frame, &app, frame.area()))
+                .unwrap();
+            let text = buffer_text(terminal.backend().buffer(), Rect::new(0, 0, 40, 8));
+            assert!(text.contains("PTT: hold mouse"));
+            assert!(text.contains(if enhanced {
+                "Space: hold PTT"
+            } else {
+                "Space: tap PTT"
+            }));
+        }
+        let ptt = REMOTE_KEYS
+            .into_iter()
+            .flatten()
+            .find(|key| key.code == 0x13)
+            .unwrap();
+        assert_eq!(ptt.shortcut, "Space");
+        assert!(
+            !REMOTE_KEYS
+                .into_iter()
+                .flatten()
+                .any(|key| key.shortcut == "a")
+        );
+    }
+
+    #[test]
+    fn held_ptt_is_highlighted_until_the_shared_input_state_releases_it() {
+        let app = App::demo();
+        let area = Rect::new(0, 0, 37, 18);
+        let ptt = keypad_cells(area)[19];
+        let mut terminal = Terminal::new(TestBackend::new(37, 18)).unwrap();
+        app.remote_input_state.lock().unwrap().held_key = Some(0x13);
+        terminal
+            .draw(|frame| render_keypad(frame, &app, area))
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer(), ptt);
+        assert!(text.contains("PTT"));
+        assert!(text.contains("mouse"));
+        let label = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "P")
+            .unwrap();
+        assert_eq!(label.bg, COLOR_WARNING);
+        assert!(!label.modifier.contains(Modifier::DIM));
+        app.remote_input_state.lock().unwrap().held_key = None;
+        terminal
+            .draw(|frame| render_keypad(frame, &app, area))
+            .unwrap();
+        let label = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "P")
+            .unwrap();
+        assert_eq!(label.bg, COLOR_SURFACE_1);
+    }
+
+    #[test]
+    fn compact_ptt_button_and_help_preserve_mouse_and_keyboard_guidance() {
+        let mut app = App::demo();
+        let area = main_content_area(Rect::new(0, 0, 80, 24));
+        let layout = remote_screen_layout(area);
+        assert_eq!(layout.keypad.height, 14);
+        assert_eq!(layout.keypad_help.height, 4);
+        let ptt = keypad_cells(layout.keypad)[19];
+        for enhanced in [false, true] {
+            app.remote_keyboard_release_supported = enhanced;
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| render_remote_screen(frame, &app, area))
+                .unwrap();
+            let text = buffer_text(terminal.backend().buffer(), ptt);
+            assert!(text.contains("PTT"));
+            if enhanced {
+                assert!(text.contains("Space"), "{text}");
+            } else {
+                assert!(text.contains("mouse"), "{text}");
+                assert!(!text.contains("Space"), "{text}");
+            }
+            let help = buffer_text(terminal.backend().buffer(), layout.keypad_help);
+            assert!(help.contains("PTT: hold mouse"));
+            assert!(help.contains(if enhanced {
+                "Space: hold PTT"
+            } else {
+                "Space: tap PTT"
+            }));
+        }
+    }
+
+    #[test]
+    fn lcd_canvas_is_bounded_square_and_does_not_paint_letterbox_margins_black() {
+        let mut app = App::demo();
+        app.remote_screen.has_display_updates = true;
+        for (width, height) in [(80, 24), (160, 48), (240, 64), (320, 100)] {
+            let area = Rect::new(0, 0, width, height);
+            let inner = Block::bordered().inner(area);
+            let available = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 2);
+            let canvas = lcd_canvas(available);
+            assert!(canvas.width <= 128);
+            assert_eq!(canvas.height, canvas.width.div_ceil(2));
+            assert_eq!(canvas.intersection(available), canvas);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_lcd_preview(frame, &app, area))
+                .unwrap();
+            for y in available.y..available.bottom() {
+                for x in available.x..available.right() {
+                    if !canvas.contains((x, y).into()) {
+                        assert_eq!(terminal.backend().buffer()[(x, y)].bg, COLOR_SURFACE_0);
+                    }
+                }
+            }
+        }
+        for width in 0..4 {
+            for height in 0..4 {
+                assert_eq!(
+                    lcd_canvas(Rect::new(2, 3, width, height))
+                        .intersection(Rect::new(2, 3, width, height)),
+                    lcd_canvas(Rect::new(2, 3, width, height))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn compact_keys_have_uniform_borders_and_aligned_label_rows() {
         let app = App::new();
-        for (width, height, sidebar) in [(80, 24, 20), (100, 30, 22), (160, 48, 28), (240, 64, 28)]
-        {
-            let area = Rect::new(sidebar, 3, width - sidebar, height - 5);
+        for (width, height) in [
+            (60, 20),
+            (80, 24),
+            (100, 30),
+            (160, 48),
+            (190, 80),
+            (240, 64),
+        ] {
+            let area = main_content_area(Rect::new(0, 0, width, height));
             let cells = keypad_cells(remote_screen_layout(area).keypad);
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| render_remote_screen(frame, &app, area))
                 .unwrap();
             let buffer = terminal.backend().buffer();
-            let bordered = cells.iter().all(|cell| cell.width >= 6 && cell.height >= 4);
+            let bordered = cells.iter().all(|cell| cell.width >= 7 && cell.height >= 4);
             for row in 0..4 {
                 let mut label_row = None;
                 for index in row * 5..row * 5 + 5 {
@@ -1927,10 +2651,15 @@ mod tests {
                         key.label
                     );
                     if key.shortcut != key.label {
-                        assert!(
-                            buffer_text(buffer, cell).contains(key.shortcut),
-                            "{} at {width}x{height}",
+                        let subtitle = if key.code == 0x13 {
+                            "mouse"
+                        } else {
                             key.shortcut
+                        };
+                        assert!(
+                            buffer_text(buffer, cell).contains(subtitle),
+                            "{} at {width}x{height}",
+                            subtitle
                         );
                     }
                 }
@@ -2164,8 +2893,8 @@ mod tests {
     fn keypad_labels_fit_inside_main_layout_at_small_terminal_sizes() {
         let mut app = App::new();
         app.remote_active = true;
-        for (width, height, sidebar) in [(80, 24, 20), (100, 30, 22), (160, 45, 28)] {
-            let area = Rect::new(sidebar, 3, width - sidebar, height - 5);
+        for (width, height) in [(60, 20), (80, 24), (100, 30), (160, 45)] {
+            let area = main_content_area(Rect::new(0, 0, width, height));
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|f| render_remote_screen(f, &app, area))
@@ -2217,6 +2946,32 @@ mod tests {
             assert!(!text.contains("no control proof"));
             assert!(!text.contains("direct key"));
             assert!(!text.contains("control confirmed"));
+        }
+    }
+
+    #[test]
+    fn narrow_control_summary_keeps_the_complete_outcome_after_long_labels() {
+        let mut app = App::demo();
+        app.remote_active = true;
+        for (evidence, success, expected) in [
+            (RemoteEvidenceKind::NoControlEvidence, true, "not confirmed"),
+            (RemoteEvidenceKind::ControlConfirmed, true, "confirmed"),
+            (RemoteEvidenceKind::CommandFailed, false, "failed"),
+        ] {
+            let report = app.remote_screen.last_control_report.as_mut().unwrap();
+            report.label =
+                "A very long keypad action description that must not hide its result".into();
+            report.evidence = evidence;
+            report.success = success;
+            for width in [40, 60, 80, 100] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                terminal
+                    .draw(|frame| render_compact_overview(frame, &app, frame.area()))
+                    .unwrap();
+                let text = buffer_text(terminal.backend().buffer(), Rect::new(0, 0, width, 1));
+                assert!(text.contains("Last: A"), "{width}: {text}");
+                assert!(text.contains(&format!("({expected})")), "{width}: {text}");
+            }
         }
     }
 
@@ -2454,8 +3209,8 @@ mod tests {
         });
         for diagnostics in [false, true] {
             app.remote_screen.show_diagnostics = diagnostics;
-            for (width, height, sidebar) in [(80, 24, 20), (100, 30, 22), (160, 45, 28)] {
-                let area = Rect::new(sidebar, 3, width - sidebar, height - 5);
+            for (width, height) in [(80, 24), (100, 30), (160, 45)] {
+                let area = main_content_area(Rect::new(0, 0, width, height));
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
                     .draw(|frame| render_remote_screen(frame, &app, area))
@@ -2501,8 +3256,8 @@ mod tests {
                 },
             );
         }
-        for (width, height, sidebar) in [(80, 24, 20), (100, 30, 22), (160, 45, 28)] {
-            let area = Rect::new(sidebar, 3, width - sidebar, height - 5);
+        for (width, height) in [(60, 20), (80, 24), (100, 30), (160, 45)] {
+            let area = main_content_area(Rect::new(0, 0, width, height));
             let inner = Block::bordered().inner(remote_screen_layout(area).display);
             let canvas = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 2);
             let columns = canvas.width.min(canvas.height * 2);
@@ -2566,12 +3321,12 @@ mod tests {
             (61, 26, 32),
             (62, 26, 33),
             (63, 26, 34),
-            (88, 40, 57),
-            (89, 40, 58),
-            (91, 40, 59),
-            (97, 42, 63),
-            (98, 42, 64),
-            (100, 43, 65),
+            (88, 40, 59),
+            (89, 40, 60),
+            (91, 40, 62),
+            (97, 42, 68),
+            (98, 42, 69),
+            (100, 43, 71),
         ] {
             let mut app = App::new();
             assert!(app.port_candidates.is_empty());
@@ -2802,7 +3557,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         for diagnostics in [false, true] {
             app.remote_screen.show_diagnostics = diagnostics;
-            let area = Rect::new(20, 3, 60, 19);
+            let area = main_content_area(Rect::new(0, 0, 80, 24));
             terminal
                 .draw(|frame| render_remote_screen(frame, &app, area))
                 .unwrap();

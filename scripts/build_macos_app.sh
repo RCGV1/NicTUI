@@ -237,6 +237,7 @@ chmod +x "${APP_BINARY_PATH}"
 
 cp "${ROOT_DIR}/macos/launcher.sh" "${WRAPPER_PATH}"
 chmod +x "${WRAPPER_PATH}"
+cp "${ROOT_DIR}/macos/NicTUI.terminal" "${RESOURCES_DIR}/NicTUI.terminal"
 
 sed "s/@VERSION@/${VERSION}/g" "${PLIST_TEMPLATE}" > "${PLIST_PATH}"
 plutil -lint "${PLIST_PATH}" >/dev/null

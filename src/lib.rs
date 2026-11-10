@@ -27,5 +27,8 @@ pub mod device;
 pub mod protocol;
 pub mod remote;
 pub mod remote_display;
+pub mod simulator_assets;
+pub mod simulator_lcd;
+pub mod simulator_link;
 pub mod skill;
 pub mod ui;

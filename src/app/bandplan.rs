@@ -136,6 +136,7 @@ impl App {
             KeyCode::Esc => {
                 self.editing_band_plan = None;
                 self.mode = AppMode::Main(MainTab::BandPlan);
+                self.status_message = "Band plan edit cancelled".into();
             }
             KeyCode::Enter => self.commit_bandplan_edit(),
             KeyCode::Up | KeyCode::BackTab => self.select_previous_bandplan_field(),

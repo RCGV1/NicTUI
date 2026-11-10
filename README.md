@@ -20,16 +20,38 @@ A terminal-based user interface for programming the TIDRADIO TD-H3 HAM radio.
 
 ## Screenshots
 
-<p align="center">
-  <img src="assets/screenshots/channels.png" alt="NicTUI Channels view" width="100%">
-</p>
+NicTUI v1.1.0 in simulator mode.
+
+### Channel Management
+
+Review and edit channel frequencies, tones, and groups in one table.
 
 <p align="center">
-  <img src="assets/screenshots/settings.png" alt="NicTUI Settings view" width="100%">
+  <img src="assets/screenshots/channels.png" alt="NicTUI simulator Channels view with channel frequencies, tones, and groups" width="100%">
 </p>
 
+### Radio Settings
+
+Browse and adjust radio preferences without leaving the terminal.
+
 <p align="center">
-  <img src="assets/screenshots/remote.png" alt="NicTUI Remote telemetry dashboard" width="100%">
+  <img src="assets/screenshots/settings.png" alt="NicTUI simulator Settings view with configurable radio preferences" width="100%">
+</p>
+
+### Remote Control
+
+View the simulated radio display and interact with its on-screen controls.
+
+<p align="center">
+  <img src="assets/screenshots/remote.png" alt="NicTUI simulator Remote view with radio display and on-screen controls" width="100%">
+</p>
+
+### Scan Activity
+
+Track simulated scan hits by frequency, hit count, and mean raw signal.
+
+<p align="center">
+  <img src="assets/screenshots/activity.png" alt="NicTUI simulator Activity view summarizing scan frequencies, hit counts, and mean raw signal values" width="100%">
 </p>
 
 ## Installation
